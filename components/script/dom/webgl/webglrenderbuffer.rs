@@ -242,7 +242,20 @@ impl WebGLRenderbuffer {
                     constants::RGB8
                 }
             },
-            EXTColorBufferHalfFloatConstants::RGBA16F_EXT |
+            EXTColorBufferHalfFloatConstants::RGBA16F_EXT => {
+                // RGBA16F は EXT_color_buffer_half_float または
+                // EXT_color_buffer_float の有効化でレンダーバッファに使える。
+                if !context
+                    .extension_manager()
+                    .is_half_float_buffer_renderable() &&
+                    !context
+                        .extension_manager()
+                        .is_ext_color_buffer_float_enabled()
+                {
+                    return Err(WebGLError::InvalidEnum);
+                }
+                internal_format
+            },
             EXTColorBufferHalfFloatConstants::RGB16F_EXT => {
                 if !context
                     .extension_manager()
@@ -253,7 +266,28 @@ impl WebGLRenderbuffer {
                 internal_format
             },
             WEBGLColorBufferFloatConstants::RGBA32F_EXT => {
-                if !context.extension_manager().is_float_buffer_renderable() {
+                // RGBA32F は WEBGL_color_buffer_float（WebGL1）または
+                // EXT_color_buffer_float（WebGL2）の有効化でレンダーバッファに使える。
+                if !context.extension_manager().is_float_buffer_renderable() &&
+                    !context
+                        .extension_manager()
+                        .is_ext_color_buffer_float_enabled()
+                {
+                    return Err(WebGLError::InvalidEnum);
+                }
+                internal_format
+            },
+            // EXT_color_buffer_float で color-renderable になる浮動小数点形式。
+            // RGB16F / RGB32F はこの拡張でも renderable にならないため含めない。
+            constants::R16F |
+            constants::R32F |
+            constants::RG16F |
+            constants::RG32F |
+            constants::R11F_G11F_B10F => {
+                if !context
+                    .extension_manager()
+                    .is_ext_color_buffer_float_enabled()
+                {
                     return Err(WebGLError::InvalidEnum);
                 }
                 internal_format

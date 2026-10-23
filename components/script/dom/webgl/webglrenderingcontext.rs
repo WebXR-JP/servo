@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{LazyLock, Mutex};
 use std::{cmp, ptr};
 
 #[cfg(feature = "webgl_backtrace")]
@@ -99,6 +101,19 @@ fn has_invalid_blend_constants(arg1: u32, arg2: u32) -> bool {
         (_, _) => false,
     }
 }
+
+/// WebGL検証エラーの発生箇所ごとの累積件数（重複ログ抑制と集計用）。
+/// キーは `webgl_error` の呼び出し元 (`file, line, column`) で、値は呼び出し回数。
+/// `handle_potential_webgl_error!` 経由の呼び出しはマクロ展開先の行を指す。
+static WEBGL_ERROR_COUNTS: LazyLock<Mutex<HashMap<(&'static str, u32, u32), usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 保留中の `last_error` を積んだ発生箇所。キーは `WebGLRenderingContext` のアドレス。
+/// `#[dom_struct]` のトレース対象に含めないため、構造体外の静的マップで保持する。
+/// `previous error was Some(..)` の原因箇所を特定するために使う。
+static WEBGL_LAST_ERROR_ORIGIN: LazyLock<
+    Mutex<HashMap<usize, ((&'static str, u32, u32), WebGLError)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn uniform_get<T, F>(triple: (&WebGLRenderingContext, WebGLProgramId, i32), f: F) -> T
 where
@@ -410,18 +425,49 @@ impl WebGLRenderingContext {
         self.send_with_fallibility(command, Operation::Fallible);
     }
 
+    #[track_caller]
     pub(crate) fn webgl_error(&self, err: WebGLError) {
-        // TODO(emilio): Add useful debug messages to this
-        warn!(
-            "WebGL error: {:?}, previous error was {:?}",
-            err,
-            self.last_error.get()
-        );
+        // 呼び出し元（WebGL API入口付近の行）を特定するための位置情報。
+        // `handle_potential_webgl_error!` 経由の呼び出しはマクロ展開先の行を指す。
+        let caller = std::panic::Location::caller();
+        let here = (caller.file(), caller.line(), caller.column());
+        let context_id = self as *const Self as usize;
+        let previous = self.last_error.get();
+        let previous_location = {
+            WEBGL_LAST_ERROR_ORIGIN
+                .lock()
+                .unwrap()
+                .get(&context_id)
+                .map(|(loc, _)| *loc)
+        };
+        // 同一箇所からの重複ログを抑制する。初回は warn、2回目以降は debug に落とす。
+        // 全体の件数は `GetError` での集計ログと debug ログの集計で分かる。
+        let count = {
+            let mut counts = WEBGL_ERROR_COUNTS.lock().unwrap();
+            let entry = counts.entry(here).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        if count == 1 {
+            warn!(
+                "WebGL error: {:?} at {}:{}:{} (count=1), previous error was {:?} from {:?}",
+                err, here.0, here.1, here.2, previous, previous_location
+            );
+        } else {
+            debug!(
+                "WebGL error: {:?} at {}:{}:{} (count={}), previous error was {:?} from {:?}",
+                err, here.0, here.1, here.2, count, previous, previous_location
+            );
+        }
 
         // If an error has been detected no further errors must be
         // recorded until `getError` has been called
-        if self.last_error.get().is_none() {
+        if previous.is_none() {
             self.last_error.set(Some(err));
+            WEBGL_LAST_ERROR_ORIGIN
+                .lock()
+                .unwrap()
+                .insert(context_id, (here, err));
         }
     }
 
@@ -2507,6 +2553,38 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
         } else {
             constants::NO_ERROR
         };
+        // 保留中の検証エラーを消費する際に、積み元の位置と全体の件数を残す。
+        // `WebGL error: .., previous error was Some(..)` の `previous` 側の発生箇所がここで分かる。
+        if let Some(error) = self.last_error.get() {
+            let context_id = self as *const Self as usize;
+            let origin = {
+                WEBGL_LAST_ERROR_ORIGIN
+                    .lock()
+                    .unwrap()
+                    .get(&context_id)
+                    .map(|(loc, _)| *loc)
+            };
+            let summary = {
+                let counts = WEBGL_ERROR_COUNTS.lock().unwrap();
+                let mut entries: Vec<_> = counts.iter().collect();
+                entries.sort_by_key(|(k, _)| (k.0, k.1, k.2));
+                entries
+                    .iter()
+                    .map(|((f, l, c), n)| format!("{}:{}:{} x{}", f, l, c, n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            // 消費は JS 側のポーリング頻度に依存して高頻度になり得るため debug に落とす。
+            // warn ログの初回行と合わせることで location ごとの一覧と件数が復元できる。
+            debug!(
+                "WebGL GetError consumed {:?} from {:?}, counts: {}",
+                error, origin, summary
+            );
+            WEBGL_LAST_ERROR_ORIGIN
+                .lock()
+                .unwrap()
+                .remove(&context_id);
+        }
         self.last_error.set(None);
         error_code
     }

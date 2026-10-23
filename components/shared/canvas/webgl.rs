@@ -1061,6 +1061,10 @@ gl_enums! {
         CompressedRgbaS3tcDxt1 = gl::COMPRESSED_RGBA_S3TC_DXT1_EXT,
         CompressedRgbaS3tcDxt3 = gl::COMPRESSED_RGBA_S3TC_DXT3_EXT,
         CompressedRgbaS3tcDxt5 = gl::COMPRESSED_RGBA_S3TC_DXT5_EXT,
+        CompressedSrgbS3tcDxt1 = gl::COMPRESSED_SRGB_S3TC_DXT1_EXT,
+        CompressedSrgbAlphaS3tcDxt1 = gl::COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT,
+        CompressedSrgbAlphaS3tcDxt3 = gl::COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT,
+        CompressedSrgbAlphaS3tcDxt5 = gl::COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT,
         CompressedRgbEtc1 = gl_ext_constants::COMPRESSED_RGB_ETC1_WEBGL,
         R8 = gl::R8,
         R8SNorm = gl::R8_SNORM,
@@ -1161,6 +1165,10 @@ impl TexFormat {
                 gl::COMPRESSED_RGBA_S3TC_DXT1_EXT |
                 gl::COMPRESSED_RGBA_S3TC_DXT3_EXT |
                 gl::COMPRESSED_RGBA_S3TC_DXT5_EXT |
+                gl::COMPRESSED_SRGB_S3TC_DXT1_EXT |
+                gl::COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT |
+                gl::COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT |
+                gl::COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT |
                 gl_ext_constants::COMPRESSED_RGB_ETC1_WEBGL
         )
     }
@@ -1283,8 +1291,19 @@ impl TexFormat {
             TexFormat::Luminance16f => &[TexDataType::HalfFloat][..],
             TexFormat::Alpha32f => &[TexDataType::Float][..],
             TexFormat::Alpha16f => &[TexDataType::HalfFloat][..],
-            TexFormat::R8 => &[TexDataType::UnsignedByte][..],
-            TexFormat::R8SNorm => &[TexDataType::Byte][..],
+            // Unsized RED/RG are valid internal formats in WebGL 2 and map to
+            // R8/RG8, R16F/RG16F or R32F/RG32F depending on the data type.
+            TexFormat::Red => &[
+                TexDataType::UnsignedByte,
+                TexDataType::HalfFloat,
+                TexDataType::Float,
+            ][..],
+            TexFormat::RG => &[
+                TexDataType::UnsignedByte,
+                TexDataType::HalfFloat,
+                TexDataType::Float,
+            ][..],
+            TexFormat::R8 => &[TexDataType::UnsignedByte][..],            TexFormat::R8SNorm => &[TexDataType::Byte][..],
             TexFormat::R16f => &[TexDataType::HalfFloat, TexDataType::Float][..],
             TexFormat::R32f => &[TexDataType::Float][..],
             TexFormat::R8ui => &[TexDataType::UnsignedByte][..],
@@ -1354,7 +1373,11 @@ impl TexFormat {
             TexFormat::CompressedRgbS3tcDxt1 |
             TexFormat::CompressedRgbaS3tcDxt1 |
             TexFormat::CompressedRgbaS3tcDxt3 |
-            TexFormat::CompressedRgbaS3tcDxt5 => &[TexDataType::UnsignedByte][..],
+            TexFormat::CompressedRgbaS3tcDxt5 |
+            TexFormat::CompressedSrgbS3tcDxt1 |
+            TexFormat::CompressedSrgbAlphaS3tcDxt1 |
+            TexFormat::CompressedSrgbAlphaS3tcDxt3 |
+            TexFormat::CompressedSrgbAlphaS3tcDxt5 => &[TexDataType::UnsignedByte][..],
             _ => &[][..],
         }
     }
@@ -1371,6 +1394,11 @@ impl TexFormat {
             TexFormat::CompressedRgbaS3tcDxt1 |
             TexFormat::CompressedRgbaS3tcDxt3 |
             TexFormat::CompressedRgbaS3tcDxt5 => WebGLVersion::WebGL1,
+            // sRGB 圧縮 S3TC は WEBGL_compressed_texture_s3tc_srgb（WebGL2 専用）で扱う。
+            TexFormat::CompressedSrgbS3tcDxt1 |
+            TexFormat::CompressedSrgbAlphaS3tcDxt1 |
+            TexFormat::CompressedSrgbAlphaS3tcDxt3 |
+            TexFormat::CompressedSrgbAlphaS3tcDxt5 => WebGLVersion::WebGL2,
             _ => WebGLVersion::WebGL2,
         }
     }

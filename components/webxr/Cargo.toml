@@ -37,8 +37,9 @@ surfman = { workspace = true }
 webxr-api = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winapi = { workspace = true, features = ["d3d11", "dxgi", "winerror"], optional = true }
+winapi = { workspace = true, features = ["d3d11", "d3dcommon", "dxgi", "libloaderapi", "winerror"], optional = true }
 wio = { workspace = true, optional = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

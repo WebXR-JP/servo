@@ -9729,6 +9729,7 @@ dependencies = [
  "log",
  "openxr",
  "raw-window-handle",
+ "serde_json",
  "servo-base",
  "servo-profile-traits",
  "servo-webxr-api",
@@ -9816,6 +9817,7 @@ dependencies = [
  "ohos-vsync",
  "ohos-window-manager-sys",
  "ohos-window-sys",
+ "openxr",
  "raw-window-handle",
  "rustls",
  "serde_json",
@@ -9830,9 +9832,11 @@ dependencies = [
  "tracing-perfetto",
  "tracing-subscriber",
  "url",
+ "winapi",
  "windows-sys 0.61.2",
  "winit",
  "winresource",
+ "wio",
  "xcomponent-sys",
 ]
 

@@ -11,7 +11,7 @@ use std::{mem, thread};
 use euclid::{Point2D, Rect, RigidTransform3D, Rotation3D, Size2D, Transform3D, Vector3D};
 use glow::{self as gl, HasContext, PixelUnpackData};
 use interaction_profiles::{get_profiles_from_path, get_supported_interaction_profiles};
-use log::{error, warn};
+use log::{error, info, warn};
 use openxr::sys::CompositionLayerPassthroughFB;
 use openxr::{
     self, ActionSet, ActiveActionSet, ApplicationInfo, CompositionLayerBase, CompositionLayerFlags,
@@ -42,6 +42,8 @@ use input::OpenXRInput;
 mod graphics;
 mod interaction_profiles;
 use graphics::{GraphicsProvider, GraphicsProviderMethods};
+#[cfg(target_os = "windows")]
+mod xr_copy;
 
 #[cfg(target_os = "windows")]
 mod graphics_d3d11;
@@ -386,6 +388,8 @@ struct OpenXrLayerManager {
     clearer: GlClearer,
     _passthrough: Option<Passthrough>,
     passthrough_layer: Option<PassthroughLayerFB>,
+    #[cfg(target_os = "windows")]
+    copy_stats: xr_copy::CopyStats,
 }
 
 struct OpenXrLayer {
@@ -395,6 +399,8 @@ struct OpenXrLayer {
     images: Vec<<Backend as Graphics>::SwapchainImage>,
     surface_textures: Vec<Option<SurfaceTexture>>,
     waited: bool,
+    #[cfg(target_os = "windows")]
+    copy_backing: Option<xr_copy::CopyBacking>,
 }
 
 impl OpenXrLayerManager {
@@ -418,6 +424,8 @@ impl OpenXrLayerManager {
             clearer,
             _passthrough,
             passthrough_layer,
+            #[cfg(target_os = "windows")]
+            copy_stats: xr_copy::CopyStats::new(),
         }
     }
 }
@@ -441,6 +449,8 @@ impl OpenXrLayer {
             images,
             surface_textures,
             waited,
+            #[cfg(target_os = "windows")]
+            copy_backing: None,
         })
     }
 
@@ -475,6 +485,10 @@ impl LayerManagerAPI<SurfmanGL> for OpenXrLayerManager {
         context_id: ContextId,
         init: LayerInit,
     ) -> Result<LayerId, Error> {
+        // 計測用プローブ(後で削除予定)。最初に呼ばれた1回だけ共有可否を記録する。
+        // 画素の読み戻しはせず、失敗しても先へ進む。
+        #[cfg(target_os = "windows")]
+        xr_probe::probe_once(&self.session, contexts, context_id);
         let guard = self.shared_data.lock().unwrap();
         let data = guard.as_ref().unwrap();
 
@@ -533,6 +547,22 @@ impl LayerManagerAPI<SurfmanGL> for OpenXrLayerManager {
 
         let layer_id = LayerId::default();
         let openxr_layer = OpenXrLayer::new(swapchain, depth_stencil_texture, texture_size)?;
+        #[cfg(target_os = "windows")]
+        let mut openxr_layer = openxr_layer;
+        // Windowsでは既定でGPUコピー経路を使い、共有pbufferを描画先とする。
+        // `XR_LAYER_MODE=import`のときだけ従来のimport経路に戻す。
+        #[cfg(target_os = "windows")]
+        if xr_copy::copy_mode_enabled() {
+            openxr_layer.copy_backing = Some(xr_copy::setup_backing(
+                contexts,
+                context_id,
+                &openxr_layer.images,
+                texture_size.width,
+                texture_size.height,
+                format,
+                sample_count,
+            ));
+        }
         self.layers.push((context_id, layer_id));
         self.openxr_layers.insert(layer_id, openxr_layer);
         Ok(layer_id)
@@ -550,6 +580,11 @@ impl LayerManagerAPI<SurfmanGL> for OpenXrLayerManager {
             if let Some(depth_stencil_texture) = layer.depth_stencil_texture {
                 let gl = contexts.bindings(context_id).unwrap();
                 unsafe { gl.delete_texture(depth_stencil_texture) };
+            }
+            // GPUコピー経路の裏付けを先に解放する。device/contextの借用と競合させないため先に行う。
+            #[cfg(target_os = "windows")]
+            if let Some(backing) = layer.copy_backing.take() {
+                xr_copy::destroy_backing(contexts, context_id, backing);
             }
             let device = contexts
                 .device(context_id)
@@ -572,9 +607,75 @@ impl LayerManagerAPI<SurfmanGL> for OpenXrLayerManager {
 
     fn end_frame(
         &mut self,
-        _contexts: &mut dyn GLContexts<SurfmanGL>,
+        contexts: &mut dyn GLContexts<SurfmanGL>,
         layers: &[(ContextId, LayerId)],
     ) -> Result<(), Error> {
+        // WindowsのGPUコピー経路: 描画確定後に共有pbufferの内容をXR画像へ転送する。
+        // CPU読み戻しは行わない。失敗してもpanicせず、その層の提出はstale画像のまま継続する。
+        // E1では素面へ赤を描いて転送するため、contextsごと渡してbind切り替えを行う。
+        #[cfg(target_os = "windows")]
+        if xr_copy::copy_mode_enabled() {
+            let stats = &mut self.copy_stats;
+            let mut diag_submits: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
+            for &(context_id, layer_id) in layers {
+                let Some(layer) = self.openxr_layers.get_mut(&layer_id) else {
+                    continue;
+                };
+                let Some(xr_copy::CopyBacking::Ready(ready)) = layer.copy_backing.as_mut()
+                else {
+                    continue;
+                };
+                let Some(index) = ready.acquired_image.take() else {
+                    continue;
+                };
+                let dst = layer
+                    .images
+                    .get(index as usize)
+                    .copied()
+                    .unwrap_or(std::ptr::null_mut());
+                if let Some(seq) = xr_copy::copy_to_swapchain(contexts, context_id, ready, dst, stats)
+                {
+                    if let Some((w, h, f, s)) = xr_copy::describe_image(dst) {
+                        diag_submits.push((seq, w, h, f, s));
+                    }
+                }
+            }
+            stats.tick_frame();
+            // 診断: 提出内容を記録する。`xr-copy-diag` の seq と対応づけて、
+            // どの画像範囲をどの swapchain に出したかを見る。
+            // ADR: 診断専用の観測点であり、提出経路自体は変えない。
+            if !diag_submits.is_empty() {
+                let guard = self.shared_data.lock().unwrap();
+                if let Some(data) = guard.as_ref() {
+                    let vps = data.viewports();
+                    for (seq, w, h, f, s) in diag_submits {
+                        let rect = |v: Rect<i32, Viewport>| {
+                            serde_json::json!({
+                                "x": v.origin.x,
+                                "y": v.origin.y,
+                                "width": v.size.width,
+                                "height": v.size.height,
+                            })
+                        };
+                        xr_copy::emit_json(serde_json::json!({
+                            "event": "xr-copy-submit",
+                            "seq": seq,
+                            "sub_image": {
+                                "image_rect": rect(vps.viewports[0]),
+                                "image_array_index": 0u32,
+                            },
+                            "swapchain": {
+                                "width": w,
+                                "height": h,
+                                "format": f,
+                                "samples": s,
+                            },
+                            "viewports": vps.viewports.iter().map(|v| rect(*v)).collect::<Vec<_>>(),
+                        }));
+                    }
+                }
+            }
+        }
         let guard = self.shared_data.lock().unwrap();
         let data = guard.as_ref().unwrap();
 
@@ -692,7 +793,8 @@ impl LayerManagerAPI<SurfmanGL> for OpenXrLayerManager {
                 .map(|layer| layer.deref())
                 .collect::<Vec<_>>();
 
-            self.frame_stream
+            let end_result = self
+                .frame_stream
                 .end_secondary(
                     data.frame_state.as_ref().unwrap().predicted_display_time,
                     data.primary_blend_mode,
@@ -709,15 +811,26 @@ impl LayerManagerAPI<SurfmanGL> for OpenXrLayerManager {
                 )
                 .map_err(|e| {
                     Error::BackendSpecific(format!("FrameStream::end_secondary {:?}", e))
-                })?;
+                });
+            #[cfg(target_os = "windows")]
+            if end_result.is_err() {
+                self.copy_stats.end_failures += 1;
+            }
+            end_result?;
         } else {
-            self.frame_stream
+            let end_result = self
+                .frame_stream
                 .end(
                     data.frame_state.as_ref().unwrap().predicted_display_time,
                     data.primary_blend_mode,
                     &primary_layers[..],
                 )
-                .map_err(|e| Error::BackendSpecific(format!("FrameStream::end {:?}", e)))?;
+                .map_err(|e| Error::BackendSpecific(format!("FrameStream::end {:?}", e)));
+            #[cfg(target_os = "windows")]
+            if end_result.is_err() {
+                self.copy_stats.end_failures += 1;
+            }
+            end_result?;
         }
         Ok(())
     }
@@ -731,38 +844,123 @@ impl LayerManagerAPI<SurfmanGL> for OpenXrLayerManager {
         let data = data_guard.as_ref().unwrap();
         let openxr_layers = &mut self.openxr_layers;
         let clearer = &mut self.clearer;
+        #[cfg(target_os = "windows")]
+        let stats = &mut self.copy_stats;
         self.frame_stream
             .begin()
-            .map_err(|e| Error::BackendSpecific(format!("FrameStream::begin {:?}", e)))?;
+            .map_err(|e| {
+                error!("[xr-debug] FrameStream::begin failed: {:?}", e);
+                Error::BackendSpecific(format!("FrameStream::begin {:?}", e))
+            })?;
         layers
             .iter()
             .map(|&(context_id, layer_id)| {
-                let device = contexts.device(context_id).ok_or(Error::NoMatchingDevice)?;
-                let context = contexts
-                    .context(context_id)
-                    .ok_or(Error::NoMatchingDevice)?;
-                let openxr_layer = openxr_layers
-                    .get_mut(&layer_id)
-                    .ok_or(Error::NoMatchingDevice)?;
-
-                let image = openxr_layer.swapchain.acquire_image().map_err(|e| {
-                    Error::BackendSpecific(format!("Swapchain::acquire_image {:?}", e))
+                let device = contexts.device(context_id).ok_or_else(|| {
+                    error!("[xr-debug] no device for context {context_id:?}");
+                    Error::NoMatchingDevice
                 })?;
-                openxr_layer
-                    .swapchain
-                    .wait_image(openxr::Duration::INFINITE)
-                    .map_err(|e| {
-                        Error::BackendSpecific(format!("Swapchain::wait_image {:?}", e))
-                    })?;
-                openxr_layer.waited = true;
+                let context = contexts.context(context_id).ok_or_else(|| {
+                    error!("[xr-debug] no surfman context for {context_id:?}");
+                    Error::NoMatchingDevice
+                })?;
+                let openxr_layer = openxr_layers.get_mut(&layer_id).ok_or_else(|| {
+                    error!("[xr-debug] no openxr layer for {layer_id:?}");
+                    Error::NoMatchingDevice
+                })?;
 
-                let color_surface_texture = openxr_layer
-                    .get_surface_texture(&device, context, image as usize)
-                    .map_err(|e| {
-                        Error::BackendSpecific(format!("Layer::get_surface_texture {:?}", e))
-                    })?;
-                let color_texture = device.surface_texture_object(color_surface_texture);
-                let color_target = device.surface_gl_texture_target();
+                let image = match openxr_layer.swapchain.acquire_image() {
+                    Ok(image) => image,
+                    Err(e) => {
+                        error!("[xr-debug] acquire_image failed: {:?}", e);
+                        return Err(Error::BackendSpecific(format!(
+                            "Swapchain::acquire_image {:?}",
+                            e
+                        )));
+                    },
+                };
+                // GPUコピー経路の層は共有pbufferへ描画する。XR画像への転送はend_frameで行う。
+                let use_copy = {
+                    #[cfg(target_os = "windows")]
+                    {
+                        openxr_layer.copy_backing.is_some()
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        false
+                    }
+                };
+                let (color_texture, color_target) = if use_copy {
+                    #[cfg(target_os = "windows")]
+                    {
+                        if matches!(
+                            openxr_layer.copy_backing,
+                            Some(xr_copy::CopyBacking::Broken)
+                        ) {
+                            error!("[xr-debug] copy backing is broken; skipping frame");
+                            return Err(Error::BackendSpecific(
+                                "Layer GPU-copy backing is broken".into(),
+                            ));
+                        }
+                        // copy_backingとswapchainは別フィールドのため同時借用できる。
+                        let ready = match openxr_layer.copy_backing.as_mut() {
+                            Some(xr_copy::CopyBacking::Ready(ready)) => ready,
+                            // 直上でBrokenを弾いているため到達しない。
+                            _ => {
+                                error!("[xr-debug] copy backing vanished; skipping frame");
+                                return Err(Error::BackendSpecific(
+                                    "Layer GPU-copy backing vanished".into(),
+                                ));
+                            },
+                        };
+                        if let Err(e) =
+                            xr_copy::wait_for_copy(&mut openxr_layer.swapchain, ready, image)
+                        {
+                            stats.note_wait_failure();
+                            error!("[xr-debug] wait_image failed: {:?}", e);
+                            return Err(e);
+                        }
+                        openxr_layer.waited = true;
+                        // E2-blit既定では自前の通常テクスチャへ描く。旧E2の取り込み面は使わない。
+                        // ページは今まで通り `XRWebGLLayer.framebuffer` に描き、end_frameでblitする。
+                        if let Some(page) = ready.page_texture {
+                            (Some(page), ready.page_target)
+                        } else {
+                            (Some(ready.gl_texture), ready.gl_target)
+                        }
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        // use_copyは非Windowsで常にfalseのため到達しない。
+                        unreachable!("GPU copy path is Windows-only");
+                    }
+                } else {
+                    if let Err(e) = openxr_layer
+                        .swapchain
+                        .wait_image(openxr::Duration::INFINITE)
+                    {
+                        error!("[xr-debug] wait_image failed: {:?}", e);
+                        return Err(Error::BackendSpecific(format!(
+                            "Swapchain::wait_image {:?}",
+                            e
+                        )));
+                    }
+                    openxr_layer.waited = true;
+
+                    let color_surface_texture =
+                        match openxr_layer.get_surface_texture(&device, context, image as usize) {
+                            Ok(texture) => texture,
+                            Err(e) => {
+                                error!("[xr-debug] get_surface_texture failed: {:?}", e);
+                                return Err(Error::BackendSpecific(format!(
+                                    "Layer::get_surface_texture {:?}",
+                                    e
+                                )));
+                            },
+                        };
+                    let color_texture = device.surface_texture_object(color_surface_texture);
+                    let color_target = device.surface_gl_texture_target();
+                    (color_texture, color_target)
+                };
                 let depth_stencil_texture = openxr_layer.depth_stencil_texture;
                 let texture_array_index = None;
                 let origin = Point2D::new(0, 0);
@@ -872,21 +1070,53 @@ impl OpenXrDevice {
 
         let (session, frame_waiter) = init_rx.recv().map_err(|_| Error::CommunicationError)?;
 
-        // XXXPaul initialisation should happen on SessionStateChanged(Ready)?
+        // Wait for the runtime to report READY before calling begin (some runtimes reject an immediate begin).
+        let mut ready = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let mut buffer = openxr::EventDataBuffer::new();
+            match instance.poll_event(&mut buffer) {
+                Ok(Some(openxr::Event::SessionStateChanged(sc))) => match sc.state() {
+                    openxr::SessionState::READY
+                    | openxr::SessionState::SYNCHRONIZED
+                    | openxr::SessionState::VISIBLE
+                    | openxr::SessionState::FOCUSED => {
+                        ready = true;
+                        break;
+                    },
+                    openxr::SessionState::STOPPING
+                    | openxr::SessionState::EXITING
+                    | openxr::SessionState::LOSS_PENDING => {
+                        break;
+                    },
+                    _ => {},
+                },
+                Ok(_) => {},
+                Err(_) => {},
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if ready {
+            info!("OpenXR session reached READY before begin");
+        } else {
+            warn!("OpenXR session did not reach READY before begin (timeout or terminal state)");
+        }
 
         if supports_secondary {
-            session
-                .begin_with_secondary(
-                    ViewConfigurationType::PRIMARY_STEREO,
-                    &[ViewConfigurationType::SECONDARY_MONO_FIRST_PERSON_OBSERVER_MSFT],
-                )
-                .map_err(|e| {
-                    Error::BackendSpecific(format!("Session::begin_with_secondary {:?}", e))
-                })?;
-        } else {
-            session
-                .begin(ViewConfigurationType::PRIMARY_STEREO)
-                .map_err(|e| Error::BackendSpecific(format!("Session::begin {:?}", e)))?;
+            if let Err(e) = session.begin_with_secondary(
+                ViewConfigurationType::PRIMARY_STEREO,
+                &[ViewConfigurationType::SECONDARY_MONO_FIRST_PERSON_OBSERVER_MSFT],
+            ) {
+                error!(
+                    "Session failed to begin after READY wait (ready={}): {:?}",
+                    ready, e
+                );
+            }
+        } else if let Err(e) = session.begin(ViewConfigurationType::PRIMARY_STEREO) {
+            error!(
+                "Session failed to begin after READY wait (ready={}): {:?}",
+                ready, e
+            );
         }
 
         let pose = Posef {
@@ -1258,7 +1488,13 @@ impl DeviceAPI for OpenXrDevice {
 
         // We get the subimages before grabbing the lock,
         // since otherwise we'll deadlock
-        let sub_images = self.layer_manager.begin_frame(layers).ok()?;
+        let sub_images = match self.layer_manager.begin_frame(layers) {
+            Ok(sub_images) => sub_images,
+            Err(e) => {
+                error!("LayerManager::begin_frame failed: {:?}", e);
+                return None;
+            },
+        };
 
         let mut guard = self.shared_data.lock().unwrap();
         let data = guard.as_mut().unwrap();
@@ -1549,4 +1785,489 @@ fn fov_to_projection_matrix<T, U>(fov: &Fovf, clip_planes: ClipPlanes) -> Transf
         fov.angle_down,
         clip_planes,
     )
+}
+
+/// Servo(ANGLE/GL)の描画結果を別D3D11デバイスへ渡せるかを判定するための能力計測。
+///
+/// 画素の読み戻しはしない。`OpenXrLayerManager::create_layer`が最初に呼ばれた1回だけ
+/// 小さなpbuffer共有ハンドルを作り、XRアダプタ上のD3D11デバイスで開けるかを記録する。
+/// どこで失敗してもpanicさせず、各段階の成否を1行JSONで残して先へ進む。
+/// 計測後は削除予定のため、このモジュールに集約する。
+#[cfg(target_os = "windows")]
+mod xr_probe {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use surfman::{SurfaceAccess, SurfaceType};
+
+    use super::graphics_d3d11::Backend;
+    use crate::SurfmanGL;
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    /// `create_layer`の先頭から呼ぶ。2回目以降は何もしない。
+    pub(super) fn probe_once(
+        session: &std::sync::Arc<openxr::Session<Backend>>,
+        contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
+        context_id: webxr_api::ContextId,
+    ) {
+        if DONE.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let line = run(session, contexts, context_id);
+        log::info!("[xr-probe] {line}");
+        // 実行担当の指示に従い、`XR_PROBE_LOG`があればそこにも追記する。
+        if let Ok(path) = std::env::var("XR_PROBE_LOG") {
+            if !path.is_empty() {
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+        }
+    }
+
+    fn run(
+        session: &std::sync::Arc<openxr::Session<Backend>>,
+        contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
+        context_id: webxr_api::ContextId,
+    ) -> String {
+        let mut angle = serde_json::Map::new();
+        let mut surface = serde_json::Map::new();
+        let mut xr = serde_json::Map::new();
+
+        // 1. WebGL側のdevice/contextを取得し、D3D11アダプタ情報とGL文字列を記録する。
+        let device = contexts.device(context_id);
+        angle.insert(
+            "has_device".into(),
+            serde_json::Value::Bool(device.is_some()),
+        );
+        let mut angle_luid: Option<(u32, i32)> = None;
+        if let Some(device) = device.as_ref() {
+            use winapi::Interface as _;
+            let native = device.native_device();
+            if native.d3d11_device.is_null() {
+                angle.insert(
+                    "d3d11_device_null".into(),
+                    serde_json::Value::Bool(true),
+                );
+            } else {
+                // `native_device()`は参照を1つ足したまま返すため、ComPtrで包んで解放する。
+                let raw = native.d3d11_device as *mut winapi::um::d3d11::ID3D11Device;
+                let raw_device = unsafe { wio::com::ComPtr::from_raw(raw) };
+                // 機能レベルはID3D11Deviceから直接取れる。
+                let feature_level = unsafe { raw_device.GetFeatureLevel() };
+                angle.insert(
+                    "feature_level".into(),
+                    serde_json::json!(format!("{feature_level:#x}")),
+                );
+                // アダプタLUIDはDXGI経由で取得する。
+                // winapi 0.3のID3D11DeviceにはGetCreationParametersが無いための代替経路である。
+                unsafe {
+                    let mut dxgi_device: *mut winapi::shared::dxgi::IDXGIDevice =
+                        std::ptr::null_mut();
+                    let qi_hr = raw_device.QueryInterface(
+                        &winapi::shared::dxgi::IDXGIDevice::uuidof(),
+                        &mut dxgi_device as *mut *mut winapi::shared::dxgi::IDXGIDevice
+                            as *mut *mut std::ffi::c_void,
+                    );
+                    angle.insert(
+                        "qi_dxgi_device_hr".into(),
+                        serde_json::json!(format!("{qi_hr:#x}")),
+                    );
+                    if qi_hr == winapi::shared::winerror::S_OK && !dxgi_device.is_null() {
+                        let dxgi_device = wio::com::ComPtr::from_raw(dxgi_device);
+                        let mut adapter: *mut winapi::shared::dxgi::IDXGIAdapter =
+                            std::ptr::null_mut();
+                        let adapter_hr = dxgi_device.GetAdapter(&mut adapter);
+                        angle.insert(
+                            "get_adapter_hr".into(),
+                            serde_json::json!(format!("{adapter_hr:#x}")),
+                        );
+                        if adapter_hr == winapi::shared::winerror::S_OK && !adapter.is_null() {
+                            let adapter = wio::com::ComPtr::from_raw(adapter);
+                            let mut adapter1: *mut winapi::shared::dxgi::IDXGIAdapter1 =
+                                std::ptr::null_mut();
+                            let qi1_hr = adapter.QueryInterface(
+                                &winapi::shared::dxgi::IDXGIAdapter1::uuidof(),
+                                &mut adapter1 as *mut *mut winapi::shared::dxgi::IDXGIAdapter1
+                                    as *mut *mut std::ffi::c_void,
+                            );
+                            angle.insert(
+                                "qi_adapter1_hr".into(),
+                                serde_json::json!(format!("{qi1_hr:#x}")),
+                            );
+                            if qi1_hr == winapi::shared::winerror::S_OK && !adapter1.is_null() {
+                                let adapter1 = wio::com::ComPtr::from_raw(adapter1);
+                                let mut desc: winapi::shared::dxgi::DXGI_ADAPTER_DESC1 =
+                                    std::mem::zeroed();
+                                let desc_hr = adapter1.GetDesc1(&mut desc);
+                                angle.insert(
+                                    "adapter_desc_hr".into(),
+                                    serde_json::json!(format!("{desc_hr:#x}")),
+                                );
+                                if desc_hr == winapi::shared::winerror::S_OK {
+                                    angle.insert(
+                                        "adapter_luid_low".into(),
+                                        serde_json::json!(desc.AdapterLuid.LowPart),
+                                    );
+                                    angle.insert(
+                                        "adapter_luid_high".into(),
+                                        serde_json::json!(desc.AdapterLuid.HighPart),
+                                    );
+                                    angle_luid = Some((
+                                        desc.AdapterLuid.LowPart,
+                                        desc.AdapterLuid.HighPart,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(gl) = contexts.bindings(context_id) {
+            use glow::HasContext as _;
+            // SAFETY: RENDERER/VENDOR/VERSIONは有効な列挙子であり、
+            // 取得した文字列はこのブロック内でJSONへ複写するだけである。
+            let (renderer, vendor, version) = unsafe {
+                (
+                    gl.get_parameter_string(glow::RENDERER),
+                    gl.get_parameter_string(glow::VENDOR),
+                    gl.get_parameter_string(glow::VERSION),
+                )
+            };
+            angle.insert("gl_renderer".into(), serde_json::json!(renderer));
+            angle.insert("gl_vendor".into(), serde_json::json!(vendor));
+            angle.insert("gl_version".into(), serde_json::json!(version));
+        } else {
+            angle.insert(
+                "has_bindings".into(),
+                serde_json::Value::Bool(false),
+            );
+        }
+        angle.insert(
+            "libegl_path".into(),
+            serde_json::json!(module_path("libEGL.dll")),
+        );
+        angle.insert(
+            "libglesv2_path".into(),
+            serde_json::json!(module_path("libGLESv2.dll")),
+        );
+
+        // 2. 小さな共有pbufferを作り、ハンドル取得とXR側での開放を試す。
+        // 画素は読まない。surfaceは最後に明示的に破棄する。
+        match contexts.context(context_id) {
+            Some(context) => {
+                surface.insert(
+                    "has_context".into(),
+                    serde_json::Value::Bool(true),
+                );
+                match device.as_ref() {
+                    Some(device) => {
+                        let size = euclid::Size2D::new(64, 64);
+                        match device.create_surface(
+                            &*context,
+                            SurfaceAccess::GPUOnly,
+                            SurfaceType::Generic { size },
+                        ) {
+                            Ok(mut probe_surface) => {
+                                surface.insert(
+                                    "created".into(),
+                                    serde_json::Value::Bool(true),
+                                );
+                                let handle = probe_surface.share_handle();
+                                surface.insert(
+                                    "share_handle".into(),
+                                    match handle {
+                                        Some(handle) => serde_json::json!(format!(
+                                            "{:#x}",
+                                            handle as usize
+                                        )),
+                                        None => serde_json::Value::Null,
+                                    },
+                                );
+                                probe_open(session, handle, &mut xr, angle_luid);
+                                match device.destroy_surface(&mut *context, &mut probe_surface) {
+                                    Ok(()) => {
+                                        surface.insert(
+                                            "destroyed".into(),
+                                            serde_json::Value::Bool(true),
+                                        );
+                                    },
+                                    Err(error) => {
+                                        surface.insert(
+                                            "destroyed".into(),
+                                            serde_json::Value::Bool(false),
+                                        );
+                                        surface.insert(
+                                            "destroy_error".into(),
+                                            serde_json::json!(format!("{error:?}")),
+                                        );
+                                        // 破棄失敗のままDropするとpanicするため、リークを選ぶ。
+                                        // ADR: 計測用の一時surfaceであり、終了時に回収される。
+                                        std::mem::forget(probe_surface);
+                                    },
+                                }
+                            },
+                            Err(error) => {
+                                surface.insert(
+                                    "created".into(),
+                                    serde_json::Value::Bool(false),
+                                );
+                                surface.insert(
+                                    "error".into(),
+                                    serde_json::json!(format!("{error:?}")),
+                                );
+                                probe_open(session, None, &mut xr, angle_luid);
+                            },
+                        }
+                    },
+                    None => {
+                        probe_open(session, None, &mut xr, angle_luid);
+                    },
+                }
+            },
+            None => {
+                surface.insert(
+                    "has_context".into(),
+                    serde_json::Value::Bool(false),
+                );
+                probe_open(session, None, &mut xr, angle_luid);
+            },
+        }
+
+        let root = serde_json::json!({
+            "event": "xr-probe",
+            "angle": angle,
+            "surface": surface,
+            "xr": xr,
+        });
+        serde_json::to_string(&root).unwrap_or_else(|_| "{\"event\":\"xr-probe-encode-error\"}".into())
+    }
+
+    /// XRランタイムの要求LUIDを取得し、同一アダプタ上のD3D11デバイスで共有ハンドルを開く。
+    ///
+    /// 注: `graphics_d3d11.rs`が作ったデバイス本体ではなく、同一アダプタ上に作り直した
+    /// 別デバイスである。デバイス間共有の可否を見る目的は同じである。
+    fn probe_open(
+        session: &std::sync::Arc<openxr::Session<Backend>>,
+        handle: Option<*mut std::ffi::c_void>,
+        xr: &mut serde_json::Map<String, serde_json::Value>,
+        angle_luid: Option<(u32, i32)>,
+    ) {
+        use openxr::{d3d::D3D11, FormFactor, Graphics};
+        use winapi::Interface as _;
+
+        let system = match session
+            .instance()
+            .system(FormFactor::HEAD_MOUNTED_DISPLAY)
+        {
+            Ok(system) => system,
+            Err(error) => {
+                xr.insert(
+                    "system_error".into(),
+                    serde_json::json!(format!("{error:?}")),
+                );
+                return;
+            },
+        };
+        let requirements = match D3D11::requirements(session.instance(), system) {
+            Ok(requirements) => requirements,
+            Err(error) => {
+                xr.insert(
+                    "requirements_error".into(),
+                    serde_json::json!(format!("{error:?}")),
+                );
+                return;
+            },
+        };
+        xr.insert(
+            "req_luid_low".into(),
+            serde_json::json!(requirements.adapter_luid.LowPart),
+        );
+        xr.insert(
+            "req_luid_high".into(),
+            serde_json::json!(requirements.adapter_luid.HighPart),
+        );
+        xr.insert(
+            "req_min_feature_level".into(),
+            serde_json::json!(format!("{:#x}", requirements.min_feature_level as u32)),
+        );
+        xr.insert(
+            "luid_match".into(),
+            serde_json::Value::Bool(
+                angle_luid ==
+                    Some((
+                        requirements.adapter_luid.LowPart as u32,
+                        requirements.adapter_luid.HighPart as i32,
+                    )),
+            ),
+        );
+
+        let xr_device = match create_device_on_adapter(
+            requirements.adapter_luid.LowPart as u32,
+            requirements.adapter_luid.HighPart as i32,
+        ) {
+            Ok(device) => device,
+            Err(error) => {
+                xr.insert("xr_device_error".into(), serde_json::json!(error));
+                return;
+            },
+        };
+        xr.insert(
+            "xr_device_created".into(),
+            serde_json::Value::Bool(true),
+        );
+
+        let handle = match handle {
+            Some(handle) => handle,
+            None => {
+                xr.insert(
+                    "open_skipped".into(),
+                    serde_json::json!("no share handle"),
+                );
+                return;
+            },
+        };
+        unsafe {
+            let mut opened: *mut std::ffi::c_void = std::ptr::null_mut();
+            let open_hr = xr_device.OpenSharedResource(
+                handle,
+                &winapi::um::d3d11::ID3D11Texture2D::uuidof(),
+                &mut opened,
+            );
+            xr.insert(
+                "open_hr".into(),
+                serde_json::json!(format!("{open_hr:#x}")),
+            );
+            if open_hr != winapi::shared::winerror::S_OK || opened.is_null() {
+                xr.insert("opened".into(), serde_json::Value::Bool(false));
+                return;
+            }
+            xr.insert("opened".into(), serde_json::Value::Bool(true));
+            let texture =
+                wio::com::ComPtr::from_raw(opened as *mut winapi::um::d3d11::ID3D11Texture2D);
+            // IDXGISurface::GetDescで寸法と形式だけを見る。画素は読まない。
+            let mut surface_ptr: *mut winapi::shared::dxgi::IDXGISurface =
+                std::ptr::null_mut();
+            let query_hr = texture.QueryInterface(
+                &winapi::shared::dxgi::IDXGISurface::uuidof(),
+                &mut surface_ptr as *mut *mut winapi::shared::dxgi::IDXGISurface
+                    as *mut *mut std::ffi::c_void,
+            );
+            xr.insert(
+                "qi_surface_hr".into(),
+                serde_json::json!(format!("{query_hr:#x}")),
+            );
+            if query_hr != winapi::shared::winerror::S_OK || surface_ptr.is_null() {
+                return;
+            }
+            let surface_object = wio::com::ComPtr::from_raw(surface_ptr);
+            let mut desc: winapi::shared::dxgi::DXGI_SURFACE_DESC = std::mem::zeroed();
+            let desc_hr = surface_object.GetDesc(&mut desc);
+            xr.insert(
+                "desc_hr".into(),
+                serde_json::json!(format!("{desc_hr:#x}")),
+            );
+            if desc_hr == winapi::shared::winerror::S_OK {
+                xr.insert("tex_width".into(), serde_json::json!(desc.Width));
+                xr.insert("tex_height".into(), serde_json::json!(desc.Height));
+                xr.insert("tex_format".into(), serde_json::json!(desc.Format));
+                xr.insert(
+                    "tex_sample_count".into(),
+                    serde_json::json!(desc.SampleDesc.Count),
+                );
+            }
+        }
+    }
+
+    /// XRランタイムの要求LUIDに一致するアダプタでD3D11デバイスを作る。
+    fn create_device_on_adapter(
+        luid_low: u32,
+        luid_high: i32,
+    ) -> Result<wio::com::ComPtr<winapi::um::d3d11::ID3D11Device>, String> {
+        use winapi::Interface as _;
+        use winapi::shared::winerror::S_OK;
+        unsafe {
+            let mut factory_ptr: *mut winapi::shared::dxgi::IDXGIFactory1 =
+                std::ptr::null_mut();
+            let factory_hr = winapi::shared::dxgi::CreateDXGIFactory1(
+                &winapi::shared::dxgi::IDXGIFactory1::uuidof(),
+                &mut factory_ptr as *mut *mut winapi::shared::dxgi::IDXGIFactory1
+                    as *mut *mut std::ffi::c_void,
+            );
+            if factory_hr != S_OK || factory_ptr.is_null() {
+                return Err(format!("CreateDXGIFactory1 failed: {factory_hr:#x}"));
+            }
+            let factory = wio::com::ComPtr::from_raw(factory_ptr);
+
+            let mut index = 0;
+            let adapter = loop {
+                let mut adapter_ptr: *mut winapi::shared::dxgi::IDXGIAdapter1 =
+                    std::ptr::null_mut();
+                let enum_hr = factory.EnumAdapters1(index, &mut adapter_ptr);
+                if enum_hr == winapi::shared::winerror::DXGI_ERROR_NOT_FOUND {
+                    return Err("no DXGI adapter matches runtime LUID".to_string());
+                }
+                if enum_hr != S_OK || adapter_ptr.is_null() {
+                    return Err(format!("EnumAdapters1({index}) failed: {enum_hr:#x}"));
+                }
+                let candidate = wio::com::ComPtr::from_raw(adapter_ptr);
+                let mut desc: winapi::shared::dxgi::DXGI_ADAPTER_DESC1 = std::mem::zeroed();
+                let desc_hr = candidate.GetDesc1(&mut desc);
+                if desc_hr == S_OK &&
+                    desc.AdapterLuid.LowPart == luid_low &&
+                    desc.AdapterLuid.HighPart == luid_high
+                {
+                    break candidate;
+                }
+                index += 1;
+            };
+
+            let mut device: *mut winapi::um::d3d11::ID3D11Device = std::ptr::null_mut();
+            let mut feature_level = 0;
+            // 機能レベル配列を渡さず既定の降順選択に任せる。
+            let device_hr = winapi::um::d3d11::D3D11CreateDevice(
+                adapter.as_raw() as *mut winapi::shared::dxgi::IDXGIAdapter,
+                winapi::um::d3dcommon::D3D_DRIVER_TYPE_UNKNOWN,
+                std::ptr::null_mut(),
+                winapi::um::d3d11::D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                std::ptr::null(),
+                0,
+                winapi::um::d3d11::D3D11_SDK_VERSION,
+                &mut device,
+                &mut feature_level,
+                std::ptr::null_mut(),
+            );
+            if device_hr != S_OK || device.is_null() {
+                return Err(format!("D3D11CreateDevice failed: {device_hr:#x}"));
+            }
+            Ok(wio::com::ComPtr::from_raw(device))
+        }
+    }
+
+    /// ロード済みモジュールのフルパスを返す。未ロードや取得失敗では`None`とする。
+    fn module_path(module: &str) -> Option<String> {
+        let wide: Vec<u16> = module.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let handle = winapi::um::libloaderapi::GetModuleHandleW(wide.as_ptr());
+            if handle.is_null() {
+                return None;
+            }
+            let mut buffer = vec![0u16; 1024];
+            let length = winapi::um::libloaderapi::GetModuleFileNameW(
+                handle,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            );
+            if length == 0 {
+                return None;
+            }
+            Some(String::from_utf16_lossy(&buffer[..length as usize]))
+        }
+    }
 }

@@ -156,6 +156,19 @@ impl WebGLValidator for CommonTexImage2DValidator<'_> {
                 format
             },
             _ => {
+                log::warn!(
+                    "[texfmt] invalid internal_format={:#x} target={:#x} {}x{} level={} (from_gl_constant={:?})",
+                    self.internal_format,
+                    self.target,
+                    self.width,
+                    self.height,
+                    self.level,
+                    TexFormat::from_gl_constant(self.internal_format).map(|f| (
+                        format!("{f:?}"),
+                        f.required_webgl_version(),
+                        f.usable_as_internal()
+                    ))
+                );
                 self.context.webgl_error(InvalidEnum);
                 return Err(TexImageValidationError::InvalidTextureFormat);
             },

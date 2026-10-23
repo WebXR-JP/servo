@@ -450,8 +450,8 @@ interface mixin WebGLRenderingContextBase
 
     const GLenum NONE                           = 0;
 
-    const GLenum FRAMEBUFFER_COMPLETE                      = 0x8CD5;
-    const GLenum FRAMEBUFFER_INCOMPLETE_ATTACHMENT         = 0x8CD6;
+    const GLenum FRAMEBUFFER_COMPLETE                      = 0x8CA3;
+    const GLenum FRAMEBUFFER_INCOMPLETE_ATTACHMENT         = 0x8CD5;
     const GLenum FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT = 0x8CD7;
     const GLenum FRAMEBUFFER_INCOMPLETE_DIMENSIONS         = 0x8CD9;
     const GLenum FRAMEBUFFER_UNSUPPORTED                   = 0x8CDD;

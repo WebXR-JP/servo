@@ -98,6 +98,10 @@ pub(crate) struct ServoShellPreferences {
     pub webdriver_port: Cell<Option<u16>>,
     /// Whether the CLI option to enable experimental prefs was present at startup.
     pub experimental_preferences_enabled: bool,
+    /// Present a generated color pattern to OpenXR (D3D11) from a dedicated thread (PoC).
+    pub xr_present_test: bool,
+    /// Seconds to run before exiting in `--xr-present-test` mode (`None` means no timeout).
+    pub xr_present_seconds: Option<u64>,
     /// Log filter given in the `log_filter` spec as a String, if any.
     /// If a filter is passed, the logger should adjust accordingly.
     #[cfg(target_env = "ohos")]
@@ -131,6 +135,8 @@ impl Default for ServoShellPreferences {
             #[cfg(target_env = "ohos")]
             log_to_file: false,
             experimental_preferences_enabled: false,
+            xr_present_test: false,
+            xr_present_seconds: None,
         }
     }
 }
@@ -574,6 +580,14 @@ struct CmdArgs {
     #[bpaf(long)]
     zealous_gc: bool,
 
+    /// Present a generated color pattern to OpenXR (D3D11) from a dedicated thread (PoC, Windows only).
+    #[bpaf(long("xr-present-test"))]
+    xr_present_test: bool,
+
+    /// Seconds to run before exiting in `--xr-present-test` mode.
+    #[bpaf(long("seconds"), argument("N"))]
+    seconds: Option<u64>,
+
     /// The url we should load.
     #[bpaf(positional("URL"), fallback(String::from("https://www.servo.org")))]
     url: String,
@@ -669,6 +683,14 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         return ArgumentParsingResult::ContentProcess(content_process);
     }
 
+    // `--xr-present-test`は単一プロセスPoCのため`-M`とは併用できない。
+    if cmd_args.xr_present_test && cmd_args.multiprocess {
+        eprintln!(
+            "error: --xr-present-test cannot be used with -M/--multiprocess (single-process PoC)"
+        );
+        return ArgumentParsingResult::ErrorParsing;
+    }
+
     let config_dir = cmd_args
         .config_dir
         .clone()
@@ -720,6 +742,8 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         userscripts_directory: cmd_args.userscripts,
         user_stylesheets: cmd_args.user_stylesheet,
         experimental_preferences_enabled: cmd_args.enable_experimental_web_platform_features,
+        xr_present_test: cmd_args.xr_present_test,
+        xr_present_seconds: cmd_args.seconds,
         #[cfg(target_env = "ohos")]
         log_filter: cmd_args.log_filter.or_else(|| {
             (!preferences.log_filter.is_empty()).then(|| preferences.log_filter.clone())

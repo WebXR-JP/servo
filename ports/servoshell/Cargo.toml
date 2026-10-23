@@ -153,6 +153,15 @@ signal-hook-registry = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 servo = { workspace = true, features = ["no-wgl"] }
 windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_System_Console"] }
+# `--xr-present-test` PoC (D3D11経由のOpenXR提示) 用。components/webxr とは独立。
+openxr = { workspace = true }
+winapi = { workspace = true, features = [
+    "d3d11",
+    "d3dcommon",
+    "dxgi",
+    "winerror",
+] }
+wio = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { workspace = true, features = [

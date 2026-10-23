@@ -43,6 +43,11 @@ pub fn main() {
     crate::init_tracing(servoshell_preferences.tracing_filter.as_deref());
 
     let clean_shutdown = servoshell_preferences.clean_shutdown;
+    // XR提示PoCスレッドはメインスレッド(winit/Servo)と結合せず、独立に回す。
+    // メイン側では`xrWaitFrame`等の待ちを行わない。
+    if servoshell_preferences.xr_present_test {
+        super::xr_present::spawn(&servoshell_preferences);
+    }
     let event_loop = match servoshell_preferences.headless {
         true => ServoShellEventLoop::headless(),
         false => ServoShellEventLoop::headed(),

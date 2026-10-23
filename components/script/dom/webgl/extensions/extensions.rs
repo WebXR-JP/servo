@@ -24,6 +24,7 @@ use crate::dom::bindings::codegen::Bindings::OESTextureHalfFloatBinding::OESText
 use crate::dom::bindings::codegen::Bindings::OESVertexArrayObjectBinding::OESVertexArrayObjectConstants;
 use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGLRenderingContextConstants as constants;
 use crate::dom::bindings::trace::JSTraceable;
+use crate::dom::webgl::extensions::extcolorbufferfloat::EXTColorBufferFloat;
 use crate::dom::webgl::extensions::extcolorbufferhalffloat::EXTColorBufferHalfFloat;
 use crate::dom::webgl::extensions::oestexturefloat::OESTextureFloat;
 use crate::dom::webgl::extensions::oestexturehalffloat::OESTextureHalfFloat;
@@ -417,6 +418,7 @@ impl WebGLExtensions {
     fn register_all_extensions(&self) {
         self.register::<ext::angleinstancedarrays::ANGLEInstancedArrays>();
         self.register::<ext::extblendminmax::EXTBlendMinmax>();
+        self.register::<ext::extcolorbufferfloat::EXTColorBufferFloat>();
         self.register::<ext::extcolorbufferhalffloat::EXTColorBufferHalfFloat>();
         self.register::<ext::extfragdepth::EXTFragDepth>();
         self.register::<ext::extshadertexturelod::EXTShaderTextureLod>();
@@ -431,6 +433,7 @@ impl WebGLExtensions {
         self.register::<ext::webglcolorbufferfloat::WEBGLColorBufferFloat>();
         self.register::<ext::webglcompressedtextureetc1::WEBGLCompressedTextureETC1>();
         self.register::<ext::webglcompressedtextures3tc::WEBGLCompressedTextureS3TC>();
+        self.register::<ext::webglcompressedtextures3tcsrgb::WEBGLCompressedTextureS3TCSrgb>();
     }
 
     pub(crate) fn enable_element_index_uint(&self) {
@@ -459,6 +462,12 @@ impl WebGLExtensions {
 
     pub(crate) fn is_half_float_buffer_renderable(&self) -> bool {
         self.is_enabled::<EXTColorBufferHalfFloat>() || self.is_enabled::<OESTextureHalfFloat>()
+    }
+
+    /// EXT_color_buffer_float が有効な場合に真を返す。
+    /// WebGL2 の浮動小数点レンダーバッファ作成の可否判定に使う。
+    pub(crate) fn is_ext_color_buffer_float_enabled(&self) -> bool {
+        self.is_enabled::<EXTColorBufferFloat>()
     }
 
     pub(crate) fn effective_type(&self, type_: u32) -> u32 {

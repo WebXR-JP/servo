@@ -30,7 +30,15 @@ impl XrDiscoveryWebXrRegistry {
         window: Rc<dyn PlatformWindow>,
         event_loop: Option<&ActiveEventLoop>,
         preferences: &Preferences,
+        xr_present_test: bool,
     ) -> Box<Self> {
+        // `--xr-present-test`モードではservo内蔵のOpenXR/glwindow discoveryを使わない。
+        // 専用スレッドが自前のOpenXRセッションを持つため、二重初期化を避ける。
+        if xr_present_test {
+            return Box::new(Self {
+                xr_discovery: RefCell::new(None),
+            });
+        }
         let Some(event_loop) = event_loop else {
             return Box::new(Self {
                 xr_discovery: RefCell::new(None),

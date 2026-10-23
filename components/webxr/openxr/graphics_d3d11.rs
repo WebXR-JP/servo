@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::{mem, ptr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use euclid::{Size2D, UnknownUnit};
 use log::warn;
@@ -18,12 +19,25 @@ use webxr_api::Error;
 use winapi::Interface;
 use winapi::shared::winerror::{DXGI_ERROR_NOT_FOUND, S_OK};
 use winapi::shared::{dxgi, dxgiformat};
-use winapi::um::d3d11::ID3D11Texture2D;
+use winapi::um::d3d11::{ID3D11Device, ID3D11Texture2D};
 use wio::com::ComPtr;
 
 use crate::openxr::graphics::{GraphicsProvider, GraphicsProviderMethods};
 
 pub type Backend = D3D11;
+
+/// `xrCreateSession` に渡した D3D11 デバイスの生ポインタを保持する。
+///
+/// XR スワップチェーン画像はこのデバイスの所有物であり、`xr_copy` が使う
+/// デバイスとの同一判定の基準とする。`native_device()` は参照を1つ足して返すため、
+/// ここに格納した分は解放せず、セッション存続中は有効に保つ。
+/// 不変条件: 0 は未設定であり、設定後は不変である。
+static SESSION_D3D_DEVICE: AtomicUsize = AtomicUsize::new(0);
+
+/// セッション作成時に XR ランタイムへ渡したデバイスを返す。未作成時は null である。
+pub(super) fn session_device_ptr() -> *mut ID3D11Device {
+    SESSION_D3D_DEVICE.load(Ordering::SeqCst) as *mut ID3D11Device
+}
 
 impl GraphicsProviderMethods<D3D11> for GraphicsProvider {
     fn enable_graphics_extensions(exts: &mut ExtensionSet) {
@@ -37,8 +51,11 @@ impl GraphicsProviderMethods<D3D11> for GraphicsProvider {
         warn!("Available formats: {:?}", formats);
         for format in formats {
             match *format {
-                dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => return *format,
+                // ADR: ANGLE共有pbuffer（TEXTURE_RGBA由来）はUNORMであり、
+                // GPUコピー経路のCopyResourceは形式一致を要求するためUNORMを優先する。
+                // SRGBが選ばれると転送元と形式が合わず層の初期化に失敗する。
                 dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM => return *format,
+                dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => return *format,
                 // dxgiformat::DXGI_FORMAT_R8G8B8A8_UNORM => return *format,
                 f => {
                     warn!("Backend requested unsupported format {:?}", f);
@@ -63,6 +80,9 @@ impl GraphicsProviderMethods<D3D11> for GraphicsProvider {
             .map_err(|_| Error::NoMatchingDevice)?;
         let native_device = device.native_device();
         let d3d_device = native_device.d3d11_device;
+        // デバイス同一判定の基準として保持する。native_device() の +1 参照は放さず、
+        // セッション存続中の有効性を保証する（終了時に回収される一時的なリーク）。
+        SESSION_D3D_DEVICE.store(d3d_device as usize, Ordering::SeqCst);
 
         unsafe {
             instance
