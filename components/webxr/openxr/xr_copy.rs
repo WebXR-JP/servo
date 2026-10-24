@@ -90,13 +90,6 @@ fn release_shared_texture(ready: &CopyReady) -> Result<(), i32> {
 // ADR: 毎フレーム出力すると90Hzで肥大化するため、60フレームごとの集約とする。
 const EMIT_EVERY_FRAMES: u64 = 60;
 
-/// GPUコピー経路を使うかどうか。既定で使い、`XR_LAYER_MODE=import` のときだけ従来経路に戻す。
-pub(super) fn copy_mode_enabled() -> bool {
-    std::env::var("XR_LAYER_MODE")
-        .map(|v| v != "import")
-        .unwrap_or(true)
-}
-
 pub(super) fn emit_json(value: serde_json::Value) {
     let line = serde_json::to_string(&value)
         .unwrap_or_else(|_| "{\"event\":\"xr-copy-encode-error\"}".to_owned());
