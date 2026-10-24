@@ -38,9 +38,8 @@ use winapi::shared::dxgi::{
 };
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::{
-    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
     D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RTV_DIMENSION_TEXTURE2D,
-    D3D11_RTV_DIMENSION_TEXTURE2DMS, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device,
+    D3D11_RTV_DIMENSION_TEXTURE2DMS, D3D11_TEXTURE2D_DESC, ID3D11Device,
     ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Resource, ID3D11Texture2D,
 };
 use wio::com::ComPtr;
@@ -216,12 +215,11 @@ pub(super) struct CopyReady {
     /// 不変条件: 通常時は `Some` であり、E1描画の途中の瞬間だけ `None` である。
     pub(super) surface_texture: Option<SurfaceTexture>,
     pub(super) gl_texture: glow::NativeTexture,
-    pub(super) gl_target: u32,
     /// ページの描画先となるservo自前の通常GLテクスチャ。`SubImage.color_texture` に渡す。
     /// E2-blitの転送元であり、ページは今まで通り `XRWebGLLayer.framebuffer` に描く。
-    /// 不変条件: 既定転送では `Some` であり、生成失敗時はsetup全体がBrokenになる。
+    /// 不変条件: 生成時に必ず作り、失敗時はsetup全体がBrokenになる。
     /// GLスレッドでのみ操作する。
-    pub(super) page_texture: Option<glow::NativeTexture>,
+    pub(super) page_texture: glow::NativeTexture,
     /// `page_texture` のテクスチャ標的。常に `TEXTURE_2D` である。
     pub(super) page_target: u32,
     /// 転送元の共有テクスチャ。E2ではXRデバイス上で作ったTそのものである。
@@ -238,10 +236,7 @@ pub(super) struct CopyReady {
     pub(super) d3d_device: *mut ID3D11Device,
     /// XR画像の形式。`ResolveSubresource`に渡す。
     pub(super) dst_format: u32,
-    /// 診断用に保持するTの共有ハンドルと層の寸法。
-    /// `GetSharedHandle` での再取得値と比較する。
-    /// ADR: 診断専用の保持であり、転送経路には使わない。
-    pub(super) share_handle: *mut c_void,
+    /// 層の寸法。
     pub(super) width: i32,
     pub(super) height: i32,
     /// T2の中間テクスチャ。XRデバイス上で作った87の自前資源であり、共有ハンドルの
@@ -643,7 +638,6 @@ pub(super) fn setup_backing(
         }
         return fail("imported surface texture has no GL object".into());
     };
-    let gl_target = device.surface_gl_texture_target();
     // 以降は XR デバイスに統一する。ANGLE 側の +1 参照は取り込み時に放済みである。
     let d3d_device = xr_device;
     let mut imm: *mut ID3D11DeviceContext = ptr::null_mut();
@@ -755,7 +749,7 @@ pub(super) fn setup_backing(
         create_page_texture(gl, width, height, context_id)
     };
     let (page_texture, page_method) = match page_tex_result {
-        Ok((tex, method)) => (Some(tex), method),
+        Ok((tex, method)) => (tex, method),
         Err(reason) => {
             unsafe {
                 drop(ComPtr::from_raw(t));
@@ -783,7 +777,6 @@ pub(super) fn setup_backing(
     CopyBacking::Ready(CopyReady {
         surface_texture: Some(surface_texture),
         gl_texture,
-        gl_target,
         page_texture,
         page_target,
         shared_texture: t,
@@ -791,7 +784,6 @@ pub(super) fn setup_backing(
         imm_context: imm,
         d3d_device,
         dst_format: dst_desc.Format,
-        share_handle: t_handle,
         width,
         height,
         resolve,
@@ -845,18 +837,6 @@ pub(super) fn diag_enabled() -> bool {
     })
 }
 
-/// D3D側診断読み戻しの範囲を環境変数で切り替える。
-/// `XR_COPY_DIAG_D3D` が `nodst` ならXR画像側、`nosrc` なら共有側、`nod3d` なら両方を
-/// 省略する（GL側診断と転送自体は行う）。デバイス除去の切り分け用の一時的な綱である。
-/// ADR: 原因特定後に削除する。
-static DIAG_D3D_MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-fn diag_d3d_mode() -> &'static str {
-    DIAG_D3D_MODE
-        .get_or_init(|| std::env::var("XR_COPY_DIAG_D3D").unwrap_or_default())
-        .as_str()
-}
-
 /// 診断で読む画素位置。左端・中央・右端の3点をGL座標（原点は左下）で返す。
 /// 左端は赤帯、右端は緑帯、中央はカラーバーの想定である。
 fn diag_points(width: i32, height: i32) -> [(i32, i32); 3] {
@@ -864,33 +844,22 @@ fn diag_points(width: i32, height: i32) -> [(i32, i32); 3] {
     [(2, y), (width / 2, y), (width - 3, y)]
 }
 
-/// 1段分の診断読み戻し結果。`pixels` は左端・中央・右端の順で、
-/// GL側はRGBA、D3D側はBGRAのまま格納する。
+/// 1段分の診断読み戻し結果。`value` はJSONへ記録する内容である。
 struct DiagRead {
     value: serde_json::Value,
-    pixels: Option<[[u8; 4]; 3]>,
 }
 
 /// GLテクスチャ側の診断読み戻し。FBOにアタッチして数点を読む。
 /// ページの描画が `SubImage.color_texture` に届いているかを見る。
-/// E2-blitでは `page_texture`（servo自前の通常テクスチャ）を読み、
-/// 旧経路の診断時のみ取り込み面の `gl_texture` を読む。
+/// E2-blitでは `page_texture`（servo自前の通常テクスチャ）を読む。
 /// ADR: 診断専用の読み戻しであり、転送経路には入れない。
 fn diag_read_gl(gl: &glow::Context, ready: &CopyReady) -> DiagRead {
     let points = diag_points(ready.width, ready.height);
     let fail = |reason: String| DiagRead {
         value: serde_json::json!({"ok": false, "error": reason}),
-        pixels: None,
     };
-    // E2-blit既定ではページ描画先を読む。旧診断（E1-dance等）では取り込み面を読む。
-    let (tex, target, source) = if let Some(page) = ready.page_texture {
-        (page, ready.page_target, "page")
-    } else {
-        let Some(_surface_texture) = ready.surface_texture.as_ref() else {
-            return fail("no surface_texture for GL diag".into());
-        };
-        (ready.gl_texture, ready.gl_target, "imported")
-    };
+    // E2-blit既定ではページ描画先を読む。
+    let (tex, target, source) = (ready.page_texture, ready.page_target, "page");
     // SAFETY: GLスレッド上の有効なコンテキストに対する診断専用の読み戻しである。
     // 既存の描画内容は変えず、FBOの結び替えは元に戻し、診断用FBOは都度捨てる。
     unsafe {
@@ -938,157 +907,8 @@ fn diag_read_gl(gl: &glow::Context, ready: &CopyReady) -> DiagRead {
                 "fbo_status": format!("{status:#x}"),
                 "gl_error": format!("{error:#x}"),
             }),
-            pixels: Some(sampled),
         }
     }
-}
-
-/// D3Dテクスチャ側の診断読み戻し。STAGINGへ転送して `Map` し、数点を読む。
-/// `via_resolve` が真のときはMSAA解決で読む（XR画像側がMSAAの場合）。
-/// ADR: 診断専用の読み戻しであり、転送経路には入れない。STAGINGは都度作って捨てる。
-unsafe fn diag_read_d3d(
-    device: *mut ID3D11Device,
-    imm: *mut ID3D11DeviceContext,
-    src: *mut ID3D11Texture2D,
-    via_resolve: bool,
-    resolve_format: u32,
-) -> DiagRead {
-    let fail = |reason: String| DiagRead {
-        value: serde_json::json!({"ok": false, "error": reason}),
-        pixels: None,
-    };
-    if device.is_null() || imm.is_null() || src.is_null() {
-        return fail("null device/context/texture".into());
-    }
-    // SAFETY: 呼び出し元が保証する有効なテクスチャの記述子取得である。
-    let mut desc: D3D11_TEXTURE2D_DESC = std::mem::zeroed();
-    (*src).GetDesc(&mut desc);
-    let staging_desc = D3D11_TEXTURE2D_DESC {
-        Width: desc.Width,
-        Height: desc.Height,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: desc.Format,
-        SampleDesc: winapi::shared::dxgitype::DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_STAGING,
-        BindFlags: 0,
-        CPUAccessFlags: D3D11_CPU_ACCESS_READ,
-        MiscFlags: 0,
-    };
-    let mut staging: *mut ID3D11Texture2D = ptr::null_mut();
-    // SAFETY: 出力先ポインタは有効であり、STAGING記述子は読み戻し用途の定型である。
-    let create_hr = (*device).CreateTexture2D(&staging_desc, ptr::null(), &mut staging);
-    if create_hr != S_OK || staging.is_null() {
-        return fail(format!("CreateTexture2D staging failed: {create_hr:#x}"));
-    }
-    // SAFETY: ここで確保した+1参照はガードが放す。GLスレッドでのみ実行される。
-    let _staging_guard = ComPtr::from_raw(staging);
-    // SAFETY: 転送元・転送先はいずれも有効であり、immediate context上で順序実行される。
-    if via_resolve {
-        (*imm).ResolveSubresource(
-            staging as *mut ID3D11Resource,
-            0,
-            src as *mut ID3D11Resource,
-            0,
-            resolve_format,
-        );
-    } else {
-        (*imm).CopyResource(
-            staging as *mut ID3D11Resource,
-            src as *mut ID3D11Resource,
-        );
-    }
-    let mut mapped: D3D11_MAPPED_SUBRESOURCE = std::mem::zeroed();
-    // SAFETY: STAGINGへの有効なMap要求であり、読み範囲は記述子内に収める。
-    let map_hr = (*imm).Map(
-        staging as *mut ID3D11Resource,
-        0,
-        D3D11_MAP_READ,
-        0,
-        &mut mapped,
-    );
-    if map_hr != S_OK || mapped.pData.is_null() {
-        return fail(format!("Map failed: {map_hr:#x}"));
-    }
-    // D3Dの行0は上端のため、GL座標（原点は左下）とは上下が反転する。
-    // 同一論理画素の比較になるよう行を反転して読む。
-    let w = desc.Width as i32;
-    let h = desc.Height as i32;
-    let points = diag_points(w, h);
-    let mut sampled = [[0u8; 4]; 3];
-    for (i, (x, y_gl)) in points.iter().enumerate() {
-        let row = (h - 1 - y_gl) as isize;
-        // SAFETY: Map済み範囲内の4バイト読みであり、行列とも記述子内に収まる。
-        let base =
-            (mapped.pData as *const u8).offset(row * mapped.RowPitch as isize + *x as isize * 4);
-        let px = std::slice::from_raw_parts(base, 4);
-        sampled[i] = [px[0], px[1], px[2], px[3]];
-    }
-    (*imm).Unmap(staging as *mut ID3D11Resource, 0);
-    DiagRead {
-        value: serde_json::json!({
-            "ok": true,
-            "left_bgra": sampled[0],
-            "center_bgra": sampled[1],
-            "right_bgra": sampled[2],
-            "width": desc.Width,
-            "height": desc.Height,
-            "format": desc.Format,
-            "samples": desc.SampleDesc.Count,
-            "map_hr": format!("{map_hr:#x}"),
-        }),
-        pixels: Some(sampled),
-    }
-}
-
-/// 段ごとの診断結果を1行JSONで記録する。黒画面の切断点を数値で特定するための一時的な観測点である。
-fn emit_diag(seq: u64, ready: &CopyReady, gl: DiagRead, src: DiagRead, dst: DiagRead) {
-    // GL側はRGBA、D3D側はBGRAのため、比較時にチャンネルを揃える。
-    let swizzle = |bgra: [u8; 4]| [bgra[2], bgra[1], bgra[0], bgra[3]];
-    let match_gl_src = match (&gl.pixels, &src.pixels) {
-        (Some(g), Some(s)) => g.iter().zip(s.iter()).all(|(g, s)| *g == swizzle(*s)),
-        _ => false,
-    };
-    let match_src_dst = match (&src.pixels, &dst.pixels) {
-        (Some(s), Some(d)) => s == d,
-        _ => false,
-    };
-    // 共有ハンドルの再取得。GLテクスチャ側と共有元が同一物かを見る。
-    // SAFETY: setupで開いた有効な共有テクスチャに対する問い合わせである。
-    let (handle_now, handle_hr) = unsafe {
-        let mut res: *mut IDXGIResource = ptr::null_mut();
-        let hr = (*ready.shared_texture).QueryInterface(
-            &IDXGIResource::uuidof(),
-            &mut res as *mut *mut IDXGIResource as *mut *mut c_void,
-        );
-        if hr != S_OK || res.is_null() {
-            (None, hr)
-        } else {
-            let res = ComPtr::from_raw(res);
-            // winapi 0.3のDXGI 1.0式シグネチャではハンドルをout引数で受ける。
-            let mut handle: *mut c_void = ptr::null_mut();
-            let handle_hr = res.GetSharedHandle(&mut handle);
-            (Some(handle as usize), handle_hr)
-        }
-    };
-    emit_json(serde_json::json!({
-        "event": "xr-copy-diag",
-        "seq": seq,
-        "size": {"width": ready.width, "height": ready.height},
-        "gl_texture": gl.value,
-        "shared_texture": src.value,
-        "xr_image": dst.value,
-        "match_gl_shared": match_gl_src,
-        "match_shared_xr": match_src_dst,
-        "share_handle": format!("{:#x}", ready.share_handle as usize),
-        "share_handle_requery": handle_now.map(|h| format!("{h:#x}")),
-        "share_handle_hr": format!("{handle_hr:#x}"),
-        "share_handle_equal": handle_now == Some(ready.share_handle as usize),
-        "resolve": ready.resolve,
-    }));
 }
 
 /// XRスワップチェーン画像の記述子を診断用に返す (width, height, format, samples)。
@@ -1731,9 +1551,7 @@ fn blit_page_to_default(
     let Some(gl) = contexts.bindings(context_id) else {
         return Err("no GL bindings for blit".into());
     };
-    let Some(page) = ready.page_texture else {
-        return Err("no page_texture for blit".into());
-    };
+    let page = ready.page_texture;
     let (w, h) = (ready.width, ready.height);
     let flip = blit_flip_enabled();
     // SAFETY: GLスレッド上の有効なコンテキストに対するblitであり、FBOの結び替えは元に戻し、
@@ -2531,7 +2349,8 @@ pub(super) fn destroy_backing(
         return;
     };
     // ページ描画先（自前GLテクスチャ）を破棄する。失敗してもpanicさせず、終了時に回収される。
-    if let Some(page) = ready.page_texture.take() {
+    {
+        let page = ready.page_texture;
         if let Some(gl) = contexts.bindings(context_id) {
             // SAFETY: GLスレッド上の有効なコンテキストに対する破棄要求である。
             unsafe {

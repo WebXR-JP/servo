@@ -214,13 +214,9 @@ impl Presenter {
                     return Err(e);
                 }
                 layer.waited = true;
-                // E2-blit既定では自前の通常テクスチャへ描く。旧E2の取り込み面は使わない。
-                // ページは今まで通り `XRWebGLLayer.framebuffer` に描き、end_frameでblitする。
-                if let Some(page) = ready.page_texture {
-                    (Some(page), ready.page_target)
-                } else {
-                    (Some(ready.gl_texture), ready.gl_target)
-                }
+                // E2-blit既定では自前の通常テクスチャへ描く。生成失敗時はsetup全体がBrokenの
+                // ため、ここでは常に有効である。ページは今まで通り `XRWebGLLayer.framebuffer` に描き、end_frameでblitする。
+                (Some(ready.page_texture), ready.page_target)
             },
         };
         Ok(DrawTarget {
