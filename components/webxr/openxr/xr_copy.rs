@@ -13,12 +13,11 @@
 //! 無限待ちは使わない（`wait_image`のみ有限タイムアウトで切り上げ、そのフレームを落とす）。
 //!
 //! 旧E2（取り込み面のGLテクスチャへFBOで描く）は `readPixels` が `[0,0,0,0]` で
-//! 描けていなかったため使わない。T1/E1-dance/T2/E3の診断経路は保持するが、
-//! 既定のE2転送は本モジュールのblit経路である。上下反転はblit矩形で吸収する
-//! （既定は非反転の等倍、`XR_BLIT_FLIP=1` でY反転）。
+//! 描けていなかったため使わない。既定のE2転送は本モジュールのblit経路である。
+//! 上下反転はblit矩形で吸収する（既定は非反転の等倍、`XR_BLIT_FLIP=1` でY反転）。
 //!
-//! Tは `D3D11_RESOURCE_MISC_SHARED` で作る（E3と同一）。keyed mutex付きの旧E2用Tは
-//! 診断（T1/T2/E1-dance）のために残すが、既定転送には使わない。
+//! keyed mutex付きの旧E2用Tや取り込み面などの旧資源の生成は残すが、既定転送には
+//! 使わない（作業単位Cで削除する）。
 
 use std::ffi::c_void;
 use std::ptr;
@@ -38,9 +37,7 @@ use winapi::shared::dxgi::{
 };
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::{
-    D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RTV_DIMENSION_TEXTURE2D,
-    D3D11_RTV_DIMENSION_TEXTURE2DMS, D3D11_TEXTURE2D_DESC, ID3D11Device,
-    ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Resource, ID3D11Texture2D,
+    D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
 };
 use wio::com::ComPtr;
 
@@ -53,37 +50,6 @@ use crate::SurfmanGL;
 /// タイムアウト時はそのフレームを落としてセッションを継続する。
 // ADR: `INFINITE`を使うとランタイム異常時にGLスレッドが永久停止するため上限を設ける。
 pub(super) const WAIT_TIMEOUT_NANOS: i64 = 500_000_000;
-
-/// keyed mutex確保の有限待ち時間（ミリ秒）。
-///
-/// `glFinish` 済みのため通常は即時取得できる。ANGLE側が持ち切りのときは
-/// そのフレームを落として継続し、GLスレッドを止めない。
-// ADR: surfman 0.14はbind/unbindで `AcquireSync(0, INFINITE)`／`ReleaseSync(0)` を使うが、
-// ここではランタイム異常時の永久停止を避けるため有限値とする。キーはsurfmanに合わせた0である。
-const KEYED_MUTEX_TIMEOUT_MS: u32 = 500;
-
-/// `CopyResource` 直前にTの所有権をD3D側へ移す。
-///
-/// ANGLE描画は `glFinish` で確定済みであることを呼び出し元が保証する。
-/// 取得失敗時は転送を行わず、そのフレームを落とす。
-fn acquire_shared_texture(ready: &CopyReady) -> Result<(), i32> {
-    if ready.keyed_mutex.is_null() {
-        return Err(winapi::shared::winerror::E_FAIL);
-    }
-    // SAFETY: setupで取得した有効なkeyed mutexに対する有限待ちの確保要求である。
-    let hr = unsafe { (*ready.keyed_mutex).AcquireSync(0, KEYED_MUTEX_TIMEOUT_MS) };
-    if hr == S_OK { Ok(()) } else { Err(hr) }
-}
-
-/// `CopyResource`＋`Flush` 直後にTの所有権をANGLE側へ戻す。
-fn release_shared_texture(ready: &CopyReady) -> Result<(), i32> {
-    if ready.keyed_mutex.is_null() {
-        return Err(winapi::shared::winerror::E_FAIL);
-    }
-    // SAFETY: acquire済みの有効なkeyed mutexに対する解放要求である。
-    let hr = unsafe { (*ready.keyed_mutex).ReleaseSync(0) };
-    if hr == S_OK { Ok(()) } else { Err(hr) }
-}
 
 /// 統計ログの出力間隔（end_frame回数）。
 // ADR: 毎フレーム出力すると90Hzで肥大化するため、60フレームごとの集約とする。
@@ -210,10 +176,12 @@ pub(super) enum CopyBacking {
 }
 
 pub(super) struct CopyReady {
-    /// 取り込み面Sから作った描画用テクスチャ。旧E2/E1-danceの診断用に残す。
+    /// 取り込み面Sから作った描画用テクスチャ。旧E2の診断用に残す（作業単位Cで削除する）。
     /// 既定のE2-blit転送では使わない（FBO経由で描けないことが確定したため）。
-    /// 不変条件: 通常時は `Some` であり、E1描画の途中の瞬間だけ `None` である。
+    /// 不変条件: 通常時は `Some` であり、描画の途中の瞬間だけ `None` になり得る。
     pub(super) surface_texture: Option<SurfaceTexture>,
+    /// 旧E2の取り込み面から作った描画用テクスチャのGL名。既定転送では使わない
+    /// （作業単位Cで `surface_texture` とともに削除する）。
     pub(super) gl_texture: glow::NativeTexture,
     /// ページの描画先となるservo自前の通常GLテクスチャ。`SubImage.color_texture` に渡す。
     /// E2-blitの転送元であり、ページは今まで通り `XRWebGLLayer.framebuffer` に描く。
@@ -222,13 +190,13 @@ pub(super) struct CopyReady {
     pub(super) page_texture: glow::NativeTexture,
     /// `page_texture` のテクスチャ標的。常に `TEXTURE_2D` である。
     pub(super) page_target: u32,
-    /// 転送元の共有テクスチャ。E2ではXRデバイス上で作ったTそのものである。
-    /// GLスレッドでのみ操作する。
+    /// 旧E2用の共有テクスチャ。XRデバイス上で作ったTそのものである。
+    /// 既定転送の転送元には使わず、`ensure_e3` が記述子取得元として読むだけである
+    /// （作業単位Cで削除する）。GLスレッドでのみ操作する。
     pub(super) shared_texture: *mut ID3D11Texture2D,
-    /// Tのkeyed mutex。+1参照であり、GLスレッドでのみ操作する。
-    /// `CopyResource` 前後で `AcquireSync(0)`／`ReleaseSync(0)` し、ANGLE描画との所有権を受け渡す。
-    /// キーはsurfman 0.14のANGLE実装（`device.rs` のbind/unbind）に合わせた0である。
-    /// 不変条件: nullまたは有効な+1参照であり、E2/T1/E1-danceの転送元がTのときだけ使う。
+    /// 旧E2用Tのkeyed mutex。+1参照であり、GLスレッドでのみ操作する。
+    /// 既定転送では使わず、破棄時に放すだけである（作業単位Cで削除する）。
+    /// 不変条件: nullまたは有効な+1参照である。
     pub(super) keyed_mutex: *mut IDXGIKeyedMutex,
     /// XRデバイスのimmediate context。GLスレッドでのみ操作する。
     pub(super) imm_context: *mut ID3D11DeviceContext,
@@ -239,10 +207,6 @@ pub(super) struct CopyReady {
     /// 層の寸法。
     pub(super) width: i32,
     pub(super) height: i32,
-    /// T2の中間テクスチャ。XRデバイス上で作った87の自前資源であり、共有ハンドルの
-    /// 由来物ではない。`CopyResource(T → XR画像)` の合法性だけを切り分ける。
-    /// 不変条件: nullまたは有効な+1参照であり、GLスレッドでのみ操作する。
-    pub(super) t2_texture: *mut ID3D11Texture2D,
     /// E3の裏付け（XRデバイス作成T＋ANGLE取り込み面S）。遅延生成する。
     pub(super) e3: Option<E3State>,
     /// XR画像がMSAAのときに`CopyResource`ではなく`ResolveSubresource`を使う。
@@ -445,7 +409,7 @@ fn create_page_texture(
     /// 取り込んだ面Sへ直接結び付けた描画用テクスチャを得る。ページはこのGLテクスチャへ
 /// 直接描き、end_frameで `CopyResource(T → XR画像)` する。TとXR画像は同一デバイス上の
 /// 資源であるためデバイス間転送は発生しない。
-/// ADR: ANGLEが作ったpbufferをXR側で開く旧経路は黒になるため使わない（T1/E1'で確定）。
+/// ADR: ANGLEが作ったpbufferをXR側で開く旧経路は黒になるため使わない。
 pub(super) fn setup_backing(
     contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
     context_id: ContextId,
@@ -787,7 +751,6 @@ pub(super) fn setup_backing(
         width,
         height,
         resolve,
-        t2_texture: ptr::null_mut(),
         e3: None,
         acquired_image: None,
     })
@@ -818,7 +781,7 @@ pub(super) fn wait_for_copy(
 
 /// 診断読み戻しの実施通番。`copy_to_swapchain` の呼び出しごとに進む。
 ///
-/// 初回3回と、その後600回に1回だけ診断する。STAGING確保と `Map` 待ちを伴うため
+/// 初回3回と、その後600回に1回だけ診断する。GL側の読み戻しを伴うため
 /// 毎フレームは行わない。
 /// ADR: 診断専用の観測点であり、転送経路には入れない。
 static DIAG_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -932,273 +895,18 @@ pub(super) fn describe_image(
     }
 }
 
-/// Stage A の有効判定。`XR_STAGE_A` が `1` のときだけD3D単体の赤塗りを行う。
-/// Stage A では ANGLE・GL・共有面に一切触らず、XR画像だけを赤くする。
-/// ADR: 黒画面の切り分け専用の一時的な観測点であり、原因特定後に削除する。
-fn stage_a_enabled() -> bool {
-    std::env::var("XR_STAGE_A")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
-/// Stage A: XR画像へD3Dだけで赤を出す。`CopyResource` は使わない。
-///
-/// XR画像(90 TYPELESS)へ形式87(B8G8R8A8_UNORM)のRTVを作り、
-/// `ClearRenderTargetView` で全面赤(1,0,0,1)に塗る。TYPELESS資源へのUNORM
-/// ビューはDXGIの形式互換であり、形式不一致によるno-opは起きない。
-/// `Flush` 後に呼び出し元がrelease・`xrEndFrame`へ進む。
-/// ADR: STAGING読み戻しは一切行わない（device removal回避）。原因特定後に削除する。
-fn stage_a_fill_red(
-    ready: &mut CopyReady,
-    dst: *mut ID3D11Texture2D,
-    stats: &mut CopyStats,
-    seq: u64,
-    diagnosing: bool,
-) {
-    // SAFETY: 呼び出し元が保証する有効なXR画像・デバイス・contextである。
-    // XRセッションはこのデバイスから作られており、XR画像は同一デバイス上の資源である。
-    unsafe {
-        let mut desc: D3D11_TEXTURE2D_DESC = std::mem::zeroed();
-        (*dst).GetDesc(&mut desc);
-        let view_dimension = if desc.SampleDesc.Count > 1 {
-            D3D11_RTV_DIMENSION_TEXTURE2DMS
-        } else {
-            D3D11_RTV_DIMENSION_TEXTURE2D
-        };
-        // 共用体部は MipSlice=0 であり、ゼロ初期値のままでよい。
-        let mut rtv_desc: D3D11_RENDER_TARGET_VIEW_DESC = std::mem::zeroed();
-        rtv_desc.Format =
-            winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
-        rtv_desc.ViewDimension = view_dimension;
-        let mut rtv: *mut ID3D11RenderTargetView = ptr::null_mut();
-        let create_hr = (*ready.d3d_device).CreateRenderTargetView(
-            dst as *mut ID3D11Resource,
-            &rtv_desc,
-            &mut rtv,
-        );
-        if create_hr != S_OK || rtv.is_null() {
-            stats.note_copy_failure();
-            // 失敗分岐のログは初回3回と600フレームに1回に絞る（暴走防止）。
-            if should_emit_fail(seq) {
-                error!("[xr-copy] stage-a RTV creation failed: {create_hr:#x}");
-                emit_json(serde_json::json!({
-                    "event": "xr-copy-stage-a",
-                    "seq": seq,
-                    "ok": false,
-                    "reason": "create_rtv_failed",
-                    "create_hr": format!("{create_hr:#x}"),
-                    "dst": {"width": desc.Width, "height": desc.Height,
-                            "format": desc.Format, "samples": desc.SampleDesc.Count},
-                }));
-            }
-            return;
-        }
-        // SAFETY: 直上で確保した+1参照をガードが放す。GLスレッドでのみ実行される。
-        let _rtv_guard = ComPtr::from_raw(rtv);
-        let begun = Instant::now();
-        let red = [1.0f32, 0.0, 0.0, 1.0];
-        (*ready.imm_context).ClearRenderTargetView(rtv, &red);
-        (*ready.imm_context).Flush();
-        let clear_ms = begun.elapsed().as_secs_f64() * 1000.0;
-        // SAFETY: setupで保持した有効なデバイスに対する状態取得である。
-        // XRデバイスに統一した後の所有関係を imperative に確認する。
-        let removed = (*ready.d3d_device).GetDeviceRemovedReason();
-        if removed != S_OK {
-            stats.note_copy_failure();
-            // 失敗分岐のログは初回3回と600フレームに1回に絞る（暴走防止）。
-            if should_emit_fail(seq) {
-                error!("[xr-copy] stage-a failed (device reason {removed:#x})");
-            }
-        }
-        stats.record_copy(0.0, clear_ms);
-        if diagnosing {
-            emit_json(serde_json::json!({
-                "event": "xr-copy-stage-a",
-                "seq": seq,
-                "ok": removed == S_OK,
-                "create_hr": format!("{create_hr:#x}"),
-                "removed_hr": format!("{removed:#x}"),
-                "clear_ms": clear_ms,
-                "dst": {"width": desc.Width, "height": desc.Height,
-                        "format": desc.Format, "samples": desc.SampleDesc.Count},
-                "rtv_format": rtv_desc.Format,
-                "rtv_dimension": view_dimension,
-            }));
-        }
-    }
-}
-
-/// E1実験の有効判定。既定では無効であり、E2（ページ内容の転送）が動く。
-/// `XR_COPY_E1` が `on`・`1`・`e1` のときだけ旧来の赤塗りを行う。
-/// `off` のときは診断fillの指定があっても赤塗りしない。
-/// ADR: E2を既定にするため、診断fill（`XR_E1_FILL`）の明示指定があるときもE1系を動かす。
-fn e1_enabled() -> bool {
-    match std::env::var("XR_COPY_E1").as_deref() {
-        Ok("on") | Ok("1") | Ok("e1") => true,
-        Ok("off") => false,
-        _ => e1_fill_d3d() || e1_fill_t2() || e1_fill_e3(),
-    }
-}
-
-/// E1の赤塗り手段の切り替え。`XR_E1_FILL=d3d` のときだけD3Dで共有面を赤くする。
-/// 既定（空）は従来通り、素面をbindしてGLで赤クリアする。
-/// E1'（GLクリア→コピーが黒）が示した切断点が、GL→共有面の書き込みか
-/// 共有面→XR画像のCopyResourceかを一段で切り分けるための一時的な綱である。
-/// ADR: 原因特定後に削除する。
-fn e1_fill_d3d() -> bool {
-    std::env::var("XR_E1_FILL")
-        .map(|v| v == "d3d")
-        .unwrap_or(false)
-}
-
-/// T2の有効判定。`XR_E1_FILL=t2` のときだけ自前T(87)を赤くして写す。
-/// 共有ハンドル由来物を経由せず、CopyResource(87→90)の合法性だけを見る。
-/// ADR: 原因特定後に削除する。
-fn e1_fill_t2() -> bool {
-    std::env::var("XR_E1_FILL")
-        .map(|v| v == "t2")
-        .unwrap_or(false)
-}
-
-/// E3の有効判定。`XR_E1_FILL=e3` のときだけXRデバイス作成のTをANGLEに取り込んで描く。
-/// T2で `CopyResource(T → XR画像)` の合法性は確定済みであり、E3ではGL描画が
-/// ANGLE経由でTに届くかだけを切り分ける一段である。
-/// ADR: 原因特定後に削除する。
-fn e1_fill_e3() -> bool {
-    std::env::var("XR_E1_FILL")
-        .map(|v| v == "e3")
-        .unwrap_or(false)
-}
-
-/// T1: D3Dだけで共有テクスチャを赤く塗る。GL・surfmanには一切触れない。
-///
-/// 共有テクスチャ（87 UNORM）へ形式87のRTVを作り、`ClearRenderTargetView` で
-/// 全面赤(1,0,0,1)に塗る。Stage Aと同一手法であり、device removalの誘発はない。
-/// この後の共通転送部が `CopyResource(共有面 → XR画像)` を行う。
-/// viewportが赤になればCopyResourceは合法であり、黒の原因はGL側の書き込みにある。
-/// 黒のままならCopyResource自体（形式87→90等）が無効である。
-/// ADR: STAGING読み戻しは一切行わない（device removal回避）。原因特定後に削除する。
-fn d3d_fill_shared_red(ready: &mut CopyReady, stats: &mut CopyStats, seq: u64, diagnosing: bool) {
-    d3d_fill_red(ready, ready.shared_texture, "xr-copy-t1", stats, seq, diagnosing);
-}
-
-/// T2の中間テクスチャ。XRデバイス上で作った87の自前資源であり、共有ハンドルの
-/// 由来物ではない。`CopyResource(T → XR画像)` の合法性だけを切り分ける。
-/// ADR: T2診断専用の一時的な資源であり、原因特定後に削除する。
-fn ensure_t2_texture(ready: &mut CopyReady) -> *mut ID3D11Texture2D {
-    if !ready.t2_texture.is_null() {
-        return ready.t2_texture;
-    }
-    // SAFETY: setupで保持した有効なデバイスに対する生成要求であり、出力先は有効である。
-    // 寸法・形式は転送元と同一とし、転送先(90)との比較対象を形式87→90の一点に絞る。
-    unsafe {
-        let mut src_desc: D3D11_TEXTURE2D_DESC = std::mem::zeroed();
-        (*ready.shared_texture).GetDesc(&mut src_desc);
-        let t2_desc = D3D11_TEXTURE2D_DESC {
-            Width: src_desc.Width,
-            Height: src_desc.Height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: src_desc.Format,
-            SampleDesc: src_desc.SampleDesc,
-            Usage: winapi::um::d3d11::D3D11_USAGE_DEFAULT,
-            BindFlags: winapi::um::d3d11::D3D11_BIND_RENDER_TARGET,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let mut t2: *mut ID3D11Texture2D = ptr::null_mut();
-        let create_hr = (*ready.d3d_device).CreateTexture2D(&t2_desc, ptr::null(), &mut t2);
-        if create_hr != S_OK || t2.is_null() {
-            return ptr::null_mut();
-        }
-        ready.t2_texture = t2;
-        t2
-    }
-}
-
-/// 指定テクスチャへ形式87のRTVを作り赤く塗る。T1・T2の共通部である。
-fn d3d_fill_red(
-    ready: &mut CopyReady,
-    target: *mut ID3D11Texture2D,
-    event: &str,
-    stats: &mut CopyStats,
-    seq: u64,
-    diagnosing: bool,
-) {
-    // SAFETY: 呼び出し元が保証する有効なテクスチャ・デバイス・contextである。
-    // いずれもXRデバイス上の資源であり、同一デバイス上の操作である。
-    unsafe {
-        let mut desc: D3D11_TEXTURE2D_DESC = std::mem::zeroed();
-        (*target).GetDesc(&mut desc);
-        let view_dimension = if desc.SampleDesc.Count > 1 {
-            D3D11_RTV_DIMENSION_TEXTURE2DMS
-        } else {
-            D3D11_RTV_DIMENSION_TEXTURE2D
-        };
-        let mut rtv_desc: D3D11_RENDER_TARGET_VIEW_DESC = std::mem::zeroed();
-        rtv_desc.Format = winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
-        rtv_desc.ViewDimension = view_dimension;
-        let mut rtv: *mut ID3D11RenderTargetView = ptr::null_mut();
-        let create_hr = (*ready.d3d_device).CreateRenderTargetView(
-            target as *mut ID3D11Resource,
-            &rtv_desc,
-            &mut rtv,
-        );
-        if create_hr != S_OK || rtv.is_null() {
-            stats.note_copy_failure();
-            if should_emit_fail(seq) {
-                error!("[xr-copy] {event} RTV creation failed: {create_hr:#x}");
-                emit_json(serde_json::json!({
-                    "event": event,
-                    "seq": seq,
-                    "ok": false,
-                    "reason": "create_rtv_failed",
-                    "create_hr": format!("{create_hr:#x}"),
-                }));
-            }
-            return;
-        }
-        // SAFETY: 直上で確保した+1参照をガードが放す。GLスレッドでのみ実行される。
-        let _rtv_guard = ComPtr::from_raw(rtv);
-        let red = [1.0f32, 0.0, 0.0, 1.0];
-        (*ready.imm_context).ClearRenderTargetView(rtv, &red);
-        (*ready.imm_context).Flush();
-        // SAFETY: setupで保持した有効なデバイスに対する状態取得である。
-        let removed = (*ready.d3d_device).GetDeviceRemovedReason();
-        if removed != S_OK {
-            stats.note_copy_failure();
-            if should_emit_fail(seq) {
-                error!("[xr-copy] {event} fill failed (device reason {removed:#x})");
-            }
-        }
-        if diagnosing {
-            emit_json(serde_json::json!({
-                "event": event,
-                "seq": seq,
-                "ok": removed == S_OK,
-                "create_hr": format!("{create_hr:#x}"),
-                "removed_hr": format!("{removed:#x}"),
-                "dst": {"width": desc.Width, "height": desc.Height,
-                        "format": desc.Format, "samples": desc.SampleDesc.Count},
-            }));
-        }
-    }
-}
-
 /// E3の裏付け。XRデバイス上の自前テクスチャTと、ANGLEに取り込んだ描画先Sである。
-/// T2で `CopyResource(T → XR画像)` の合法性は確定済みであり、E3ではGL描画が
-/// ANGLE経由でTに届くかだけを切り分ける。
-/// ADR: E3診断専用の一時的な裏付けであり、原因特定後に削除する。
+/// 既定のE2-blit転送で `T → XR画像` の転送元として使う。遅延生成する。
 struct E3State {
     /// XRデバイス上のT(87, MISC_SHARED)。+1参照。GLスレッドでのみ操作する。
     t: *mut ID3D11Texture2D,
-    /// ANGLEに取り込んだ描画先。dance中だけNoneになる。
+    /// ANGLEに取り込んだ描画先。blit中のbind切り替えの間だけNoneになる。
     surface: Option<SurfmanSurface>,
 }
 
-/// E3裏付けを破棄する。danceの成否にかかわらず、所在が分かる資源は解放する。
-/// Sの所在が不明の場合（unbind失敗時）はANGLE側に残るが、E3診断の一時経路であり
-/// 終了時に回収される（E1の復旧不能経路と同一方針）。
+/// E3裏付けを破棄する。blitの成否にかかわらず、所在が分かる資源は解放する。
+/// Sの所在が不明の場合（unbind失敗時）はANGLE側に残るが、次フレームで作り直すため
+/// 終了時に回収される。
 fn teardown_e3(
     device: &SurfmanDevice,
     context: &mut SurfmanContext,
@@ -1221,8 +929,7 @@ fn teardown_e3(
 ///
 /// XRデバイス上にT(87, MISC_SHARED)を作り、その共有ハンドルをANGLEデバイス上で
 /// 開き直して `create_surface_from_texture` で取り込んだSを作る。TへのRTVクリアは
-/// 行わない（GL描画の到達だけを見るため、Tの初期内容は問わない）。
-/// ADR: E3診断専用の一時的な裏付けであり、原因特定後に削除する。
+/// 行わない（blitで全面を上書きするため、Tの初期内容は問わない）。
 fn ensure_e3(
     contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
     context_id: ContextId,
@@ -1316,215 +1023,6 @@ fn ensure_e3(
                 Err(format!("E3 create_surface_from_texture failed: {e:?}"))
             },
         }
-    }
-}
-
-/// E3: 取り込み面Sをbindして既定FBへ赤クリアする。ページ内容は無視する。
-///
-/// E1の素面danceと同一手順だが、SにSurfaceTextureは無いため作り直しは行わない。
-/// Sは呼び出し後にE3Stateへ戻す。unbind失敗時はSの所在が不明になるため、
-/// 呼び出し元がteardown_e3でTごと破棄し、次フレーム作り直す。
-/// ADR: E3診断専用であり、D3DのSTAGING読み戻しは一切行わない。
-fn e3_bind_clear_red(
-    contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
-    context_id: ContextId,
-    device: &SurfmanDevice,
-    e3: &mut E3State,
-    width: i32,
-    height: i32,
-) -> Result<serde_json::Value, String> {
-    let mut detail = serde_json::Map::new();
-    let surface = e3.surface.take().ok_or_else(|| "E3: no surface".to_owned())?;
-    // 段階1: 既存の束縛面を退避する。WebGLコンテキストは自前の面を持っている。
-    let orig_surface = {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E3".to_owned())?;
-        match device.unbind_surface_from_context(context) {
-            Ok(surface) => {
-                detail.insert(
-                    "unbind_orig_ok".into(),
-                    serde_json::Value::Bool(surface.is_some()),
-                );
-                surface
-            },
-            Err(e) => {
-                e3.surface = Some(surface);
-                return Err(format!("unbind orig surface failed: {e:?}"));
-            },
-        }
-    };
-    // 段階2: Sをbindしてカレントにする。
-    {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E3 bind".to_owned())?;
-        if let Err((e, surface)) = device.bind_surface_to_context(context, surface) {
-            let _ = device.destroy_surface(context, &mut { surface });
-            if let Some(orig) = orig_surface {
-                let _ = device.bind_surface_to_context(context, orig);
-                let _ = device.make_context_current(context);
-            }
-            return Err(format!("bind E3 surface failed: {e:?}"));
-        }
-        if let Err(e) = device.make_context_current(context) {
-            // Sの所在はbind済みだが、後続のunbindで回収を試みる。
-            if let Some(orig) = orig_surface {
-                let _ = device.bind_surface_to_context(context, orig);
-                let _ = device.make_context_current(context);
-            }
-            return Err(format!("make_current for E3 surface failed: {e:?}"));
-        }
-        detail.insert("bind_e3_ok".into(), serde_json::Value::Bool(true));
-    }
-    // 段階3: 既定フレームバッファへ赤クリアする。E1とE3の共通部である。
-    match clear_default_red(contexts, context_id, width, height) {
-        Ok((gl_error, fbo_status, sampled)) => {
-            detail.insert("gl_error".into(), serde_json::json!(format!("{gl_error:#x}")));
-            detail.insert(
-                "fbo_status".into(),
-                serde_json::json!(format!("{fbo_status:#x}")),
-            );
-            detail.insert(
-                "sampled_rgba".into(),
-                serde_json::json!([sampled[0], sampled[1], sampled[2]]),
-            );
-        },
-        Err(reason) => {
-            // Sを外して戻し、既存面を復帰させる。
-            if let Some(context) = contexts.context(context_id) {
-                if let Ok(Some(s)) = device.unbind_surface_from_context(context) {
-                    e3.surface = Some(s);
-                }
-                if let Some(orig) = orig_surface {
-                    let _ = device.bind_surface_to_context(context, orig);
-                    let _ = device.make_context_current(context);
-                } else {
-                    // Sの所在が不明なためteardown対象として空のままにする。
-                }
-            }
-            return Err(reason);
-        },
-    }
-    // 段階4: Sを外してE3Stateへ戻し、既存面を戻す。
-    {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E3 unbind".to_owned())?;
-        match device.unbind_surface_from_context(context) {
-            Ok(Some(s)) => {
-                e3.surface = Some(s);
-            },
-            Ok(None) => {
-                if let Some(orig) = orig_surface {
-                    let _ = device.bind_surface_to_context(context, orig);
-                    let _ = device.make_context_current(context);
-                }
-                return Err("E3: no bound surface after clear".into());
-            },
-            Err(e) => {
-                if let Some(orig) = orig_surface {
-                    let _ = device.bind_surface_to_context(context, orig);
-                    let _ = device.make_context_current(context);
-                }
-                return Err(format!("unbind E3 surface failed: {e:?}"));
-            },
-        }
-    }
-    if let Some(orig) = orig_surface {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E3 restore".to_owned())?;
-        match device.bind_surface_to_context(context, orig) {
-            Ok(()) => {
-                let _ = device.make_context_current(context);
-                detail.insert("restore_orig_ok".into(), serde_json::Value::Bool(true));
-            },
-            Err((e, mut surface)) => {
-                let _ = device.destroy_surface(context, &mut surface);
-                return Err(format!("restore orig surface failed: {e:?}"));
-            },
-        }
-    } else {
-        detail.insert("restore_orig_ok".into(), serde_json::Value::Bool(false));
-    }
-    Ok(serde_json::Value::Object(detail))
-}
-/// 既定フレームバッファ（bind中の面）へ赤クリアする。ANGLEのpbufferはNoneが既定である。
-/// 直前のページ描画が残したGLエラーを先に捨て、今回のclearの成否だけを見る。
-/// さらに既定フレームバッファから3点（左端・中央・右端）を読み戻し、赤が載ったかをGL側で確かめる。
-/// 戻り値は (clear直後と読み戻し後を合成したGLエラー, FBO状態, 採取画素)。
-/// ADR: GL側のreadPixelsであり、D3DのSTAGING/Mapは使わない（device removal回避）。
-/// E1とE3の共通部である。
-fn clear_default_red(
-    contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
-    context_id: ContextId,
-    width: i32,
-    height: i32,
-) -> Result<(u32, u32, [[u8; 4]; 3]), String> {
-    let Some(gl) = contexts.bindings(context_id) else {
-        return Err("no GL bindings for default-framebuffer clear".into());
-    };
-    // SAFETY: GLスレッド上の有効なコンテキストに対する描画であり、FBOの結び替えは元に戻す。
-    unsafe {
-        // 残留エラーを捨てる（上限付き）。
-        for _ in 0..16 {
-            if gl.get_error() == glow::NO_ERROR {
-                break;
-            }
-        }
-        let draw_fbo = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
-        let read_fbo = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
-        // 既定フレームバッファ（素面）へ向ける。
-        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-        // 全面を確実に塗るため、視域を素面全体にしてシザーを外す。
-        let mut prev_viewport = [0; 4];
-        gl.get_parameter_i32_slice(glow::VIEWPORT, &mut prev_viewport);
-        let scissor_enabled = gl.is_enabled(glow::SCISSOR_TEST);
-        gl.disable(glow::SCISSOR_TEST);
-        gl.viewport(0, 0, width, height);
-        gl.clear_color(1.0, 0.0, 0.0, 1.0);
-        gl.clear(glow::COLOR_BUFFER_BIT);
-        gl.finish();
-        let error = gl.get_error();
-        // 既定フレームバッファから3点を読み戻す（左端・中央・右端）。
-        let y = height / 2;
-        let mut sampled = [[0u8; 4]; 3];
-        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-        for (i, x) in [2, width / 2, width - 3].iter().enumerate() {
-            let mut buf = [0u8; 4];
-            gl.read_pixels(
-                *x,
-                y,
-                1,
-                1,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut buf[..])),
-            );
-            sampled[i] = buf;
-        }
-        let read_error = gl.get_error();
-        // 状態を戻す。FBO名は文脈全体で有効なため単純に戻してよい。
-        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_fbo);
-        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, read_fbo);
-        gl.viewport(
-            prev_viewport[0],
-            prev_viewport[1],
-            prev_viewport[2],
-            prev_viewport[3],
-        );
-        if scissor_enabled {
-            gl.enable(glow::SCISSOR_TEST);
-        }
-        // clear直後のエラーと読み戻し後のエラーを合成する。
-        let combined = if error != glow::NO_ERROR {
-            error
-        } else {
-            read_error
-        };
-        Ok((combined, status, sampled))
     }
 }
 
@@ -1841,203 +1339,8 @@ fn e2_blit_page_to_e3(
     Ok(serde_json::Value::Object(detail))
 }
 
-/// E1: 描画面（E2では取り込み面S）の素面をWebGLコンテキストにbindして赤で塗る。
-///
-/// 従来は `SurfaceTexture` のGLテクスチャへFBO経由で描いていたが、surfman 0.14の
-/// ANGLE実装ではそのテクスチャは読み取り専用（`BindTexImage` のサンプリング用）であり、
-/// 描いてもD3D共有面へ反映されない。素面をbindした既定フレームバッファへ描けば
-/// D3D面そのものが描画先になるはずであり、その可否を目視で確かめる。
-/// 手順はsurfman 0.14の `tests.rs` と `angle/device.rs` に従う:
-/// `unbind(既存面)` → `destroy_surface_texture`で素面を取り出す →
-/// `bind_surface_to_context` → `make_context_current` →
-/// 既定フレームバッファへ赤クリア → `glFinish` →
-/// `unbind` → `create_surface_texture`で作り直し → 既存面をbindし直す。
-/// WebGLコンテキストは既に自前の面を持っているため、一時的に退避する。
-/// 失敗時は可能な範囲で既存面を戻し、呼び出し元がstale提出で継続できるようにする。
-/// ADR: E1診断専用であり、D3DのSTAGING読み戻しは一切行わない（device removal回避）。
-fn e1_bind_clear_red(
-    contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
-    context_id: ContextId,
-    device: &SurfmanDevice,
-    ready: &mut CopyReady,
-) -> Result<serde_json::Value, String> {
-    let mut detail = serde_json::Map::new();
-    // 段階1: 既存の束縛面を退避する。WebGLコンテキストは自前の面を持っている。
-    let orig_surface = {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E1".to_owned())?;
-        match device.unbind_surface_from_context(context) {
-            Ok(surface) => {
-                detail.insert(
-                    "unbind_orig_ok".into(),
-                    serde_json::Value::Bool(surface.is_some()),
-                );
-                surface
-            },
-            Err(e) => {
-                return Err(format!("unbind orig surface failed: {e:?}"));
-            },
-        }
-    };
-    // 段階2: SurfaceTextureを壊して素面を取り出す。
-    let surface_texture = ready
-        .surface_texture
-        .take()
-        .ok_or_else(|| "E1: no surface_texture".to_owned())?;
-    let xr_surface = {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E1 destroy".to_owned())?;
-        match device.destroy_surface_texture(context, surface_texture) {
-            Ok(surface) => {
-                detail.insert("destroy_texture_ok".into(), serde_json::Value::Bool(true));
-                surface
-            },
-            Err((e, surface_texture)) => {
-                // 復帰不能なままDropするとpanicするためリークし、既存面を戻す。
-                std::mem::forget(surface_texture);
-                if let Some(orig) = orig_surface {
-                    if let Some(context) = contexts.context(context_id) {
-                        let _ = device.bind_surface_to_context(context, orig);
-                        let _ = device.make_context_current(context);
-                    } else {
-                        std::mem::forget(orig);
-                    }
-                }
-                return Err(format!("destroy_surface_texture failed: {e:?}"));
-            },
-        }
-    };
-    // 段階3: 素面をbindしてカレントにする。
-    {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E1 bind".to_owned())?;
-        if let Err((e, surface)) = device.bind_surface_to_context(context, xr_surface) {
-            // bind失敗時は素面を作り直して退避面を戻す。
-            let _ = device.destroy_surface(context, &mut { surface });
-            if let Some(orig) = orig_surface {
-                let _ = device.bind_surface_to_context(context, orig);
-                let _ = device.make_context_current(context);
-            }
-            return Err(format!("bind xr surface failed: {e:?}"));
-        }
-        if let Err(e) = device.make_context_current(context) {
-            return Err(format!("make_current for xr surface failed: {e:?}"));
-        }
-        detail.insert("bind_xr_ok".into(), serde_json::Value::Bool(true));
-    }
-    // 段階4: 既定フレームバッファへ赤クリアする。E1とE3の共通部である。
-    let (gl_error, fbo_status, sampled) =
-        match clear_default_red(contexts, context_id, ready.width, ready.height) {
-            Ok(v) => v,
-            Err(reason) => return Err(reason),
-        };
-    detail.insert(
-        "clear_fbo_is_default".into(),
-        serde_json::Value::Bool(true),
-    );
-    detail.insert(
-        "gl_error".into(),
-        serde_json::json!(format!("{gl_error:#x}")),
-    );
-    detail.insert(
-        "viewport_applied".into(),
-        serde_json::Value::Bool(true),
-    );
-    detail.insert(
-        "fbo_status".into(),
-        serde_json::json!(format!("{fbo_status:#x}")),
-    );
-    detail.insert(
-        "sampled_rgba".into(),
-        serde_json::json!([sampled[0], sampled[1], sampled[2]]),
-    );
-    // 段階5: 素面を外してSurfaceTextureを作り直し、既存面を戻す。
-    let xr_surface = {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E1 unbind".to_owned())?;
-        match device.unbind_surface_from_context(context) {
-            Ok(Some(surface)) => surface,
-            Ok(None) => {
-                if let Some(orig) = orig_surface {
-                    let _ = device.bind_surface_to_context(context, orig);
-                    let _ = device.make_context_current(context);
-                }
-                return Err("E1: no bound xr surface after clear".into());
-            },
-            Err(e) => {
-                if let Some(orig) = orig_surface {
-                    // 素面の所在が不明なため復旧不能。既存面だけ戻してpanicを避ける。
-                    let _ = device.bind_surface_to_context(context, orig);
-                    let _ = device.make_context_current(context);
-                }
-                return Err(format!("unbind xr surface failed: {e:?}"));
-            },
-        }
-    };
-    {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E1 recreate".to_owned())?;
-        match device.create_surface_texture(context, xr_surface) {
-            Ok(new_texture) => {
-                let gl_object = device.surface_texture_object(&new_texture);
-                match gl_object {
-                    Some(tex) => {
-                        ready.gl_texture = tex;
-                    },
-                    None => {
-                        // テクスチャ生成自体は成功したため保持し、GL名だけ更新できない。
-                        ready.surface_texture = Some(new_texture);
-                        if let Some(orig) = orig_surface {
-                            let _ = device.bind_surface_to_context(context, orig);
-                            let _ = device.make_context_current(context);
-                        }
-                        return Err("E1: recreated texture has no GL object".into());
-                    },
-                }
-                ready.surface_texture = Some(new_texture);
-                detail.insert("recreate_ok".into(), serde_json::Value::Bool(true));
-            },
-            Err((e, mut surface)) => {
-                let _ = device.destroy_surface(context, &mut surface);
-                if let Some(orig) = orig_surface {
-                    let _ = device.bind_surface_to_context(context, orig);
-                    let _ = device.make_context_current(context);
-                }
-                return Err(format!("recreate surface_texture failed: {e:?}"));
-            },
-        }
-    }
-    if let Some(orig) = orig_surface {
-        let context = contexts
-            .context(context_id)
-            .ok_or_else(|| "no surfman context for E1 restore".to_owned())?;
-        match device.bind_surface_to_context(context, orig) {
-            Ok(()) => {
-                let _ = device.make_context_current(context);
-                detail.insert("restore_orig_ok".into(), serde_json::Value::Bool(true));
-            },
-            Err((e, mut surface)) => {
-                let _ = device.destroy_surface(context, &mut surface);
-                return Err(format!("restore orig surface failed: {e:?}"));
-            },
-        }
-    } else {
-        detail.insert("restore_orig_ok".into(), serde_json::Value::Bool(false));
-    }
-    Ok(serde_json::Value::Object(detail))
-}
-
-/// E2（既定動作）: ページが描いたTの内容をXR画像へ転送する。CPU読み戻しは行わない。
-/// E1系（診断）: 転送直前に赤クリアした面の内容を転送する。
-///
-/// ページ描画の確定は `glFinish` で行い、その所要時間を統計に記録する。
-/// E2では赤塗りをしない。ページのFBO描画がTへ届くことが前提であり、
-/// 届かない場合は `XR_E1_FILL=e3` のE3診断で切り分ける。
+/// ページ描画の確定待ち（`glFinish`）を行い、その所要時間（ミリ秒）を返す。
+/// 描画内容は変えない。E2-blit転送の前段であり、赤塗りはしない。
 /// ADR: E3で `T → XR画像` の転送とGL→Tの到達は確定済みであり、E2はその常用化である。
 fn e2_finish_page(
     contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
@@ -2060,12 +1363,10 @@ fn e2_finish_page(
     }
 }
 
-/// E1では転送直前に素面へ赤クリアし、D3D面そのものへの描画が共有面へ載るかを見る。
-/// T1（`XR_E1_FILL=d3d`）ではD3Dで共有面を赤くし、CopyResource自体の合法性を切り分ける。
-/// `gl.finish`で描画を確定させてから`CopyResource`（MSAA時は`ResolveSubresource`）し、
+/// E2-blit（既定動作）: ページが描いた内容をE3経由でXR画像へ転送する。CPU読み戻しは行わない。
+/// 赤塗りはしない。`glFinish`でページ描画を確定させてから`CopyResource`（MSAA時は`ResolveSubresource`）し、
 /// `Flush`する。失敗時は統計に記録するのみでpanicしない。提出はstale画像のまま継続する。
 /// 診断を行った場合はその通番を返し、呼び出し元が提出内容と対応づけられるようにする。
-/// ADR: E1期間中はD3DのSTAGING読み戻しを一切行わない（device removal回避のため）。
 pub(super) fn copy_to_swapchain(
     contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
     context_id: ContextId,
@@ -2084,211 +1385,67 @@ pub(super) fn copy_to_swapchain(
     // 診断は初回3回と、その後600回に1回だけ行う。
     let seq = DIAG_SEQ.fetch_add(1, Ordering::Relaxed);
     let diagnosing = seq < 3 || seq % 600 == 0;
-    // Stage A: D3Dだけで赤を出す。ANGLE・GL・共有面・CopyResourceには触らない。
-    if stage_a_enabled() {
-        stage_a_fill_red(ready, dst, stats, seq, diagnosing);
-        return diagnosing.then_some(seq);
-    }
-    // E1: 素面へ赤を描く。ページ内容は無視する。
+    // E2-blit既定転送の準備: 描画確定に要るdeviceを取得する。
     let device = match contexts.device(context_id) {
         Some(device) => device,
         None => {
             stats.note_copy_failure();
-            error!("[xr-copy] no device for E1; submitting stale image");
+            error!("[xr-copy] no device for E2-blit; submitting stale image");
             return None;
         },
     };
-    let (e1_detail, finish_ms) = if e1_enabled() {
-        if e1_fill_e3() {
-            // E3: TをANGLEに取り込んだSへ赤クリアし、この後の共通転送部で T → XR画像 を写す。
-            if let Err(reason) = ensure_e3(contexts, context_id, &device, ready) {
-                stats.note_copy_failure();
-                if should_emit_fail(seq) {
-                    error!("[xr-copy] E3 init failed: {reason}; submitting stale image");
-                    emit_json(serde_json::json!({
-                        "event": "xr-copy-e3-failed",
-                        "seq": seq,
-                        "reason": reason,
-                    }));
-                }
-                return None;
+    // E2-blit（既定動作）: ページ（自前GLテクスチャ）を確定させ、
+    // E3面へbindして `glBlitFramebuffer` で移してから転送する。赤塗りはしない。
+    // 旧E2（取り込み面へFBOで描く）は `readPixels [0,0,0,0]` の死角のため使わない。
+    let (detail, finish_ms) = match e2_blit_page_to_e3(contexts, context_id, &device, ready) {
+        Ok(detail) => {
+            let ms = detail
+                .get("finish_ms")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            (Some(detail), ms)
+        },
+        Err(reason) => {
+            // Sの所在が不明な場合があるため裏付けごと破棄し、次フレーム作り直す。
+            if let Some(context) = contexts.context(context_id) {
+                teardown_e3(&device, context, ready);
             }
-            let (w, h) = (ready.width, ready.height);
-            // dance中の借用をこのブロックで終え、失敗時の破棄と競合させない。
-            let dance: Result<serde_json::Value, String> = {
-                let Some(e3) = ready.e3.as_mut() else {
-                    stats.note_copy_failure();
-                    return None;
-                };
-                e3_bind_clear_red(contexts, context_id, &device, e3, w, h)
-            };
-            let detail = match dance {
-                Ok(detail) => detail,
-                Err(reason) => {
-                    // Sの所在が不明な場合があるため裏付けごと破棄し、次フレーム作り直す。
-                    if let Some(context) = contexts.context(context_id) {
-                        teardown_e3(&device, context, ready);
-                    }
-                    stats.note_copy_failure();
-                    if should_emit_fail(seq) {
-                        error!("[xr-copy] E3 red clear failed: {reason}; submitting stale image");
-                        emit_json(serde_json::json!({
-                            "event": "xr-copy-e3-failed",
-                            "seq": seq,
-                            "reason": reason,
-                        }));
-                    }
-                    return None;
-                },
-            };
-            if diagnosing {
-                emit_json(serde_json::json!({
-                    "event": "xr-copy-e3",
-                    "seq": seq,
-                    "size": {"width": w, "height": h},
-                    "detail": detail,
-                }));
-            }
-            (None, 0.0)
-        } else if e1_fill_t2() {
-            // T2: 自前T(87)をD3Dで赤くし、この後の共通転送部で T → XR画像 を写す。
-            // 共有ハンドル由来物は転送元に使わない。
-            let t2 = ensure_t2_texture(ready);
-            if t2.is_null() {
-                stats.note_copy_failure();
-                if should_emit_fail(seq) {
-                    error!("[xr-copy] T2 texture creation failed; submitting stale image");
-                    emit_json(serde_json::json!({
-                        "event": "xr-copy-t2",
-                        "seq": seq,
-                        "ok": false,
-                        "reason": "create_texture_failed",
-                    }));
-                }
-                return None;
-            }
-            d3d_fill_red(ready, t2, "xr-copy-t2", stats, seq, diagnosing);
-            (None, 0.0)
-        } else if e1_fill_d3d() {
-            // T1: D3Dだけで共有面を赤くする。GL・surfmanのbind切り替えは行わない。
-            d3d_fill_shared_red(ready, stats, seq, diagnosing);
-            (None, 0.0)
-        } else {
-            match e1_bind_clear_red(contexts, context_id, &device, ready) {
-                Ok(detail) => (Some(detail), 0.0),
-                Err(reason) => {
-                    stats.note_copy_failure();
-                    // 失敗分岐のログは初回3回と600フレームに1回に絞る（暴走防止）。
-                    if should_emit_fail(seq) {
-                        error!("[xr-copy] E1 red clear failed: {reason}; submitting stale image");
-                        emit_json(serde_json::json!({
-                            "event": "xr-copy-e1-failed",
-                            "seq": seq,
-                            "reason": reason,
-                        }));
-                    }
-                    return None;
-                },
-            }
-        }
-    } else {
-        // E2-blit（既定動作）: ページ（自前GLテクスチャ）を確定させ、
-        // E3面へbindして `glBlitFramebuffer` で移してから転送する。赤塗りはしない。
-        // 旧E2（取り込み面へFBOで描く）は `readPixels [0,0,0,0]` の死角のため使わない。
-        match e2_blit_page_to_e3(contexts, context_id, &device, ready) {
-            Ok(detail) => {
-                let ms = detail
-                    .get("finish_ms")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                (Some(detail), ms)
-            },
-            Err(reason) => {
-                // Sの所在が不明な場合があるため裏付けごと破棄し、次フレーム作り直す。
-                if let Some(context) = contexts.context(context_id) {
-                    teardown_e3(&device, context, ready);
-                }
-                stats.note_copy_failure();
-                if should_emit_fail(seq) {
-                    error!("[xr-copy] E2-blit failed: {reason}; submitting stale image");
-                    emit_json(serde_json::json!({
-                        "event": "xr-copy-e2-blit-failed",
-                        "seq": seq,
-                        "reason": reason,
-                    }));
-                }
-                return None;
-            },
-        }
-    };
-    if diagnosing {
-        if e1_enabled() {
-            emit_json(serde_json::json!({
-                "event": "xr-copy-e1",
-                "seq": seq,
-                "size": {"width": ready.width, "height": ready.height},
-                "detail": e1_detail,
-                "resolve": ready.resolve,
-            }));
-        } else {
-            emit_json(serde_json::json!({
-                "event": "xr-copy-e2-blit",
-                "seq": seq,
-                "size": {"width": ready.width, "height": ready.height},
-                "detail": e1_detail,
-                "resolve": ready.resolve,
-            }));
-        }
-    }
-    let begun = Instant::now();
-    // E2-blitではE3のTを転送元にする（MISC_SHARED、mutexなし）。
-    // T2では共有面ではなく自前Tを転送元にする（CopyResource合法性の切り分け）。
-    // SAFETY: immediate context・転送元・転送先はいずれもsetupで確保した有効なD3Dリソースであり、
-    // 転送先はacquire済み、転送元はglFinish/blilt/D3Dクリアで確定済みである。同一デバイス上の転送である。
-    let src = if !e1_enabled() {
-        // E2-blit既定転送。E3のTが無ければstale提出とする（panicさせない）。
-        match ready.e3.as_ref() {
-            Some(e3) if !e3.t.is_null() => e3.t,
-            _ => {
-                stats.note_copy_failure();
-                if should_emit_fail(seq) {
-                    error!("[xr-copy] E2-blit has no E3 texture; submitting stale image");
-                }
-                return None;
-            },
-        }
-    } else if e1_fill_e3() {
-        // E3ではTを転送元にする（T → XR画像の合法性はT2で確定済み）。
-        match ready.e3.as_ref() {
-            Some(e3) if !e3.t.is_null() => e3.t,
-            _ => ready.shared_texture,
-        }
-    } else if e1_fill_t2() && !ready.t2_texture.is_null() {
-        ready.t2_texture
-    } else {
-        ready.shared_texture
-    };
-    // 転送元が共有テクスチャTのときはkeyed mutexで括る。E2/T1/E1-danceが該当し、
-    // T2（自前T）・E3（MISC_SHAREDのT）は対象外である。キーはsurfmanに合わせた0である。
-    // 所有権の受け渡しは acquire(転送前)→release(転送後) の一組であり、
-    // releaseは次フレームのANGLE描画への返却を兼ねる（描画前後の括りに相当）。
-    let keyed = src == ready.shared_texture && !ready.keyed_mutex.is_null();
-    if keyed {
-        if let Err(hr) = acquire_shared_texture(ready) {
             stats.note_copy_failure();
-            // 失敗分岐のログは初回3回と600フレームに1回に絞る（暴走防止）。
             if should_emit_fail(seq) {
-                error!("[xr-copy] keyed mutex acquire failed: {hr:#x}; submitting stale image");
+                error!("[xr-copy] E2-blit failed: {reason}; submitting stale image");
                 emit_json(serde_json::json!({
-                    "event": "xr-copy-keyedmutex",
+                    "event": "xr-copy-e2-blit-failed",
                     "seq": seq,
-                    "phase": "acquire",
-                    "hr": format!("{hr:#x}"),
+                    "reason": reason,
                 }));
             }
             return None;
-        }
+        },
+    };
+    if diagnosing {
+        emit_json(serde_json::json!({
+            "event": "xr-copy-e2-blit",
+            "seq": seq,
+            "size": {"width": ready.width, "height": ready.height},
+            "detail": detail,
+            "resolve": ready.resolve,
+        }));
     }
+    let begun = Instant::now();
+    // E2-blitではE3のTを転送元にする（MISC_SHARED、mutexなし）。
+    // SAFETY: immediate context・転送元・転送先はいずれもsetupで確保した有効なD3Dリソースであり、
+    // 転送先はacquire済み、転送元はglFinish/blitで確定済みである。同一デバイス上の転送である。
+    let src = match ready.e3.as_ref() {
+        // E3のTが無ければstale提出とする（panicさせない）。
+        Some(e3) if !e3.t.is_null() => e3.t,
+        _ => {
+            stats.note_copy_failure();
+            if should_emit_fail(seq) {
+                error!("[xr-copy] E2-blit has no E3 texture; submitting stale image");
+            }
+            return None;
+        },
+    };
     unsafe {
         if ready.resolve {
             (*ready.imm_context).ResolveSubresource(
@@ -2306,22 +1463,6 @@ pub(super) fn copy_to_swapchain(
         }
         (*ready.imm_context).Flush();
     }
-    if keyed {
-        if let Err(hr) = release_shared_texture(ready) {
-            stats.note_copy_failure();
-            // 転送自体は済んでいるため継続するが、次フレームのANGLE描画と競合し得る。
-            // 失敗分岐のログは初回3回と600フレームに1回に絞る（暴走防止）。
-            if should_emit_fail(seq) {
-                error!("[xr-copy] keyed mutex release failed: {hr:#x}");
-                emit_json(serde_json::json!({
-                    "event": "xr-copy-keyedmutex",
-                    "seq": seq,
-                    "phase": "release",
-                    "hr": format!("{hr:#x}"),
-                }));
-            }
-        }
-    }
     let copy_ms = begun.elapsed().as_secs_f64() * 1000.0;
     // SAFETY: setupで保持した有効なデバイスに対する状態取得である。
     let removed = unsafe { (*ready.d3d_device).GetDeviceRemovedReason() };
@@ -2332,7 +1473,7 @@ pub(super) fn copy_to_swapchain(
             error!("[xr-copy] transfer failed (device reason {removed:#x}); submitting stale image");
         }
     }
-    // E1系では素面描画内で済ませているためfinishは0であり、E2-blitではページ確定＋blit詳細内の実測値である。
+    // finishはページ確定＋blit詳細内の実測値である。
     stats.record_copy(finish_ms, copy_ms);
     diagnosing.then_some(seq)
 }
@@ -2362,9 +1503,6 @@ pub(super) fn destroy_backing(
     let Some(device) = contexts.device(context_id) else {
         // SAFETY: D3D参照の放出だけ行う。surfman資源は終了時に回収される。
         unsafe {
-            if !ready.t2_texture.is_null() {
-                drop(ComPtr::from_raw(ready.t2_texture));
-            }
             if !ready.keyed_mutex.is_null() {
                 drop(ComPtr::from_raw(ready.keyed_mutex));
             }
@@ -2391,9 +1529,6 @@ pub(super) fn destroy_backing(
     let Some(context) = contexts.context(context_id) else {
         // SAFETY: D3D参照の放出だけ行う。
         unsafe {
-            if !ready.t2_texture.is_null() {
-                drop(ComPtr::from_raw(ready.t2_texture));
-            }
             if !ready.keyed_mutex.is_null() {
                 drop(ComPtr::from_raw(ready.keyed_mutex));
             }
@@ -2422,12 +1557,8 @@ pub(super) fn destroy_backing(
     if let Some(surface_texture) = ready.surface_texture {
         destroy_surface_texture_quiet(&device, context, surface_texture);
     }
-    // SAFETY: setup/T2で取得した+1参照をここで放す。GLスレッドでのみ実行される。
+    // SAFETY: setupで取得した+1参照をここで放す。GLスレッドでのみ実行される。
     unsafe {
-        if !ready.t2_texture.is_null() {
-            drop(ComPtr::from_raw(ready.t2_texture));
-            ready.t2_texture = ptr::null_mut();
-        }
         if !ready.keyed_mutex.is_null() {
             drop(ComPtr::from_raw(ready.keyed_mutex));
             ready.keyed_mutex = ptr::null_mut();
