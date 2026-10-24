@@ -423,6 +423,19 @@ impl LayerManagerAPI<SurfmanGL> for OpenXrLayerManager {
         context_id: ContextId,
         init: LayerInit,
     ) -> Result<LayerId, Error> {
+        // MSAAスワップチェーンは未対応として、計測プローブや層生成より先に拒否する。
+        // 既定経路はsingle-sampleの転送元から非MSAAのXR画像への `CopyResource` のみであり、
+        // MSAA画像への転送は動作保証できない。ロックはこの区間で取得・解放し、
+        // 後続の既存のロック取得とは重ねない。
+        let sample_count = {
+            let guard = self.shared_data.lock().unwrap();
+            guard.as_ref().unwrap().swapchain_sample_count
+        };
+        if sample_count != 1 {
+            return Err(Error::BackendSpecific(format!(
+                "MSAA swapchain is not supported (recommended sample count {sample_count})"
+            )));
+        }
         // 計測用プローブ(後で削除予定)。最初に呼ばれた1回だけ共有可否を記録する。
         // 画素の読み戻しはせず、失敗しても先へ進む。
         present::probe_layer_once(&self.session, contexts, context_id);
@@ -435,7 +448,6 @@ impl LayerManagerAPI<SurfmanGL> for OpenXrLayerManager {
         })?;
         let format = GraphicsProvider::pick_format(&formats);
         let texture_size = init.texture_size(&data.viewports());
-        let sample_count = data.swapchain_sample_count;
         let swapchain_create_info = SwapchainCreateInfo {
             create_flags: SwapchainCreateFlags::EMPTY,
             usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT | SwapchainUsageFlags::SAMPLED,

@@ -185,15 +185,11 @@ pub(super) struct CopyReady {
     pub(super) imm_context: *mut ID3D11DeviceContext,
     /// XRデバイス。`GetDeviceRemovedReason`での故障検出に使う。
     pub(super) d3d_device: *mut ID3D11Device,
-    /// XR画像の形式。`ResolveSubresource`に渡す。
-    pub(super) dst_format: u32,
     /// 層の寸法。
     pub(super) width: i32,
     pub(super) height: i32,
     /// E3の裏付け（XRデバイス作成T＋ANGLE取り込み面S）。遅延生成する。
     pub(super) e3: Option<E3State>,
-    /// XR画像がMSAAのときに`CopyResource`ではなく`ResolveSubresource`を使う。
-    pub(super) resolve: bool,
     /// acquire済みで未releaseのXR画像index。GLスレッドでのみ操作する。
     pub(super) acquired_image: Option<u32>,
 }
@@ -389,7 +385,7 @@ fn create_page_texture(
 /// 層のGPUコピー用裏付けを作る。失敗時は [`CopyBacking::Broken`] を返す.
 ///
 /// 既定動作: ページ描画先（servo自前の通常GLテクスチャ）を作り、XR画像の記述子を
-/// 検証して転送方式（copy/resolve）を決める。実際の転送資源（E3のT＋ANGLE取り込み面S）
+/// 検証して転送可否を決める。実際の転送資源（E3のT＋ANGLE取り込み面S）
 /// は `ensure_e3` がend_frame時に遅延生成する。TとXR画像は同一デバイス上の
 /// 資源であるためデバイス間転送は発生しない。
 /// E3用Tの記述子を組み立てる。
@@ -416,17 +412,13 @@ fn e3_texture_desc(width: u32, height: u32) -> D3D11_TEXTURE2D_DESC {
     }
 }
 
-/// 層寸法とXR画像記述子の検証結果。E3用Tの生成可否と転送方式を決める。
+/// 層寸法とXR画像記述子の検証結果。E3用Tの生成可否を決める。
 /// `setup_backing` の記述子判定部を純粋化したものであり、D3Dには触らない。
 struct SetupPlan {
     /// E3用Tの寸法（検証済みのXR画像寸法）。
     width: u32,
     height: u32,
-    /// XR画像の形式。`CopyReady::dst_format`（`ResolveSubresource` に渡す）になる。
-    dst_format: u32,
-    /// XR画像がMSAAのときに真。`CopyResource` ではなく `ResolveSubresource` を使う。
-    resolve: bool,
-    /// 転送方式の記録名。`xr-copy-setup` の `transfer` に出す。
+    /// 転送方式の記録名。`xr-copy-setup` の `transfer` に出す。常に `"copy"` である。
     transfer: &'static str,
     /// 形式の厳密一致。ログ記録用。
     format_exact: bool,
@@ -434,9 +426,9 @@ struct SetupPlan {
 
 /// 層寸法とXR画像の記述子を検証し、E3用Tの生成計画を作る。失敗時は理由文を返す。
 ///
-/// 寸法一致・形式87/TYPELESS90・転送元sample=1の条件は従来の `setup_backing` と
-/// 同一である。mip/array=1の検証は作業単位Cで追加した。MSAA構成の判定
-/// （single→MSAAの解決）は変えない。
+/// 寸法一致・形式87/TYPELESS90・mip/array=1を検証する。MSAA（sample count≠1）の
+/// XR画像は明示的に拒否する。既定経路はsingle-sample間の `CopyResource` のみであり、
+/// MSAA解決は行わない。
 fn plan_e3_backing(
     width: i32,
     height: i32,
@@ -454,6 +446,14 @@ fn plan_e3_backing(
             image.MipLevels, image.ArraySize,
         ));
     }
+    // MSAAのXR画像は未対応として明示的に拒否する。single-sampleの転送元から
+    // MSAA画像への `ResolveSubresource` は通常のMSAA解決とは逆であり、動作保証できない。
+    if image.SampleDesc.Count != 1 {
+        return Err(format!(
+            "MSAA swapchain image is not supported (sample count {})",
+            image.SampleDesc.Count,
+        ));
+    }
     // ADR: XRランタイムはSRGBビュー用にTYPELESS(90)で画像を作ることがある。
     // 転送元87(UNORM)→転送先90(TYPELESS)は同一32bitレイアウトのためCopyResourceで渡せる。
     // 形式変換は行わず、ビット列をそのまま写す（sRGB解釈の差異はログに残すのみ）。
@@ -462,21 +462,13 @@ fn plan_e3_backing(
         image.Format == winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_TYPELESS;
     let format_exact = image.Format ==
         winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
-    let resolve = format_match && image.SampleDesc.Count > 1;
-    let copy = format_match && image.SampleDesc.Count == 1;
-    let transfer = if copy {
-        "copy"
-    } else if resolve {
-        "resolve"
-    } else {
+    if !format_match {
         return Err("src/dst descriptors are incompatible for GPU copy".into());
-    };
+    }
     Ok(SetupPlan {
         width: image.Width,
         height: image.Height,
-        dst_format: image.Format,
-        resolve,
-        transfer,
+        transfer: "copy",
         format_exact,
     })
 }
@@ -538,7 +530,7 @@ pub(super) fn setup_backing(
     let mut image_desc: D3D11_TEXTURE2D_DESC = unsafe { std::mem::zeroed() };
     unsafe { (*first_texture).GetDesc(&mut image_desc) };
     // 層寸法とXR画像寸法の不一致は転送不能のためBrokenとする。E3用Tの寸法・
-    // 形式・sample構成・mip/arrayもここで検証し、転送方式（copy/resolve）を決める。
+    // 形式・mip/arrayもここで検証し、MSAA画像は明示的に拒否する。
     let plan = match plan_e3_backing(width, height, &image_desc) {
         Ok(plan) => plan,
         Err(reason) => {
@@ -557,8 +549,7 @@ pub(super) fn setup_backing(
         unsafe { drop(ComPtr::from_raw(d3d_device)) };
         return fail("GetImmediateContext on XR device returned null".into());
     }
-    // 転送方式は検証済み（`plan_e3_backing` と同一条件）。MSAA構成の判定は変えない。
-    let resolve = plan.resolve;
+    // 検証済みの転送は `CopyResource` のみである（MSAAは `plan_e3_backing` で拒否済み）。
     // E3用Tの記述子は `ensure_e3` の生成と共用し、転送元とログ記録を一致させる。
     let e3_desc = e3_texture_desc(plan.width, plan.height);
     emit_json(serde_json::json!({
@@ -632,10 +623,8 @@ pub(super) fn setup_backing(
         page_target,
         imm_context: imm,
         d3d_device,
-        dst_format: plan.dst_format,
         width,
         height,
-        resolve,
         e3: None,
         acquired_image: None,
     })
@@ -1237,7 +1226,7 @@ fn e2_finish_page(
 }
 
 /// E2-blit（既定動作）: ページが描いた内容をE3経由でXR画像へ転送する。CPU読み戻しは行わない。
-/// 赤塗りはしない。`glFinish`でページ描画を確定させてから`CopyResource`（MSAA時は`ResolveSubresource`）し、
+/// 赤塗りはしない。`glFinish`でページ描画を確定させてから`CopyResource`し、
 /// `Flush`する。失敗時は統計に記録するのみでpanicしない。提出はstale画像のまま継続する。
 /// 診断を行った場合はその通番を返し、呼び出し元が提出内容と対応づけられるようにする。
 pub(super) fn copy_to_swapchain(
@@ -1301,7 +1290,6 @@ pub(super) fn copy_to_swapchain(
             "seq": seq,
             "size": {"width": ready.width, "height": ready.height},
             "detail": detail,
-            "resolve": ready.resolve,
         }));
     }
     let begun = Instant::now();
@@ -1320,20 +1308,10 @@ pub(super) fn copy_to_swapchain(
         },
     };
     unsafe {
-        if ready.resolve {
-            (*ready.imm_context).ResolveSubresource(
-                dst as *mut ID3D11Resource,
-                0,
-                src as *mut ID3D11Resource,
-                0,
-                ready.dst_format,
-            );
-        } else {
-            (*ready.imm_context).CopyResource(
-                dst as *mut ID3D11Resource,
-                src as *mut ID3D11Resource,
-            );
-        }
+        (*ready.imm_context).CopyResource(
+            dst as *mut ID3D11Resource,
+            src as *mut ID3D11Resource,
+        );
         (*ready.imm_context).Flush();
     }
     let copy_ms = begun.elapsed().as_secs_f64() * 1000.0;
@@ -1528,25 +1506,26 @@ mod setup_plan_tests {
         );
         let plan = plan_e3_backing(1024, 1024, &image).unwrap();
         assert_eq!((plan.width, plan.height), (1024, 1024));
-        assert_eq!(plan.dst_format, dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM);
-        assert!(!plan.resolve);
         assert_eq!(plan.transfer, "copy");
         assert!(plan.format_exact);
     }
 
     #[test]
-    fn resolve_for_typeless_msaa_image() {
+    fn rejects_msaa_image() {
         let image = image_desc(
             1024,
             1024,
             dxgiformat::DXGI_FORMAT_B8G8R8A8_TYPELESS,
             4,
         );
-        let plan = plan_e3_backing(1024, 1024, &image).unwrap();
-        assert!(plan.resolve);
-        assert_eq!(plan.transfer, "resolve");
-        assert_eq!(plan.dst_format, dxgiformat::DXGI_FORMAT_B8G8R8A8_TYPELESS);
-        assert!(!plan.format_exact);
+        let err = match plan_e3_backing(1024, 1024, &image) {
+            Ok(_) => panic!("MSAA画像は拒否されること"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("MSAA"),
+            "MSAA拒否の理由であること: {err}",
+        );
     }
 
     #[test]
