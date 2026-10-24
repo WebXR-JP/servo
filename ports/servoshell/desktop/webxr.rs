@@ -32,13 +32,17 @@ impl XrDiscoveryWebXrRegistry {
         preferences: &Preferences,
         xr_present_test: bool,
     ) -> Box<Self> {
-        // `--xr-present-test`モードではservo内蔵のOpenXR/glwindow discoveryを使わない。
+        // `--xr-present-test`モード (feature `xr-present-test`) ではservo内蔵のOpenXR/glwindow discoveryを使わない。
         // 専用スレッドが自前のOpenXRセッションを持つため、二重初期化を避ける。
+        // featureなしではこの引数は常に偽であり、この分岐には到達しない。
+        #[cfg(feature = "xr-present-test")]
         if xr_present_test {
             return Box::new(Self {
                 xr_discovery: RefCell::new(None),
             });
         }
+        #[cfg(not(feature = "xr-present-test"))]
+        let _ = xr_present_test;
         let Some(event_loop) = event_loop else {
             return Box::new(Self {
                 xr_discovery: RefCell::new(None),

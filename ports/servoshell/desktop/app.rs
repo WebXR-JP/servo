@@ -103,12 +103,16 @@ impl App {
         let servo = servo_builder.build();
         let platform_window = self.create_platform_window(url, active_event_loop);
 
+        #[cfg(feature = "xr-present-test")]
+        let xr_present_test = self.servoshell_preferences.xr_present_test;
+        #[cfg(not(feature = "xr-present-test"))]
+        let xr_present_test = false;
         #[cfg(feature = "webxr")]
         servo.register_webxr_registry(super::webxr::XrDiscoveryWebXrRegistry::new_boxed(
             platform_window.clone(),
             active_event_loop,
             &self.preferences,
-            self.servoshell_preferences.xr_present_test,
+            xr_present_test,
         ));
 
         servo.setup_logging();

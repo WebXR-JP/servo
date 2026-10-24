@@ -45,6 +45,7 @@ pub fn main() {
     let clean_shutdown = servoshell_preferences.clean_shutdown;
     // XR提示PoCスレッドはメインスレッド(winit/Servo)と結合せず、独立に回す。
     // メイン側では`xrWaitFrame`等の待ちを行わない。
+    #[cfg(feature = "xr-present-test")]
     if servoshell_preferences.xr_present_test {
         super::xr_present::spawn(&servoshell_preferences);
     }

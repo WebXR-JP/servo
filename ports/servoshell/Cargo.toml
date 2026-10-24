@@ -73,6 +73,8 @@ webgl_backtrace = ["servo/webgl_backtrace"]
 webgl = ["servo/webgl"]
 webgpu = ["servo/webgpu"]
 webxr = ["servo/webxr"]
+# `--xr-present-test` PoC (D3D11経由のOpenXR提示) 用。既定では無効。
+xr-present-test = ["dep:openxr", "dep:winapi", "dep:wio"]
 
 [dependencies]
 accesskit = { workspace = true }
@@ -154,14 +156,15 @@ signal-hook-registry = { workspace = true }
 servo = { workspace = true, features = ["no-wgl"] }
 windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_System_Console"] }
 # `--xr-present-test` PoC (D3D11経由のOpenXR提示) 用。components/webxr とは独立。
-openxr = { workspace = true }
-winapi = { workspace = true, features = [
+# feature `xr-present-test` でのみ有効化する。
+openxr = { workspace = true, optional = true }
+winapi = { workspace = true, optional = true, features = [
     "d3d11",
     "d3dcommon",
     "dxgi",
     "winerror",
 ] }
-wio = { workspace = true }
+wio = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { workspace = true, features = [

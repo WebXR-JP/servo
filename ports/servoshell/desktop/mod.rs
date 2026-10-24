@@ -20,4 +20,5 @@ mod protocols;
 mod tracing;
 #[cfg(feature = "webxr")]
 mod webxr;
+#[cfg(feature = "xr-present-test")]
 pub(crate) mod xr_present;
