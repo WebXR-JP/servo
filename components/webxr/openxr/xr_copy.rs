@@ -94,12 +94,12 @@ pub(super) fn emit_json(value: serde_json::Value) {
     let line = serde_json::to_string(&value)
         .unwrap_or_else(|_| "{\"event\":\"xr-copy-encode-error\"}".to_owned());
     info!("[xr-copy] {line}");
-    // ADR: 既定の出力先はカレントディレクトリの`xr-copy.jsonl`とし、
-    // `XR_COPY_LOG`で上書き・空文字で無効化する（probeの`XR_PROBE_LOG`と同一方針）。
-    let path = std::env::var("XR_COPY_LOG").unwrap_or_else(|_| "xr-copy.jsonl".to_owned());
-    if path.is_empty() {
-        return;
-    }
+    // 既定ではファイルを作らない。`XR_COPY_LOG` が設定され、空でないときだけ追記する。
+    // ADR: 既定実行から診断ファイルの副作用を外す（W3）。`info!` のログ出力は残す。
+    let path = match std::env::var("XR_COPY_LOG") {
+        Ok(path) if !path.is_empty() => path,
+        _ => return,
+    };
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -830,6 +830,20 @@ pub(super) fn wait_for_copy(
 /// 毎フレームは行わない。
 /// ADR: 診断専用の観測点であり、転送経路には入れない。
 static DIAG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 画素の読み戻し診断を行うかどうか。`XR_COPY_DIAG` が `1`・`on`・`true` のときだけ有効。
+/// 既定（未設定・その他）は無効であり、読み戻しに到達しない。判定はプロセス内で1回だけ行う。
+// ADR: 既定実行から読み戻しコストを外す（W3）。転送経路・同期は変えない。
+static DIAG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(super) fn diag_enabled() -> bool {
+    *DIAG_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("XR_COPY_DIAG").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    })
+}
 
 /// D3D側診断読み戻しの範囲を環境変数で切り替える。
 /// `XR_COPY_DIAG_D3D` が `nodst` ならXR画像側、`nosrc` なら共有側、`nod3d` なら両方を
@@ -1802,22 +1816,26 @@ fn blit_page_to_default(
         gl.finish();
         let finish_error = gl.get_error();
         // blit後の既定FBから3点を読み戻す（左端・中央・右端）。
+        // 読み戻し自体は `XR_COPY_DIAG=1` のときだけ行う。PACK_ALIGNMENTの設定と
+        // FBOの結び替え・復帰は従来どおり行い、GL状態の残留を変えない。
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
         let y = h / 2;
         let mut sampled = [[0u8; 4]; 3];
         gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-        for (i, x) in [2, w / 2, w - 3].iter().enumerate() {
-            let mut buf = [0u8; 4];
-            gl.read_pixels(
-                *x,
-                y,
-                1,
-                1,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut buf[..])),
-            );
-            sampled[i] = buf;
+        if diag_enabled() {
+            for (i, x) in [2, w / 2, w - 3].iter().enumerate() {
+                let mut buf = [0u8; 4];
+                gl.read_pixels(
+                    *x,
+                    y,
+                    1,
+                    1,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut buf[..])),
+                );
+                sampled[i] = buf;
+            }
         }
         let read_error = gl.get_error();
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_fbo);
@@ -1863,9 +1881,13 @@ fn e2_blit_page_to_e3(
         Err(reason) => return Err(reason),
     };
     let _ = finish_ms;
-    if let Some(gl) = contexts.bindings(context_id) {
-        let diag = diag_read_gl(&gl, ready);
-        detail.insert("page_sample".into(), diag.value);
+    // ページ面の画素採取は `XR_COPY_DIAG=1` のときだけ行う。
+    // 無効時は読み戻しに到達しない。`page_sample` は診断JSON専用のため欠落は観測されない。
+    if diag_enabled() {
+        if let Some(gl) = contexts.bindings(context_id) {
+            let diag = diag_read_gl(&gl, ready);
+            detail.insert("page_sample".into(), diag.value);
+        }
     }
     // E3裏付けを遅延生成する（MISC_SHAREDのT＋取り込み面S、mutexなし）。
     if let Err(reason) = ensure_e3(contexts, context_id, device, ready) {

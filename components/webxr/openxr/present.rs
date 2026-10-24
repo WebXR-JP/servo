@@ -43,8 +43,12 @@ pub(super) fn probe_layer_once(
     contexts: &mut dyn GLContexts<SurfmanGL>,
     context_id: ContextId,
 ) {
+    // 計測自体は `XR_COPY_DIAG=1` のときだけ行う。既定では呼ばない（W3）。
+    // `XR_PROBE_LOG` は従来どおり、有効時の追記先として残す。
     #[cfg(target_os = "windows")]
-    probe::probe_once(session, contexts, context_id);
+    if xr_copy::diag_enabled() {
+        probe::probe_once(session, contexts, context_id);
+    }
     #[cfg(not(target_os = "windows"))]
     let _ = (session, contexts, context_id);
 }
