@@ -831,6 +831,8 @@ impl OpenXrDevice {
 
         // Wait for the runtime to report READY before calling begin (some runtimes reject an immediate begin).
         let mut ready = false;
+        // 終端状態で打ち切った場合の記録。タイムアウトとの区別に使う。
+        let mut terminal: Option<openxr::SessionState> = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             let mut buffer = openxr::EventDataBuffer::new();
@@ -843,39 +845,67 @@ impl OpenXrDevice {
                         ready = true;
                         break;
                     },
-                    openxr::SessionState::STOPPING
+                    s @ (openxr::SessionState::STOPPING
                     | openxr::SessionState::EXITING
-                    | openxr::SessionState::LOSS_PENDING => {
+                    | openxr::SessionState::LOSS_PENDING) => {
+                        terminal = Some(s);
                         break;
                     },
                     _ => {},
                 },
                 Ok(_) => {},
-                Err(_) => {},
+                // poll失敗は握り潰さず、待機を継続せずに即座に失敗させる。
+                Err(e) => {
+                    return Err(Error::BackendSpecific(format!(
+                        "Instance::poll_event {:?}",
+                        e
+                    )));
+                },
             }
             thread::sleep(Duration::from_millis(5));
         }
         if ready {
             info!("OpenXR session reached READY before begin");
+        } else if let Some(state) = terminal {
+            // 終端状態で待機を打ち切った場合は成功扱いにせず、状態を含めて失敗させる。
+            // ADR: READY前の異常終了を正常なdevice生成として続行しない（W4）。
+            error!(
+                "OpenXR session reached terminal state before begin: {:?}",
+                state
+            );
+            return Err(Error::BackendSpecific(format!(
+                "Session::begin before READY: terminal state {:?}",
+                state
+            )));
         } else {
-            warn!("OpenXR session did not reach READY before begin (timeout or terminal state)");
+            // タイムアウト自体は即エラーにしない。イベントが遅延するランタイムとの互換を残すため、
+            // warnのうえでbeginを試み、beginの失敗は下で伝播させる。
+            warn!("OpenXR session did not reach READY before begin (timeout)");
         }
 
         if supports_secondary {
-            if let Err(e) = session.begin_with_secondary(
-                ViewConfigurationType::PRIMARY_STEREO,
-                &[ViewConfigurationType::SECONDARY_MONO_FIRST_PERSON_OBSERVER_MSFT],
-            ) {
-                error!(
-                    "Session failed to begin after READY wait (ready={}): {:?}",
-                    ready, e
-                );
-            }
-        } else if let Err(e) = session.begin(ViewConfigurationType::PRIMARY_STEREO) {
-            error!(
-                "Session failed to begin after READY wait (ready={}): {:?}",
-                ready, e
-            );
+            session
+                .begin_with_secondary(
+                    ViewConfigurationType::PRIMARY_STEREO,
+                    &[ViewConfigurationType::SECONDARY_MONO_FIRST_PERSON_OBSERVER_MSFT],
+                )
+                .map_err(|e| {
+                    error!(
+                        "Session failed to begin after READY wait (ready={}): {:?}",
+                        ready, e
+                    );
+                    Error::BackendSpecific(format!("Session::begin_with_secondary {:?}", e))
+                })?;
+        } else {
+            session
+                .begin(ViewConfigurationType::PRIMARY_STEREO)
+                .map_err(|e| {
+                    error!(
+                        "Session failed to begin after READY wait (ready={}): {:?}",
+                        ready, e
+                    );
+                    Error::BackendSpecific(format!("Session::begin {:?}", e))
+                })?;
         }
 
         let pose = Posef {
