@@ -13,12 +13,11 @@
 //! 統計は [`Presenter`] が層管理単位で集約する。
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use euclid::{Rect, Size2D};
 use glow::{self as gl, HasContext};
 use log::error;
-use openxr::{Graphics, Session, Swapchain};
+use openxr::{Graphics, Swapchain};
 use surfman::{
     Context as SurfmanContext, Device as SurfmanDevice, Error as SurfmanError, SurfaceTexture,
 };
@@ -33,25 +32,6 @@ use super::xr_copy;
 /// 移動前のログtarget。`mod.rs` にあった呼び出しの観測互換（`RUST_LOG` 絞り込み等）を保つ。
 /// W3で診断を整理するまで変えない。
 const OLD_LOG_TARGET: &str = "servo_webxr::openxr";
-
-#[cfg(target_os = "windows")]
-pub(super) mod probe;
-
-/// `create_layer` 先頭の計測プローブ。Windowsでのみ実行する。
-pub(super) fn probe_layer_once(
-    session: &Arc<Session<Backend>>,
-    contexts: &mut dyn GLContexts<SurfmanGL>,
-    context_id: ContextId,
-) {
-    // 計測自体は `XR_COPY_DIAG=1` のときだけ行う。既定では呼ばない（W3）。
-    // `XR_PROBE_LOG` は従来どおり、有効時の追記先として残す。
-    #[cfg(target_os = "windows")]
-    if xr_copy::diag_enabled() {
-        probe::probe_once(session, contexts, context_id);
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = (session, contexts, context_id);
-}
 
 /// 描画先の所有値。GLテクスチャとその標的だけを持ち、参照は保持しない。
 pub(super) struct DrawTarget {
