@@ -13,11 +13,9 @@
 //! 無限待ちは使わない（`wait_image`のみ有限タイムアウトで切り上げ、そのフレームを落とす）。
 //!
 //! 旧E2（取り込み面のGLテクスチャへFBOで描く）は `readPixels` が `[0,0,0,0]` で
-//! 描けていなかったため使わない。既定のE2転送は本モジュールのblit経路である。
+//! 描けていなかったため使わない。既定のE2転送は本モジュールのblit経路であり、
+//! 旧E2資源（keyed mutex付きT・取り込み面）は削除済みである。
 //! 上下反転はblit矩形で吸収する（既定は非反転の等倍、`XR_BLIT_FLIP=1` でY反転）。
-//!
-//! keyed mutex付きの旧E2用Tや取り込み面などの旧資源の生成は残すが、既定転送には
-//! 使わない（作業単位Cで削除する）。
 
 use std::ffi::c_void;
 use std::ptr;
@@ -28,12 +26,12 @@ use glow::HasContext as _;
 use log::{error, info};
 use openxr::Graphics;
 use surfman::{
-    Context as SurfmanContext, Device as SurfmanDevice, Surface as SurfmanSurface, SurfaceTexture,
+    Context as SurfmanContext, Device as SurfmanDevice, Surface as SurfmanSurface,
 };
 use webxr_api::{ContextId, Error};
 use winapi::Interface as _;
 use winapi::shared::dxgi::{
-    IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIKeyedMutex, IDXGIResource,
+    IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIResource,
 };
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::{
@@ -176,13 +174,6 @@ pub(super) enum CopyBacking {
 }
 
 pub(super) struct CopyReady {
-    /// 取り込み面Sから作った描画用テクスチャ。旧E2の診断用に残す（作業単位Cで削除する）。
-    /// 既定のE2-blit転送では使わない（FBO経由で描けないことが確定したため）。
-    /// 不変条件: 通常時は `Some` であり、描画の途中の瞬間だけ `None` になり得る。
-    pub(super) surface_texture: Option<SurfaceTexture>,
-    /// 旧E2の取り込み面から作った描画用テクスチャのGL名。既定転送では使わない
-    /// （作業単位Cで `surface_texture` とともに削除する）。
-    pub(super) gl_texture: glow::NativeTexture,
     /// ページの描画先となるservo自前の通常GLテクスチャ。`SubImage.color_texture` に渡す。
     /// E2-blitの転送元であり、ページは今まで通り `XRWebGLLayer.framebuffer` に描く。
     /// 不変条件: 生成時に必ず作り、失敗時はsetup全体がBrokenになる。
@@ -190,14 +181,6 @@ pub(super) struct CopyReady {
     pub(super) page_texture: glow::NativeTexture,
     /// `page_texture` のテクスチャ標的。常に `TEXTURE_2D` である。
     pub(super) page_target: u32,
-    /// 旧E2用の共有テクスチャ。XRデバイス上で作ったTそのものである。
-    /// 既定転送の転送元には使わず、`ensure_e3` が記述子取得元として読むだけである
-    /// （作業単位Cで削除する）。GLスレッドでのみ操作する。
-    pub(super) shared_texture: *mut ID3D11Texture2D,
-    /// 旧E2用Tのkeyed mutex。+1参照であり、GLスレッドでのみ操作する。
-    /// 既定転送では使わず、破棄時に放すだけである（作業単位Cで削除する）。
-    /// 不変条件: nullまたは有効な+1参照である。
-    pub(super) keyed_mutex: *mut IDXGIKeyedMutex,
     /// XRデバイスのimmediate context。GLスレッドでのみ操作する。
     pub(super) imm_context: *mut ID3D11DeviceContext,
     /// XRデバイス。`GetDeviceRemovedReason`での故障検出に使う。
@@ -216,7 +199,7 @@ pub(super) struct CopyReady {
 }
 
 // 生ポインタ群は自動的にSendである。OpenXrLayerManagerがGLスレッドに閉じるため追加の同期は行わない。
-// ADR: SurfaceTextureの破棄にはdevice/contextが必要なためDropではなくdestroy_backingで明示解放する.
+// ADR: D3D/GL資源の破棄にはdevice/contextが必要なためDropではなくdestroy_backingで明示解放する.
 
 /// GLエラーキューを上限付きで排出する。
 ///
@@ -403,12 +386,101 @@ fn create_page_texture(
 }
 
 /// 層のGPUコピー用裏付けを作る。失敗時は [`CopyBacking::Broken`] を返す。
+/// 層のGPUコピー用裏付けを作る。失敗時は [`CopyBacking::Broken`] を返す.
 ///
-/// E2（既定動作）: XRデバイス上に共有テクスチャTを作り、その共有ハンドルを
-    /// ANGLEデバイス上で開き直して `create_surface_texture_from_texture` で
-    /// 取り込んだ面Sへ直接結び付けた描画用テクスチャを得る。ページはこのGLテクスチャへ
-/// 直接描き、end_frameで `CopyResource(T → XR画像)` する。TとXR画像は同一デバイス上の
+/// 既定動作: ページ描画先（servo自前の通常GLテクスチャ）を作り、XR画像の記述子を
+/// 検証して転送方式（copy/resolve）を決める。実際の転送資源（E3のT＋ANGLE取り込み面S）
+/// は `ensure_e3` がend_frame時に遅延生成する。TとXR画像は同一デバイス上の
 /// 資源であるためデバイス間転送は発生しない。
+/// E3用Tの記述子を組み立てる。
+///
+/// 幅・高さは検証済みのXR画像寸法、形式は `DXGI_FORMAT_B8G8R8A8_UNORM`(87)、
+/// sample数は1、mip/arrayは1に固定する。転送先（TYPELESS 90等）の形式・sample・
+/// 共有フラグは持ち込まない。`setup_backing` のログ記録と `ensure_e3` の生成で共用し、
+/// 両者の記述子を一致させる。
+fn e3_texture_desc(width: u32, height: u32) -> D3D11_TEXTURE2D_DESC {
+    D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: winapi::shared::dxgitype::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: winapi::um::d3d11::D3D11_USAGE_DEFAULT,
+        BindFlags: winapi::um::d3d11::D3D11_BIND_RENDER_TARGET,
+        CPUAccessFlags: 0,
+        MiscFlags: winapi::um::d3d11::D3D11_RESOURCE_MISC_SHARED,
+    }
+}
+
+/// 層寸法とXR画像記述子の検証結果。E3用Tの生成可否と転送方式を決める。
+/// `setup_backing` の記述子判定部を純粋化したものであり、D3Dには触らない。
+struct SetupPlan {
+    /// E3用Tの寸法（検証済みのXR画像寸法）。
+    width: u32,
+    height: u32,
+    /// XR画像の形式。`CopyReady::dst_format`（`ResolveSubresource` に渡す）になる。
+    dst_format: u32,
+    /// XR画像がMSAAのときに真。`CopyResource` ではなく `ResolveSubresource` を使う。
+    resolve: bool,
+    /// 転送方式の記録名。`xr-copy-setup` の `transfer` に出す。
+    transfer: &'static str,
+    /// 形式の厳密一致。ログ記録用。
+    format_exact: bool,
+}
+
+/// 層寸法とXR画像の記述子を検証し、E3用Tの生成計画を作る。失敗時は理由文を返す。
+///
+/// 寸法一致・形式87/TYPELESS90・転送元sample=1の条件は従来の `setup_backing` と
+/// 同一である。mip/array=1の検証は作業単位Cで追加した。MSAA構成の判定
+/// （single→MSAAの解決）は変えない。
+fn plan_e3_backing(
+    width: i32,
+    height: i32,
+    image: &D3D11_TEXTURE2D_DESC,
+) -> Result<SetupPlan, String> {
+    if image.Width != width as u32 || image.Height != height as u32 {
+        return Err(format!(
+            "layer size {width}x{height} != swapchain image {}x{}",
+            image.Width, image.Height,
+        ));
+    }
+    if image.MipLevels != 1 || image.ArraySize != 1 {
+        return Err(format!(
+            "swapchain image has unexpected mip/array {}x{}",
+            image.MipLevels, image.ArraySize,
+        ));
+    }
+    // ADR: XRランタイムはSRGBビュー用にTYPELESS(90)で画像を作ることがある。
+    // 転送元87(UNORM)→転送先90(TYPELESS)は同一32bitレイアウトのためCopyResourceで渡せる。
+    // 形式変換は行わず、ビット列をそのまま写す（sRGB解釈の差異はログに残すのみ）。
+    let format_match = image.Format ==
+        winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM ||
+        image.Format == winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    let format_exact = image.Format ==
+        winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
+    let resolve = format_match && image.SampleDesc.Count > 1;
+    let copy = format_match && image.SampleDesc.Count == 1;
+    let transfer = if copy {
+        "copy"
+    } else if resolve {
+        "resolve"
+    } else {
+        return Err("src/dst descriptors are incompatible for GPU copy".into());
+    };
+    Ok(SetupPlan {
+        width: image.Width,
+        height: image.Height,
+        dst_format: image.Format,
+        resolve,
+        transfer,
+        format_exact,
+    })
+}
+
 /// ADR: ANGLEが作ったpbufferをXR側で開く旧経路は黒になるため使わない。
 pub(super) fn setup_backing(
     contexts: &mut dyn webxr_api::GLContexts<SurfmanGL>,
@@ -427,7 +499,6 @@ pub(super) fn setup_backing(
     let Some(device) = contexts.device(context_id) else {
         return fail("no device for context".into());
     };
-    let size = euclid::Size2D::new(width, height);
     // ANGLE 側デバイス（取り込み用）と XR 画像の所有デバイスを区別する。
     // Tの生成・`CopyResource` はすべて XR 画像と同一デバイス上で行う。
     // そうでないと転送が無効化（黒のまま）し、XR 画像への RTV/Clear が device removed を誘発する。
@@ -458,192 +529,38 @@ pub(super) fn setup_backing(
         angle_device,
         xr_device,
     );
-    // TをXRデバイス上に作る（E3と同一）。層寸法とXR画像寸法の不一致は転送不能のためBrokenとする。
-    // keyed mutex付きで作り、転送前後のAcquire/Release(0)に使うmutexも返す。
-    let (t, keyed_mutex, t_handle) = unsafe {
-        let mut image_desc: D3D11_TEXTURE2D_DESC = std::mem::zeroed();
-        (*first_texture).GetDesc(&mut image_desc);
-        if image_desc.Width != width as u32 || image_desc.Height != height as u32 {
-            drop(ComPtr::from_raw(angle_device));
-            drop(ComPtr::from_raw(xr_device));
-            return fail(format!(
-                "layer size {width}x{height} != swapchain image {}x{}",
-                image_desc.Width, image_desc.Height,
-            ));
-        }
-        let t_desc = D3D11_TEXTURE2D_DESC {
-            Width: image_desc.Width,
-            Height: image_desc.Height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: winapi::shared::dxgitype::DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: winapi::um::d3d11::D3D11_USAGE_DEFAULT,
-            // SHADER_RESOURCEはANGLEが取り込み面へBindTexImageする際のSRV生成に要る。
-            // 無いとSRV生成がE_INVALIDARGで失敗し、描画用テクスチャが作れない。
-            BindFlags: winapi::um::d3d11::D3D11_BIND_RENDER_TARGET |
-                winapi::um::d3d11::D3D11_BIND_SHADER_RESOURCE,
-            CPUAccessFlags: 0,
-            // KEYEDMUTEXはANGLE取り込みの前提である。surfman 0.14のANGLE実装は
-            // `EGL_DXGI_KEYED_MUTEX_ANGLE` を問い合わせて `Synchronization::KeyedMutex` とし、
-            // bind/unbindでAcquire/Release(0)する。MISC_SHAREDだけではSRV生成が
-            // `Error allocating ShaderResourceView` (E_INVALIDARG) で失敗する。
-            MiscFlags: winapi::um::d3d11::D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-        };
-        let mut t: *mut ID3D11Texture2D = ptr::null_mut();
-        // SAFETY: XRデバイス上の有効な生成要求であり、出力先は有効である。
-        let create_hr = (*xr_device).CreateTexture2D(&t_desc, ptr::null(), &mut t);
-        if create_hr != S_OK || t.is_null() {
-            drop(ComPtr::from_raw(angle_device));
-            drop(ComPtr::from_raw(xr_device));
-            return fail(format!("E2 CreateTexture2D for T failed: {create_hr:#x}"));
-        }
-        // Tのkeyed mutexを取得する。転送前後のAcquire/Release(0)に使う。
-        // 取得できないTではANGLEのSRV生成が通らないため、ここでBrokenとする。
-        // SAFETY: 生成したばかりの有効なテクスチャに対する問い合わせであり、出力先は有効である。
-        let keyed_mutex = unsafe {
-            let mut mutex_: *mut IDXGIKeyedMutex = ptr::null_mut();
-            let qi_hr = (*t).QueryInterface(
-                &IDXGIKeyedMutex::uuidof(),
-                &mut mutex_ as *mut *mut IDXGIKeyedMutex as *mut *mut c_void,
-            );
-            if qi_hr != S_OK || mutex_.is_null() {
-                drop(ComPtr::from_raw(t));
-                drop(ComPtr::from_raw(angle_device));
-                drop(ComPtr::from_raw(xr_device));
-                return fail(format!("E2 QueryInterface IDXGIKeyedMutex failed: {qi_hr:#x}"));
-            }
-            mutex_
-        };
-        // 共有ハンドルを取得する。
-        // SAFETY: 生成したばかりの有効なテクスチャに対する問い合わせである。
-        let mut res: *mut IDXGIResource = ptr::null_mut();
-        let qi_hr = (*t).QueryInterface(
-            &IDXGIResource::uuidof(),
-            &mut res as *mut *mut IDXGIResource as *mut *mut c_void,
-        );
-        if qi_hr != S_OK || res.is_null() {
-            drop(ComPtr::from_raw(t));
-            drop(ComPtr::from_raw(keyed_mutex));
-            drop(ComPtr::from_raw(angle_device));
-            drop(ComPtr::from_raw(xr_device));
-            return fail(format!("E2 QueryInterface IDXGIResource failed: {qi_hr:#x}"));
-        }
-        let res = ComPtr::from_raw(res);
-        let mut handle: *mut c_void = ptr::null_mut();
-        let handle_hr = res.GetSharedHandle(&mut handle);
-        if handle_hr != S_OK || handle.is_null() {
-            drop(ComPtr::from_raw(t));
-            drop(ComPtr::from_raw(keyed_mutex));
-            drop(ComPtr::from_raw(angle_device));
-            drop(ComPtr::from_raw(xr_device));
-            return fail(format!("E2 GetSharedHandle failed: {handle_hr:#x}"));
-        }
-        (t, keyed_mutex, handle)
+    // ANGLE側の+1参照はdevice-identityの記録にだけ使い、ここで放す。
+    // 以降のE3生成・転送はXRデバイス上で行い、旧E2用のimportは作らない。
+    // SAFETY: native_device()で取得した+1参照をここで放す。
+    unsafe { drop(ComPtr::from_raw(angle_device)) };
+    // E3用Tの素になるXR画像の記述子を取得する。画素は読まない。
+    // SAFETY: enumerate_imagesで得た有効なXR画像であり、記述子の出力先は有効である。
+    let mut image_desc: D3D11_TEXTURE2D_DESC = unsafe { std::mem::zeroed() };
+    unsafe { (*first_texture).GetDesc(&mut image_desc) };
+    // 層寸法とXR画像寸法の不一致は転送不能のためBrokenとする。E3用Tの寸法・
+    // 形式・sample構成・mip/arrayもここで検証し、転送方式（copy/resolve）を決める。
+    let plan = match plan_e3_backing(width, height, &image_desc) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            // SAFETY: setup内で取得した+1参照をここで放す。
+            unsafe { drop(ComPtr::from_raw(xr_device)) };
+            return fail(reason);
+        },
     };
-    // Tの共有ハンドルをANGLEデバイス上で開き、面Sとして取り込む（E3と同一手順）。
-    // 以降の失敗では T(+1)・mutex(+1)・angle(+1)・xr(+1) を残さない。
-    // SAFETY: native_device()は+1参照で返すためComPtrで引き継ぎ、開いたテクスチャ(+1)ごと
-    // create_surface_from_textureへ所有権を渡す。Err時は被呼出側で破棄される。
-    // surfmanのcontext借用はこの区間に閉じる。後のbindings借用と重ねない。
-    let surface_texture = {
-        let Some(context) = contexts.context(context_id) else {
-            unsafe {
-                drop(ComPtr::from_raw(angle_device));
-                drop(ComPtr::from_raw(t));
-                drop(ComPtr::from_raw(keyed_mutex));
-                drop(ComPtr::from_raw(xr_device));
-            }
-            return fail("no surfman context".into());
-        };
-        unsafe {
-            let _angle_guard = ComPtr::from_raw(angle_device);
-            let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
-            let open_hr = (*angle_device).OpenSharedResource(
-                t_handle,
-                &ID3D11Texture2D::uuidof(),
-                &mut tex as *mut *mut ID3D11Texture2D as *mut *mut std::ffi::c_void,
-            );
-            if open_hr != S_OK || tex.is_null() {
-                drop(ComPtr::from_raw(t));
-                drop(ComPtr::from_raw(keyed_mutex));
-                drop(ComPtr::from_raw(xr_device));
-                return fail(format!("E2 OpenSharedResource on ANGLE failed: {open_hr:#x}"));
-            }
-            // EGL面を共有ハンドル経由で作り直さず、取り込み面へ直接BindTexImageする。
-            // create_surface_textureは共有ハンドルの再importを伴い、
-            // XRデバイス製TではBadParameterになるため使わない。
-            // ADR: 面Sの再importではなく、取り込み面そのものへ結び付ける一段である。
-            match device.create_surface_texture_from_texture(context, &size, ComPtr::from_raw(tex)) {
-                Ok(surface_texture) => surface_texture,
-                Err(e) => {
-                    drop(ComPtr::from_raw(t));
-                    drop(ComPtr::from_raw(keyed_mutex));
-                    drop(ComPtr::from_raw(xr_device));
-                    return fail(format!("E2 create_surface_texture_from_texture failed: {e:?}"));
-                },
-            }
-        }
-    };
-    let Some(gl_texture) = device.surface_texture_object(&surface_texture) else {
-        if let Some(context) = contexts.context(context_id) {
-            destroy_surface_texture_quiet(&device, context, surface_texture);
-        } else {
-            std::mem::forget(surface_texture);
-        }
-        // SAFETY: setup内で取得した+1参照をここで放す。
-        unsafe {
-            drop(ComPtr::from_raw(t));
-            drop(ComPtr::from_raw(keyed_mutex));
-            drop(ComPtr::from_raw(xr_device));
-        }
-        return fail("imported surface texture has no GL object".into());
-    };
-    // 以降は XR デバイスに統一する。ANGLE 側の +1 参照は取り込み時に放済みである。
+    // 以降は XR デバイスに統一する。
     let d3d_device = xr_device;
     let mut imm: *mut ID3D11DeviceContext = ptr::null_mut();
     // SAFETY: 出力先ポインタは有効であり、取得したimmediate contextは+1参照として保持する。
     unsafe { (*d3d_device).GetImmediateContext(&mut imm) };
     if imm.is_null() {
         // SAFETY: setup内で取得した+1参照をここで放す。
-        unsafe {
-            drop(ComPtr::from_raw(t));
-            drop(ComPtr::from_raw(keyed_mutex));
-            drop(ComPtr::from_raw(d3d_device));
-        }
-        if let Some(context) = contexts.context(context_id) {
-            destroy_surface_texture_quiet(&device, context, surface_texture);
-        } else {
-            std::mem::forget(surface_texture);
-        }
+        unsafe { drop(ComPtr::from_raw(d3d_device)) };
         return fail("GetImmediateContext on XR device returned null".into());
     }
-    // 転送元と転送先の記述子を取得する。画素は読まない。
-    let mut src_desc: D3D11_TEXTURE2D_DESC = unsafe { std::mem::zeroed() };
-    // SAFETY: tはXRデバイス上で作った有効なテクスチャである。
-    unsafe { (*t).GetDesc(&mut src_desc) };
-    let mut dst_desc: D3D11_TEXTURE2D_DESC = unsafe { std::mem::zeroed() };
-    // SAFETY: setup先頭で有効性を確認したXR画像の記述子取得である。
-    unsafe { (*first_texture).GetDesc(&mut dst_desc) };
-    // 転送可否を記述子で事前判定する。寸法・形式の不一致やMSAA構成の想定外はBrokenとする。
-    let dims_match =
-        dst_desc.Width == src_desc.Width && dst_desc.Height == src_desc.Height;
-    // ADR: XRランタイムはSRGBビュー用にTYPELESS(90)で画像を作ることがある。
-    // 転送元87(UNORM)→転送先90(TYPELESS)は同一32bitレイアウトのためCopyResourceで渡せる。
-    // 形式変換は行わず、ビット列をそのまま写す（sRGB解釈の差異はログに残すのみ）。
-    let format_match = dst_desc.Format == src_desc.Format ||
-        (src_desc.Format ==
-            winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM &&
-            dst_desc.Format == winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_TYPELESS);
-    let format_exact = dst_desc.Format == src_desc.Format;
-    let resolve = dims_match &&
-        format_match &&
-        dst_desc.SampleDesc.Count > 1 &&
-        src_desc.SampleDesc.Count == 1;
-    let copy = dims_match && format_match && dst_desc.SampleDesc.Count == 1;
+    // 転送方式は検証済み（`plan_e3_backing` と同一条件）。MSAA構成の判定は変えない。
+    let resolve = plan.resolve;
+    // E3用Tの記述子は `ensure_e3` の生成と共用し、転送元とログ記録を一致させる。
+    let e3_desc = e3_texture_desc(plan.width, plan.height);
     emit_json(serde_json::json!({
         "event": "xr-copy-setup",
         "mode": "gpu-copy-e2",
@@ -652,37 +569,21 @@ pub(super) fn setup_backing(
         "format": format,
         "is_srgb": format == winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
         "recommended_sample_count": sample_count,
-        "t_handle": format!("{:#x}", t_handle as usize),
-        "src": {"width": src_desc.Width, "height": src_desc.Height,
-                "format": src_desc.Format, "samples": src_desc.SampleDesc.Count,
-                "bind_flags": src_desc.BindFlags, "misc_flags": src_desc.MiscFlags,
-                "usage": src_desc.Usage, "cpu_access": src_desc.CPUAccessFlags,
-                "mips": src_desc.MipLevels, "array": src_desc.ArraySize,
-                "quality": src_desc.SampleDesc.Quality},
-        "dst": {"width": dst_desc.Width, "height": dst_desc.Height,
-                "format": dst_desc.Format, "samples": dst_desc.SampleDesc.Count,
-                "bind_flags": dst_desc.BindFlags, "misc_flags": dst_desc.MiscFlags,
-                "usage": dst_desc.Usage, "cpu_access": dst_desc.CPUAccessFlags,
-                "mips": dst_desc.MipLevels, "array": dst_desc.ArraySize,
-                "quality": dst_desc.SampleDesc.Quality},
-        "transfer": if copy {"copy"} else if resolve {"resolve"} else {"incompatible"},
-        "format_exact": format_exact,
+        "src": {"width": e3_desc.Width, "height": e3_desc.Height,
+                "format": e3_desc.Format, "samples": e3_desc.SampleDesc.Count,
+                "bind_flags": e3_desc.BindFlags, "misc_flags": e3_desc.MiscFlags,
+                "usage": e3_desc.Usage, "cpu_access": e3_desc.CPUAccessFlags,
+                "mips": e3_desc.MipLevels, "array": e3_desc.ArraySize,
+                "quality": e3_desc.SampleDesc.Quality},
+        "dst": {"width": image_desc.Width, "height": image_desc.Height,
+                "format": image_desc.Format, "samples": image_desc.SampleDesc.Count,
+                "bind_flags": image_desc.BindFlags, "misc_flags": image_desc.MiscFlags,
+                "usage": image_desc.Usage, "cpu_access": image_desc.CPUAccessFlags,
+                "mips": image_desc.MipLevels, "array": image_desc.ArraySize,
+                "quality": image_desc.SampleDesc.Quality},
+        "transfer": plan.transfer,
+        "format_exact": plan.format_exact,
     }));
-    if !copy && !resolve {
-        // SAFETY: setup内で取得した+1参照をここで放す。
-        unsafe {
-            drop(ComPtr::from_raw(t));
-            drop(ComPtr::from_raw(keyed_mutex));
-            drop(ComPtr::from_raw(imm));
-            drop(ComPtr::from_raw(d3d_device));
-        }
-        if let Some(context) = contexts.context(context_id) {
-            destroy_surface_texture_quiet(&device, context, surface_texture);
-        } else {
-            std::mem::forget(surface_texture);
-        }
-        return fail("src/dst descriptors are incompatible for GPU copy".into());
-    }
     // E2-blit用のページ描画先（servo自前の通常GLテクスチャ）を作る。
     // ページはこのテクスチャへ今まで通り `XRWebGLLayer.framebuffer` に描く。
     // E2以前に色が出ていた健全な経路であり、FBO経由で描けない取り込み面は使わない。
@@ -692,17 +593,11 @@ pub(super) fn setup_backing(
     // 失敗時の後片付けは借用終了後に行う。
     let page_tex_result: Result<(glow::NativeTexture, &'static str), String> = {
         let Some(gl) = contexts.bindings(context_id) else {
-            // bindings借用は成立していないため、後片付けでcontextを借りてよい。
+            // bindings借用は成立していないため、後片付けは不要である。
+            // SAFETY: setup内で取得した+1参照をここで放す。
             unsafe {
-                drop(ComPtr::from_raw(t));
-                drop(ComPtr::from_raw(keyed_mutex));
                 drop(ComPtr::from_raw(imm));
                 drop(ComPtr::from_raw(d3d_device));
-            }
-            if let Some(context) = contexts.context(context_id) {
-                destroy_surface_texture_quiet(&device, context, surface_texture);
-            } else {
-                std::mem::forget(surface_texture);
             }
             return fail("no GL bindings for page texture".into());
         };
@@ -715,16 +610,10 @@ pub(super) fn setup_backing(
     let (page_texture, page_method) = match page_tex_result {
         Ok((tex, method)) => (tex, method),
         Err(reason) => {
+            // SAFETY: setup内で取得した+1参照をここで放す。
             unsafe {
-                drop(ComPtr::from_raw(t));
-                drop(ComPtr::from_raw(keyed_mutex));
                 drop(ComPtr::from_raw(imm));
                 drop(ComPtr::from_raw(d3d_device));
-            }
-            if let Some(context) = contexts.context(context_id) {
-                destroy_surface_texture_quiet(&device, context, surface_texture);
-            } else {
-                std::mem::forget(surface_texture);
             }
             return fail(reason);
         },
@@ -739,15 +628,11 @@ pub(super) fn setup_backing(
         "page_method": page_method,
     }));
     CopyBacking::Ready(CopyReady {
-        surface_texture: Some(surface_texture),
-        gl_texture,
         page_texture,
         page_target,
-        shared_texture: t,
-        keyed_mutex,
         imm_context: imm,
         d3d_device,
-        dst_format: dst_desc.Format,
+        dst_format: plan.dst_format,
         width,
         height,
         resolve,
@@ -939,22 +824,10 @@ fn ensure_e3(
     if ready.e3.is_some() {
         return Ok(());
     }
-    // TをXRデバイス上に作る。形式・寸法は転送元と同一とする。
+    // TをXRデバイス上に作る。寸法・形式はsetupで検証済みの値から組み立てる。
+    // 転送先（TYPELESS 90等）の形式・sampleは持ち込まない。
     let (t, t_handle) = unsafe {
-        let mut src_desc: D3D11_TEXTURE2D_DESC = std::mem::zeroed();
-        (*ready.shared_texture).GetDesc(&mut src_desc);
-        let t_desc = D3D11_TEXTURE2D_DESC {
-            Width: src_desc.Width,
-            Height: src_desc.Height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: src_desc.Format,
-            SampleDesc: src_desc.SampleDesc,
-            Usage: winapi::um::d3d11::D3D11_USAGE_DEFAULT,
-            BindFlags: winapi::um::d3d11::D3D11_BIND_RENDER_TARGET,
-            CPUAccessFlags: 0,
-            MiscFlags: winapi::um::d3d11::D3D11_RESOURCE_MISC_SHARED,
-        };
+        let t_desc = e3_texture_desc(ready.width as u32, ready.height as u32);
         let mut t: *mut ID3D11Texture2D = ptr::null_mut();
         let create_hr = (*ready.d3d_device).CreateTexture2D(&t_desc, ptr::null(), &mut t);
         if create_hr != S_OK || t.is_null() {
@@ -1501,12 +1374,8 @@ pub(super) fn destroy_backing(
     }
     // 以降のsurfman破棄に要るdevice/contextを順次取得する。同時に借りない。
     let Some(device) = contexts.device(context_id) else {
-        // SAFETY: D3D参照の放出だけ行う。surfman資源は終了時に回収される。
+        // SAFETY: D3D参照の放出だけ行う。E3の面Sはdevice無しでは破棄できない。
         unsafe {
-            if !ready.keyed_mutex.is_null() {
-                drop(ComPtr::from_raw(ready.keyed_mutex));
-            }
-            drop(ComPtr::from_raw(ready.shared_texture));
             drop(ComPtr::from_raw(ready.imm_context));
             drop(ComPtr::from_raw(ready.d3d_device));
         }
@@ -1521,18 +1390,11 @@ pub(super) fn destroy_backing(
                 std::mem::forget(surface);
             }
         }
-        if let Some(surface_texture) = ready.surface_texture {
-            std::mem::forget(surface_texture);
-        }
         return;
     };
     let Some(context) = contexts.context(context_id) else {
         // SAFETY: D3D参照の放出だけ行う。
         unsafe {
-            if !ready.keyed_mutex.is_null() {
-                drop(ComPtr::from_raw(ready.keyed_mutex));
-            }
-            drop(ComPtr::from_raw(ready.shared_texture));
             drop(ComPtr::from_raw(ready.imm_context));
             drop(ComPtr::from_raw(ready.d3d_device));
         }
@@ -1546,43 +1408,14 @@ pub(super) fn destroy_backing(
                 std::mem::forget(surface);
             }
         }
-        if let Some(surface_texture) = ready.surface_texture {
-            std::mem::forget(surface_texture);
-        }
         return;
     };
-    // E3裏付け（T＋取り込み面S）を先に破棄する。surface_textureのtake（部分移動）より
-    // 後に &mut ready を借りると競合するためである（両者は独立である）。
+    // E3裏付け（T＋取り込み面S）を先に破棄する。
     teardown_e3(&device, context, &mut ready);
-    if let Some(surface_texture) = ready.surface_texture {
-        destroy_surface_texture_quiet(&device, context, surface_texture);
-    }
     // SAFETY: setupで取得した+1参照をここで放す。GLスレッドでのみ実行される。
     unsafe {
-        if !ready.keyed_mutex.is_null() {
-            drop(ComPtr::from_raw(ready.keyed_mutex));
-            ready.keyed_mutex = ptr::null_mut();
-        }
-        drop(ComPtr::from_raw(ready.shared_texture));
         drop(ComPtr::from_raw(ready.imm_context));
         drop(ComPtr::from_raw(ready.d3d_device));
-    }
-}
-
-fn destroy_surface_texture_quiet(
-    device: &SurfmanDevice,
-    context: &mut SurfmanContext,
-    surface_texture: SurfaceTexture,
-) {
-    match device.destroy_surface_texture(context, surface_texture) {
-        Ok(mut surface) => {
-            let _ = device.destroy_surface(context, &mut surface);
-        },
-        Err((_, surface_texture)) => {
-            // ADR: 破棄失敗のままDropするとpanicするためリークを選ぶ（probeと同一方針）。
-            // 終了時に回収される一時的なGLリソースである。
-            std::mem::forget(surface_texture);
-        },
     }
 }
 
@@ -1657,5 +1490,126 @@ impl CopyStats {
             "max_finish_ms": self.max_finish_ms,
             "max_copy_ms": self.max_copy_ms,
         }));
+    }
+}
+
+#[cfg(test)]
+mod setup_plan_tests {
+    use super::*;
+    use winapi::shared::dxgiformat;
+    use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
+
+    /// 検証用のXR画像記述子を作る。mip/arrayは1に固定する。
+    fn image_desc(width: u32, height: u32, format: u32, samples: u32) -> D3D11_TEXTURE2D_DESC {
+        D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: samples,
+                Quality: 0,
+            },
+            Usage: 0,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        }
+    }
+
+    #[test]
+    fn copy_for_matching_unorm_image() {
+        let image = image_desc(
+            1024,
+            1024,
+            dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM,
+            1,
+        );
+        let plan = plan_e3_backing(1024, 1024, &image).unwrap();
+        assert_eq!((plan.width, plan.height), (1024, 1024));
+        assert_eq!(plan.dst_format, dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert!(!plan.resolve);
+        assert_eq!(plan.transfer, "copy");
+        assert!(plan.format_exact);
+    }
+
+    #[test]
+    fn resolve_for_typeless_msaa_image() {
+        let image = image_desc(
+            1024,
+            1024,
+            dxgiformat::DXGI_FORMAT_B8G8R8A8_TYPELESS,
+            4,
+        );
+        let plan = plan_e3_backing(1024, 1024, &image).unwrap();
+        assert!(plan.resolve);
+        assert_eq!(plan.transfer, "resolve");
+        assert_eq!(plan.dst_format, dxgiformat::DXGI_FORMAT_B8G8R8A8_TYPELESS);
+        assert!(!plan.format_exact);
+    }
+
+    #[test]
+    fn rejects_size_mismatch() {
+        let image = image_desc(
+            1024,
+            1024,
+            dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM,
+            1,
+        );
+        assert!(plan_e3_backing(800, 600, &image).is_err());
+    }
+
+    #[test]
+    fn rejects_foreign_format() {
+        let image = image_desc(
+            1024,
+            1024,
+            dxgiformat::DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+        );
+        assert!(plan_e3_backing(1024, 1024, &image).is_err());
+    }
+
+    #[test]
+    fn rejects_mip_or_array() {
+        let mut image = image_desc(
+            1024,
+            1024,
+            dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM,
+            1,
+        );
+        image.MipLevels = 2;
+        assert!(plan_e3_backing(1024, 1024, &image).is_err());
+        image.MipLevels = 1;
+        image.ArraySize = 2;
+        assert!(plan_e3_backing(1024, 1024, &image).is_err());
+    }
+
+    #[test]
+    fn e3_desc_matches_plan() {
+        let image = image_desc(
+            1024,
+            1024,
+            dxgiformat::DXGI_FORMAT_B8G8R8A8_TYPELESS,
+            1,
+        );
+        let plan = plan_e3_backing(1024, 1024, &image).unwrap();
+        let desc = e3_texture_desc(plan.width, plan.height);
+        assert_eq!((desc.Width, desc.Height), (1024, 1024));
+        assert_eq!(desc.Format, dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert_eq!(desc.SampleDesc.Count, 1);
+        assert_eq!(desc.SampleDesc.Quality, 0);
+        assert_eq!((desc.MipLevels, desc.ArraySize), (1, 1));
+        assert_eq!(desc.Usage, winapi::um::d3d11::D3D11_USAGE_DEFAULT);
+        assert_eq!(
+            desc.BindFlags,
+            winapi::um::d3d11::D3D11_BIND_RENDER_TARGET
+        );
+        assert_eq!(desc.CPUAccessFlags, 0);
+        assert_eq!(
+            desc.MiscFlags,
+            winapi::um::d3d11::D3D11_RESOURCE_MISC_SHARED
+        );
     }
 }
