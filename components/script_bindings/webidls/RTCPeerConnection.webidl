@@ -21,11 +21,11 @@ interface RTCPeerConnection : EventTarget {
     readonly attribute RTCSignalingState      signalingState;
     readonly attribute RTCIceGatheringState   iceGatheringState;
     readonly attribute RTCIceConnectionState  iceConnectionState;
-    // readonly attribute RTCPeerConnectionState connectionState;
+    readonly attribute RTCPeerConnectionState connectionState;
     // readonly attribute boolean?               canTrickleIceCandidates;
     // static sequence<RTCIceServer>      getDefaultIceServers();
     // RTCConfiguration                   getConfiguration();
-    // void                               setConfiguration(RTCConfiguration configuration);
+    [Throws] undefined                  setConfiguration(optional RTCConfiguration configuration = {});
     undefined                               close();
              attribute EventHandler           onnegotiationneeded;
              attribute EventHandler           onicecandidate;
@@ -33,7 +33,7 @@ interface RTCPeerConnection : EventTarget {
              attribute EventHandler           onsignalingstatechange;
              attribute EventHandler           oniceconnectionstatechange;
              attribute EventHandler           onicegatheringstatechange;
-    //          attribute EventHandler           onconnectionstatechange;
+             attribute EventHandler           onconnectionstatechange;
 
     // removed from spec, but still shipped by browsers
     undefined addStream (MediaStream stream);
@@ -42,7 +42,9 @@ interface RTCPeerConnection : EventTarget {
 dictionary RTCConfiguration {
     sequence<RTCIceServer>   iceServers;
     RTCIceTransportPolicy    iceTransportPolicy = "all";
-    RTCBundlePolicy          bundlePolicy = "balanced";
+    // GStreamer's balanced policy creates conflicting ICE credentials in the
+    // bundled offer, which LiveKit rejects. Prefer a single transport by default.
+    RTCBundlePolicy          bundlePolicy = "max-bundle";
     RTCRtcpMuxPolicy         rtcpMuxPolicy = "require";
     DOMString                peerIdentity;
     // sequence<RTCCertificate> certificates;
@@ -106,6 +108,15 @@ enum RTCIceConnectionState {
     "closed"
 };
 
+enum RTCPeerConnectionState {
+    "new",
+    "connecting",
+    "connected",
+    "disconnected",
+    "failed",
+    "closed"
+};
+
 enum RTCSignalingState {
     "stable",
     "have-local-offer",
@@ -132,15 +143,17 @@ dictionary RTCRtpTransceiverInit {
 };
 
 partial interface RTCPeerConnection {
-    // sequence<RTCRtpSender>      getSenders();
-    // sequence<RTCRtpReceiver>    getReceivers();
-    // sequence<RTCRtpTransceiver> getTransceivers();
-    // RTCRtpSender                addTrack(MediaStreamTrack track,
-    //                                      MediaStream... streams);
-    // void                        removeTrack(RTCRtpSender sender);
     [Pref="dom_webrtc_transceiver_enabled"]
-    RTCRtpTransceiver           addTransceiver((MediaStreamTrack or DOMString) trackOrKind,
-                                               optional RTCRtpTransceiverInit init = {});
+    sequence<RTCRtpSender>      getSenders();
+    // sequence<RTCRtpReceiver>    getReceivers();
+    [Pref="dom_webrtc_transceiver_enabled"]
+    sequence<RTCRtpTransceiver> getTransceivers();
+    [Pref="dom_webrtc_transceiver_enabled", Throws]
+    RTCRtpSender addTrack(MediaStreamTrack track, MediaStream... streams);
+    // void                        removeTrack(RTCRtpSender sender);
+    [Pref="dom_webrtc_transceiver_enabled", Throws]
+    RTCRtpTransceiver addTransceiver((MediaStreamTrack or DOMString) trackOrKind,
+                                     optional RTCRtpTransceiverInit init = {});
     attribute EventHandler ontrack;
 };
 

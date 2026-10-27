@@ -8900,6 +8900,7 @@ dependencies = [
  "gstreamer-video",
  "gstreamer-webrtc",
  "log",
+ "rand 0.10.3",
  "servo-base",
  "servo-media",
  "servo-media-audio",
@@ -9024,6 +9025,7 @@ version = "0.7.0"
 dependencies = [
  "log",
  "servo-media-streams",
+ "url",
  "uuid",
 ]
 

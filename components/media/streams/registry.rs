@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use malloc_size_of_derive::MallocSizeOf;
 use uuid::Uuid;
 
-use super::MediaStream;
+use super::{MediaStream, MediaStreamSettings};
 
 type RegisteredMediaStream = Arc<Mutex<dyn MediaStream>>;
 
@@ -41,9 +41,31 @@ pub fn register_stream(stream: Arc<Mutex<dyn MediaStream>>) -> MediaStreamId {
 }
 
 pub fn unregister_stream(stream: &MediaStreamId) {
-    MEDIA_STREAMS_REGISTRY.lock().unwrap().remove(stream);
+    // A stream's destructor may unregister itself. Drop the removed value only
+    // after releasing the registry lock so that cleanup can re-enter safely.
+    let removed = MEDIA_STREAMS_REGISTRY.lock().unwrap().remove(stream);
+    drop(removed);
 }
 
 pub fn get_stream(stream: &MediaStreamId) -> Option<Arc<Mutex<dyn MediaStream>>> {
     MEDIA_STREAMS_REGISTRY.lock().unwrap().get(stream).cloned()
+}
+
+pub fn set_stream_enabled(stream: &MediaStreamId, enabled: bool) -> Result<(), String> {
+    let stream = get_stream(stream).ok_or_else(|| String::from("メディアストリームが無い"))?;
+    stream.lock().unwrap().set_enabled(enabled)
+}
+
+pub fn clone_stream(stream: &MediaStreamId) -> Result<MediaStreamId, String> {
+    let stream = get_stream(stream).ok_or_else(|| String::from("メディアストリームが無い"))?;
+    stream.lock().unwrap().clone_stream()
+}
+
+pub fn stop_stream(stream: &MediaStreamId) -> Result<(), String> {
+    let stream = get_stream(stream).ok_or_else(|| String::from("メディアストリームが無い"))?;
+    stream.lock().unwrap().stop()
+}
+
+pub fn stream_settings(stream: &MediaStreamId) -> Option<MediaStreamSettings> {
+    get_stream(stream).map(|stream| stream.lock().unwrap().settings())
 }

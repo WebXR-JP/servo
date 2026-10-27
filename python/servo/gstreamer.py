@@ -72,6 +72,7 @@ GSTREAMER_WIN_DEPENDENCY_LIBS = [
     "opus-0.dll",
     "orc-0.4-0.dll",
     "pcre2-8-0.dll",
+    "srtp2-1.dll",
     "swresample-4.dll",
     "theora-0.dll",
     "theoradec-1.dll",

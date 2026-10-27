@@ -38,6 +38,8 @@
 "gstdtls",
 "gstid3tag",
 "gstproxy",
+"gstsctp",
+"gstsrtp",
 "gstvideoparsersbad",
 "gstwebrtc",
 // gst-libav

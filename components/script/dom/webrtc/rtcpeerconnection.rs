@@ -15,19 +15,27 @@ use script_bindings::reflector::reflect_weak_referenceable_dom_object_with_proto
 use servo_media::ServoMedia;
 use servo_media::streams::MediaStreamType;
 use servo_media::streams::registry::MediaStreamId;
+use servo_media::webrtc::ice::{IceConfigError, IceConfiguration, IceServer, IceTransportPolicy};
 use servo_media::webrtc::{
-    BundlePolicy, DataChannelEvent, DataChannelId, DataChannelState, GatheringState, IceCandidate,
-    IceConnectionState, SdpType, SessionDescription, SignalingState, WebRtcController,
+    BundlePolicy, ConnectionState, DataChannelEvent, DataChannelId, DataChannelState,
+    GatheringState, IceCandidate, IceConnectionState, OutgoingTrack, RemoteTrackMetadata, SdpType,
+    SessionDescription, SignalingState, TransceiverDirection, TransceiverKind, WebRtcController,
     WebRtcSignaller,
 };
 
 use crate::conversions::Convert;
+use crate::dom::bindings::codegen::Bindings::MediaStreamBinding::MediaStreamMethods;
+use crate::dom::bindings::codegen::Bindings::MediaStreamTrackBinding::MediaStreamTrackMethods;
 use crate::dom::bindings::codegen::Bindings::RTCDataChannelBinding::RTCDataChannelInit;
 use crate::dom::bindings::codegen::Bindings::RTCIceCandidateBinding::RTCIceCandidateInit;
 use crate::dom::bindings::codegen::Bindings::RTCPeerConnectionBinding::{
     RTCAnswerOptions, RTCBundlePolicy, RTCConfiguration, RTCIceConnectionState,
-    RTCIceGatheringState, RTCOfferOptions, RTCPeerConnectionMethods, RTCRtpTransceiverInit,
-    RTCSignalingState,
+    RTCIceCredentialType, RTCIceGatheringState, RTCIceTransportPolicy, RTCOfferOptions,
+    RTCPeerConnectionMethods, RTCPeerConnectionState, RTCRtpTransceiverInit, RTCSignalingState,
+};
+use crate::dom::bindings::codegen::Bindings::RTCRtpSenderBinding::RTCRtpSenderMethods;
+use crate::dom::bindings::codegen::Bindings::RTCRtpTransceiverBinding::{
+    RTCRtpTransceiverDirection, RTCRtpTransceiverMethods,
 };
 use crate::dom::bindings::codegen::Bindings::RTCSessionDescriptionBinding::{
     RTCSdpType, RTCSessionDescriptionInit,
@@ -47,7 +55,9 @@ use crate::dom::rtcdatachannel::RTCDataChannel;
 use crate::dom::rtcdatachannelevent::RTCDataChannelEvent;
 use crate::dom::rtcicecandidate::RTCIceCandidate;
 use crate::dom::rtcpeerconnectioniceevent::RTCPeerConnectionIceEvent;
-use crate::dom::rtcrtptransceiver::RTCRtpTransceiver;
+use crate::dom::rtcrtpreceiver::RTCRtpReceiver;
+use crate::dom::rtcrtpsender::RTCRtpSender;
+use crate::dom::rtcrtptransceiver::{RTCRtpTransceiver, backend_direction};
 use crate::dom::rtcsessiondescription::RTCSessionDescription;
 use crate::dom::rtctrackevent::RTCTrackEvent;
 use crate::dom::window::Window;
@@ -71,14 +81,72 @@ pub(crate) struct RTCPeerConnection {
     remote_description: MutNullableDom<RTCSessionDescription>,
     gathering_state: Cell<RTCIceGatheringState>,
     ice_connection_state: Cell<RTCIceConnectionState>,
+    connection_state: Cell<RTCPeerConnectionState>,
+    bundle_policy: Cell<RTCBundlePolicy>,
+    #[ignore_malloc_size_of = "defined in servo-media"]
+    #[no_trace]
+    ice_config: DomRefCell<IceConfiguration>,
     signaling_state: Cell<RTCSignalingState>,
     #[ignore_malloc_size_of = "defined in servo-media"]
     data_channels: DomRefCell<FxHashMap<DataChannelId, Dom<RTCDataChannel>>>,
+    senders: DomRefCell<Vec<Dom<RTCRtpSender>>>,
+    transceivers: DomRefCell<Vec<Dom<RTCRtpTransceiver>>>,
 }
 
 struct RTCSignaller {
     trusted: Trusted<RTCPeerConnection>,
     task_source: SendableTaskSource,
+}
+
+fn copy_ice_configuration(config: &IceConfiguration) -> IceConfiguration {
+    IceConfiguration {
+        stun_server: config.stun_server.clone(),
+        turn_servers: config.turn_servers.clone(),
+        policy: config.policy,
+    }
+}
+
+fn convert_ice_configuration(
+    config: &RTCConfiguration,
+    previous: Option<&IceConfiguration>,
+) -> Fallible<IceConfiguration> {
+    let policy = match config.iceTransportPolicy {
+        RTCIceTransportPolicy::All => IceTransportPolicy::All,
+        RTCIceTransportPolicy::Relay => IceTransportPolicy::Relay,
+    };
+    let Some(servers) = &config.iceServers else {
+        let mut ice = previous.map(copy_ice_configuration).unwrap_or_default();
+        ice.policy = policy;
+        return Ok(ice);
+    };
+    let servers = servers
+        .iter()
+        .map(|server| {
+            if server.credentialType != RTCIceCredentialType::Password {
+                return Err(Error::NotSupported(Some(
+                    "OAuth ICE credentials are not supported".into(),
+                )));
+            }
+            let urls = match &server.urls {
+                StringOrStringSequence::String(url) => vec![url.to_string()],
+                StringOrStringSequence::StringSequence(urls) => {
+                    urls.iter().map(ToString::to_string).collect()
+                },
+            };
+            Ok(IceServer {
+                urls,
+                username: server.username.as_ref().map(ToString::to_string),
+                credential: server.credential.as_ref().map(ToString::to_string),
+            })
+        })
+        .collect::<Fallible<Vec<_>>>()?;
+    IceConfiguration::new(servers, policy).map_err(|error| match error {
+        IceConfigError::InvalidCredentials { .. } => Error::InvalidAccess(Some(error.to_string())),
+        IceConfigError::MultipleStunServers | IceConfigError::UnsupportedScheme { .. } => {
+            Error::NotSupported(Some(error.to_string()))
+        },
+        _ => Error::Syntax(Some(error.to_string())),
+    })
 }
 
 impl WebRtcSignaller for RTCSignaller {
@@ -117,6 +185,15 @@ impl WebRtcSignaller for RTCSignaller {
             }));
     }
 
+    fn update_connection_state(&self, state: ConnectionState) {
+        let this = self.trusted.clone();
+        self.task_source
+            .queue(task!(update_connection_state: move |cx| {
+                let this = this.root();
+                this.update_connection_state(cx, state);
+            }));
+    }
+
     fn update_signaling_state(&self, state: SignalingState) {
         let this = self.trusted.clone();
         self.task_source
@@ -126,12 +203,17 @@ impl WebRtcSignaller for RTCSignaller {
             }));
     }
 
-    fn on_add_stream(&self, id: &MediaStreamId, ty: MediaStreamType) {
+    fn on_add_stream(
+        &self,
+        id: &MediaStreamId,
+        ty: MediaStreamType,
+        metadata: RemoteTrackMetadata,
+    ) {
         let this = self.trusted.clone();
         let id = *id;
         self.task_source.queue(task!(on_add_stream: move |cx| {
             let this = this.root();
-            this.on_add_stream(cx, id, ty, );
+            this.on_add_stream(cx, id, ty, metadata);
         }));
     }
 
@@ -170,8 +252,13 @@ impl RTCPeerConnection {
             remote_description: Default::default(),
             gathering_state: Cell::new(RTCIceGatheringState::New),
             ice_connection_state: Cell::new(RTCIceConnectionState::New),
+            connection_state: Cell::new(RTCPeerConnectionState::New),
+            bundle_policy: Cell::new(RTCBundlePolicy::Balanced),
+            ice_config: DomRefCell::new(IceConfiguration::default()),
             signaling_state: Cell::new(RTCSignalingState::Stable),
             data_channels: DomRefCell::new(FxHashMap::default()),
+            senders: DomRefCell::new(vec![]),
+            transceivers: DomRefCell::new(vec![]),
         }
     }
 
@@ -180,7 +267,8 @@ impl RTCPeerConnection {
         window: &Window,
         proto: Option<HandleObject>,
         config: &RTCConfiguration,
-    ) -> DomRoot<RTCPeerConnection> {
+    ) -> Fallible<DomRoot<RTCPeerConnection>> {
+        let ice_config = convert_ice_configuration(config, None)?;
         let this = reflect_weak_referenceable_dom_object_with_proto(
             cx,
             Rc::new(RTCPeerConnection::new_inherited()),
@@ -189,27 +277,20 @@ impl RTCPeerConnection {
         );
         let signaller = this.make_signaller();
         *this.controller.borrow_mut() = Some(ServoMedia::get().create_webrtc(signaller));
-        if let Some(ref servers) = config.iceServers &&
-            let Some(server) = servers.first()
-        {
-            let server = match server.urls {
-                StringOrStringSequence::String(ref s) => Some(s.clone()),
-                StringOrStringSequence::StringSequence(ref s) => s.first().cloned(),
-            };
-            if let Some(server) = server {
-                let policy = match config.bundlePolicy {
-                    RTCBundlePolicy::Balanced => BundlePolicy::Balanced,
-                    RTCBundlePolicy::Max_compat => BundlePolicy::MaxCompat,
-                    RTCBundlePolicy::Max_bundle => BundlePolicy::MaxBundle,
-                };
-                this.controller
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .configure(String::from(server), policy);
-            }
+        let policy = match config.bundlePolicy {
+            RTCBundlePolicy::Balanced => BundlePolicy::Balanced,
+            RTCBundlePolicy::Max_compat => BundlePolicy::MaxCompat,
+            RTCBundlePolicy::Max_bundle => BundlePolicy::MaxBundle,
+        };
+        let controller = this.controller.borrow().as_ref().unwrap().clone();
+        controller.configure(String::new(), policy);
+        if let Err(error) = controller.set_ice_configuration(copy_ice_configuration(&ice_config)) {
+            controller.quit();
+            return Err(Error::Operation(Some(format!("{error:?}").into())));
         }
-        this
+        this.bundle_policy.set(config.bundlePolicy);
+        *this.ice_config.borrow_mut() = ice_config;
+        Ok(this)
     }
 
     pub(crate) fn get_webrtc_controller(&self) -> &DomRefCell<Option<WebRtcController>> {
@@ -261,11 +342,60 @@ impl RTCPeerConnection {
         event.upcast::<Event>().fire(cx, self.upcast());
     }
 
-    fn on_add_stream(&self, cx: &mut JSContext, id: MediaStreamId, ty: MediaStreamType) {
+    fn on_add_stream(
+        &self,
+        cx: &mut JSContext,
+        id: MediaStreamId,
+        ty: MediaStreamType,
+        metadata: RemoteTrackMetadata,
+    ) {
         if self.closed.get() {
             return;
         }
-        let track = MediaStreamTrack::new(cx, &self.global(), id, ty);
+        let track = match metadata.track_id {
+            Some(track_id) => {
+                MediaStreamTrack::new_with_id(cx, &self.global(), id, ty, track_id.into())
+            },
+            None => MediaStreamTrack::new(cx, &self.global(), id, ty),
+        };
+        let receiver = RTCRtpReceiver::new(cx, &self.global(), &track);
+        let streams = metadata
+            .stream_ids
+            .into_iter()
+            .map(|stream_id| {
+                let stream = MediaStream::new_with_id(cx, &self.global(), stream_id.into());
+                stream.add_track(&track);
+                stream
+            })
+            .collect::<Vec<_>>();
+        let existing = self
+            .transceivers
+            .borrow()
+            .iter()
+            .find(|transceiver| transceiver.id() == metadata.transceiver_id)
+            .map(|transceiver| DomRoot::from_ref(&**transceiver));
+        let transceiver = if let Some(transceiver) = existing {
+            transceiver.set_remote(&receiver, metadata.mid.map(Into::into));
+            transceiver
+        } else {
+            let controller = self.controller.borrow().as_ref().unwrap().clone();
+            let transceiver = RTCRtpTransceiver::new_remote(
+                cx,
+                &self.global(),
+                RTCRtpTransceiverDirection::Recvonly,
+                &receiver,
+                metadata.mid.map(Into::into),
+                controller,
+                metadata.transceiver_id,
+            );
+            self.senders
+                .borrow_mut()
+                .push(Dom::from_ref(&*transceiver.Sender()));
+            self.transceivers
+                .borrow_mut()
+                .push(Dom::from_ref(&*transceiver));
+            transceiver
+        };
         let event = RTCTrackEvent::new(
             cx,
             self.global().as_window(),
@@ -273,6 +403,9 @@ impl RTCPeerConnection {
             false,
             false,
             &track,
+            &receiver,
+            &transceiver,
+            &streams,
         );
         event.upcast::<Event>().fire(cx, self.upcast());
     }
@@ -418,6 +551,25 @@ impl RTCPeerConnection {
         event.upcast::<Event>().fire(cx, self.upcast());
     }
 
+    fn update_connection_state(&self, cx: &mut JSContext, state: ConnectionState) {
+        if self.closed.get() {
+            return;
+        }
+        let state: RTCPeerConnectionState = state.convert();
+        if state == self.connection_state.get() {
+            return;
+        }
+        self.connection_state.set(state);
+        let event = Event::new(
+            cx,
+            &self.global(),
+            "connectionstatechange".into(),
+            EventBubbles::DoesNotBubble,
+            EventCancelable::NotCancelable,
+        );
+        event.upcast::<Event>().fire(cx, self.upcast());
+    }
+
     fn update_signaling_state(&self, cx: &mut JSContext, state: SignalingState) {
         if self.closed.get() {
             return;
@@ -510,7 +662,28 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         proto: Option<HandleObject>,
         config: &RTCConfiguration,
     ) -> Fallible<DomRoot<RTCPeerConnection>> {
-        Ok(RTCPeerConnection::new(cx, window, proto, config))
+        RTCPeerConnection::new(cx, window, proto, config)
+    }
+
+    /// <https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-setconfiguration>
+    fn SetConfiguration(&self, config: &RTCConfiguration) -> Fallible<()> {
+        if self.closed.get() {
+            return Err(Error::InvalidState(None));
+        }
+        if self.bundle_policy.get() != config.bundlePolicy {
+            return Err(Error::InvalidModification(Some(
+                "bundle policy cannot be changed".into(),
+            )));
+        }
+        let ice_config = convert_ice_configuration(config, Some(&self.ice_config.borrow()))?;
+        self.controller
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .set_ice_configuration(copy_ice_configuration(&ice_config))
+            .map_err(|error| Error::Operation(Some(format!("{error:?}").into())))?;
+        *self.ice_config.borrow_mut() = ice_config;
+        Ok(())
     }
 
     // https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-icecandidate
@@ -549,6 +722,12 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
 
     // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-ondatachannel
     event_handler!(datachannel, GetOndatachannel, SetOndatachannel);
+
+    event_handler!(
+        connectionstatechange,
+        GetOnconnectionstatechange,
+        SetOnconnectionstatechange
+    );
 
     /// <https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-addicecandidate>
     fn AddIceCandidate(
@@ -730,6 +909,94 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         }
     }
 
+    /// <https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-getsenders>
+    fn GetSenders(&self) -> Vec<DomRoot<RTCRtpSender>> {
+        self.senders
+            .borrow()
+            .iter()
+            .map(|sender| DomRoot::from_ref(&**sender))
+            .collect()
+    }
+
+    /// <https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-gettransceivers>
+    fn GetTransceivers(&self) -> Vec<DomRoot<RTCRtpTransceiver>> {
+        if !self.closed.get()
+            && let Some(controller) = self.controller.borrow().as_ref()
+            && let Ok(states) = controller.get_transceivers()
+        {
+            for state in &states {
+                if let Some(transceiver) = self
+                    .transceivers
+                    .borrow()
+                    .iter()
+                    .find(|t| t.id() == state.id)
+                {
+                    transceiver.update_state(state);
+                }
+            }
+        }
+        self.transceivers
+            .borrow()
+            .iter()
+            .map(|transceiver| DomRoot::from_ref(&**transceiver))
+            .collect()
+    }
+
+    /// <https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-addtrack>
+    fn AddTrack(
+        &self,
+        cx: &mut JSContext,
+        track: &MediaStreamTrack,
+        streams: &[&MediaStream],
+    ) -> Fallible<DomRoot<RTCRtpSender>> {
+        if self.closed.get() {
+            return Err(Error::InvalidState(None));
+        }
+        if self
+            .senders
+            .borrow()
+            .iter()
+            .filter_map(|sender| sender.GetTrack())
+            .any(|sender_track| &*sender_track == track)
+        {
+            return Err(Error::InvalidAccess(Some(
+                "track is already associated with this connection".into(),
+            )));
+        }
+
+        let controller = self.controller.borrow().as_ref().unwrap().clone();
+        let source = OutgoingTrack {
+            source_stream: track.id(),
+            stream_ids: streams
+                .iter()
+                .map(|stream| stream.Id().to_string())
+                .collect(),
+            track_id: track.Id().to_string(),
+            audio_bitrate: None,
+        };
+        let kind = match track.ty() {
+            MediaStreamType::Audio => TransceiverKind::Audio,
+            MediaStreamType::Video => TransceiverKind::Video,
+        };
+        let id = controller
+            .add_transceiver(kind, TransceiverDirection::SendRecv, Some(source))
+            .map_err(|error| Error::Operation(Some(format!("{error:?}").into())))?;
+        let transceiver = RTCRtpTransceiver::new(
+            cx,
+            &self.global(),
+            RTCRtpTransceiverDirection::Sendrecv,
+            Some(track),
+            controller,
+            id,
+        );
+        let sender = transceiver.Sender();
+        self.senders.borrow_mut().push(Dom::from_ref(&*sender));
+        self.transceivers
+            .borrow_mut()
+            .push(Dom::from_ref(&*transceiver));
+        Ok(sender)
+    }
+
     /// <https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-icegatheringstate>
     fn IceGatheringState(&self) -> RTCIceGatheringState {
         self.gathering_state.get()
@@ -738,6 +1005,11 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
     /// <https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-iceconnectionstate>
     fn IceConnectionState(&self) -> RTCIceConnectionState {
         self.ice_connection_state.get()
+    }
+
+    /// <https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-connectionstate>
+    fn ConnectionState(&self) -> RTCPeerConnectionState {
+        self.connection_state.get()
     }
 
     /// <https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-signalingstate>
@@ -770,9 +1042,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
 
         // Step 11
         self.ice_connection_state.set(RTCIceConnectionState::Closed);
-
-        // Step 11
-        // (no current support for connection state)
+        self.connection_state.set(RTCPeerConnectionState::Closed);
     }
 
     /// <https://www.w3.org/TR/webrtc/#dom-peerconnection-createdatachannel>
@@ -789,10 +1059,85 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
     fn AddTransceiver(
         &self,
         cx: &mut JSContext,
-        _track_or_kind: MediaStreamTrackOrString,
+        track_or_kind: MediaStreamTrackOrString,
         init: &RTCRtpTransceiverInit,
-    ) -> DomRoot<RTCRtpTransceiver> {
-        RTCRtpTransceiver::new(cx, &self.global(), init.direction)
+    ) -> Fallible<DomRoot<RTCRtpTransceiver>> {
+        if self.closed.get() {
+            return Err(Error::InvalidState(None));
+        }
+        let (kind, track) = match track_or_kind {
+            MediaStreamTrackOrString::MediaStreamTrack(track) => {
+                let kind = match track.ty() {
+                    MediaStreamType::Audio => TransceiverKind::Audio,
+                    MediaStreamType::Video => TransceiverKind::Video,
+                };
+                (kind, Some(track))
+            },
+            MediaStreamTrackOrString::String(kind) => match &*kind.str() {
+                "audio" => (TransceiverKind::Audio, None),
+                "video" => (TransceiverKind::Video, None),
+                _ => return Err(Error::Type(c"Invalid transceiver kind".to_owned())),
+            },
+        };
+        if track.as_ref().is_some_and(|track| {
+            self.senders
+                .borrow()
+                .iter()
+                .filter_map(|sender| sender.GetTrack())
+                .any(|sender_track| &*sender_track == &**track)
+        }) {
+            return Err(Error::NotSupported(Some(
+                "sending the same track on multiple transceivers is not supported".into(),
+            )));
+        }
+        if init.sendEncodings.len() > 1
+            || init.sendEncodings.iter().any(|encoding| {
+                !encoding.active
+                    || encoding.parent.rid.is_some()
+                    || encoding.scaleResolutionDownBy.is_some()
+            })
+        {
+            return Err(Error::NotSupported(Some(
+                "unsupported RTP encoding options".into(),
+            )));
+        }
+        let audio_bitrate = init
+            .sendEncodings
+            .first()
+            .and_then(|encoding| encoding.maxBitrate);
+        if kind == TransceiverKind::Video && audio_bitrate.is_some() {
+            return Err(Error::NotSupported(Some(
+                "video bitrate control is not supported".into(),
+            )));
+        }
+        let source = track.as_ref().map(|track| OutgoingTrack {
+            source_stream: track.id(),
+            stream_ids: init
+                .streams
+                .iter()
+                .map(|stream| stream.Id().to_string())
+                .collect(),
+            track_id: track.Id().to_string(),
+            audio_bitrate,
+        });
+        let controller = self.controller.borrow().as_ref().unwrap().clone();
+        let id = controller
+            .add_transceiver(kind, backend_direction(init.direction)?, source)
+            .map_err(|error| Error::Operation(Some(format!("{error:?}").into())))?;
+        let transceiver = RTCRtpTransceiver::new(
+            cx,
+            &self.global(),
+            init.direction,
+            track.as_deref(),
+            controller,
+            id,
+        );
+        let sender = transceiver.Sender();
+        self.senders.borrow_mut().push(Dom::from_ref(&*sender));
+        self.transceivers
+            .borrow_mut()
+            .push(Dom::from_ref(&*transceiver));
+        Ok(transceiver)
     }
 }
 
@@ -846,6 +1191,19 @@ impl Convert<RTCIceConnectionState> for IceConnectionState {
             IceConnectionState::Disconnected => RTCIceConnectionState::Disconnected,
             IceConnectionState::Failed => RTCIceConnectionState::Failed,
             IceConnectionState::Closed => RTCIceConnectionState::Closed,
+        }
+    }
+}
+
+impl Convert<RTCPeerConnectionState> for ConnectionState {
+    fn convert(self) -> RTCPeerConnectionState {
+        match self {
+            ConnectionState::New => RTCPeerConnectionState::New,
+            ConnectionState::Connecting => RTCPeerConnectionState::Connecting,
+            ConnectionState::Connected => RTCPeerConnectionState::Connected,
+            ConnectionState::Disconnected => RTCPeerConnectionState::Disconnected,
+            ConnectionState::Failed => RTCPeerConnectionState::Failed,
+            ConnectionState::Closed => RTCPeerConnectionState::Closed,
         }
     }
 }

@@ -10,6 +10,7 @@ use servo_media::streams::MediaStreamType;
 use servo_media::streams::registry::MediaStreamId;
 
 use crate::dom::bindings::codegen::Bindings::MediaStreamBinding::MediaStreamMethods;
+use crate::dom::bindings::codegen::Bindings::MediaStreamTrackBinding::MediaStreamTrackMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
@@ -22,13 +23,15 @@ use crate::dom::window::Window;
 #[dom_struct]
 pub(crate) struct MediaStream {
     eventtarget: EventTarget,
+    id: DOMString,
     tracks: DomRefCell<Vec<Dom<MediaStreamTrack>>>,
 }
 
 impl MediaStream {
-    pub(crate) fn new_inherited() -> MediaStream {
+    pub(crate) fn new_inherited(id: DOMString) -> MediaStream {
         MediaStream {
             eventtarget: EventTarget::new_inherited(),
+            id,
             tracks: DomRefCell::new(vec![]),
         }
     }
@@ -37,15 +40,24 @@ impl MediaStream {
         cx: &mut js::context::JSContext,
         global: &GlobalScope,
     ) -> DomRoot<MediaStream> {
-        Self::new_with_proto(cx, global, None)
+        Self::new_with_proto(cx, global, None, uuid::Uuid::new_v4().to_string().into())
+    }
+
+    pub(crate) fn new_with_id(
+        cx: &mut js::context::JSContext,
+        global: &GlobalScope,
+        id: DOMString,
+    ) -> DomRoot<MediaStream> {
+        Self::new_with_proto(cx, global, None, id)
     }
 
     fn new_with_proto(
         cx: &mut js::context::JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        id: DOMString,
     ) -> DomRoot<MediaStream> {
-        reflect_dom_object_with_proto(cx, Box::new(MediaStream::new_inherited()), global, proto)
+        reflect_dom_object_with_proto(cx, Box::new(MediaStream::new_inherited(id)), global, proto)
     }
 
     pub(crate) fn new_single(
@@ -70,13 +82,23 @@ impl MediaStream {
 }
 
 impl MediaStreamMethods<crate::DomTypeHolder> for MediaStream {
+    /// <https://w3c.github.io/mediacapture-main/#dom-mediastream-id>
+    fn Id(&self) -> DOMString {
+        self.id.clone()
+    }
+
     /// <https://w3c.github.io/mediacapture-main/#dom-mediastream-constructor>
     fn Constructor(
         cx: &mut js::context::JSContext,
         global: &Window,
         proto: Option<HandleObject>,
     ) -> Fallible<DomRoot<MediaStream>> {
-        Ok(MediaStream::new_with_proto(cx, &global.global(), proto))
+        Ok(MediaStream::new_with_proto(
+            cx,
+            &global.global(),
+            proto,
+            uuid::Uuid::new_v4().to_string().into(),
+        ))
     }
 
     /// <https://w3c.github.io/mediacapture-main/#dom-mediastream-constructor>
@@ -96,7 +118,12 @@ impl MediaStreamMethods<crate::DomTypeHolder> for MediaStream {
         proto: Option<HandleObject>,
         tracks: Vec<DomRoot<MediaStreamTrack>>,
     ) -> Fallible<DomRoot<MediaStream>> {
-        let new = MediaStream::new_with_proto(cx, &global.global(), proto);
+        let new = MediaStream::new_with_proto(
+            cx,
+            &global.global(),
+            proto,
+            uuid::Uuid::new_v4().to_string().into(),
+        );
         for track in tracks {
             // this is quadratic, but shouldn't matter much
             // if this becomes a problem we can use a hash map
@@ -139,7 +166,7 @@ impl MediaStreamMethods<crate::DomTypeHolder> for MediaStream {
         self.tracks
             .borrow()
             .iter()
-            .find(|x| x.id().id().to_string() == id)
+            .find(|x| x.Id() == id)
             .map(|x| DomRoot::from_ref(&**x))
     }
 
@@ -170,7 +197,12 @@ impl MediaStream {
         cx: &mut js::context::JSContext,
         proto: Option<HandleObject>,
     ) -> DomRoot<MediaStream> {
-        let new = MediaStream::new_with_proto(cx, &self.global(), proto);
+        let new = MediaStream::new_with_proto(
+            cx,
+            &self.global(),
+            proto,
+            uuid::Uuid::new_v4().to_string().into(),
+        );
         for track in &*self.tracks.borrow() {
             new.add_track(track)
         }

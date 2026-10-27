@@ -6,10 +6,10 @@
 
 [Exposed=Window, Pref="dom_webrtc_transceiver_enabled"]
 interface RTCRtpTransceiver {
-  //readonly attribute DOMString? mid;
+  readonly attribute DOMString? mid;
   [SameObject] readonly attribute RTCRtpSender sender;
-  //[SameObject] readonly attribute RTCRtpReceiver receiver;
-  attribute RTCRtpTransceiverDirection direction;
+  [SameObject] readonly attribute RTCRtpReceiver? receiver;
+  [SetterThrows] attribute RTCRtpTransceiverDirection direction;
   //readonly attribute RTCRtpTransceiverDirection? currentDirection;
   //void stop();
   //void setCodecPreferences(sequence<RTCRtpCodecCapability> codecs);
