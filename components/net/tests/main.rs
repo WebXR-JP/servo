@@ -45,7 +45,7 @@ use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::request::Request;
 use net_traits::response::Response;
 use net_traits::{FetchTaskTarget, ResourceFetchTiming, ResourceTimingType};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
@@ -123,6 +123,8 @@ fn create_http_state(fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>) -> Http
         )),
         override_manager,
         embedder_proxy: fc.unwrap_or_else(|| create_generic_embedder_proxy()),
+        cookie_config_dir: None,
+        cookie_save_lock: Mutex::new(()),
     }
 }
 

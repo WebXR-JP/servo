@@ -228,6 +228,8 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy: embedder_proxy.clone(),
+        cookie_config_dir: config_dir.map(|path| path.to_path_buf()),
+        cookie_save_lock: Mutex::new(()),
     };
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -244,6 +246,8 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy,
+        cookie_config_dir: None,
+        cookie_save_lock: Mutex::new(()),
     };
 
     (Arc::new(http_state), Arc::new(private_http_state))
@@ -459,10 +463,12 @@ impl ResourceChannelManager {
                     .cookie_jar
                     .write()
                     .delete_cookies_for_sites(&sites);
+                http_state.save_cookies();
                 let _ = sender.send(());
             },
             CoreResourceMsg::DeleteSessionCookies(sender) => {
                 http_state.cookie_jar.write().clear_session_cookies();
+                http_state.save_cookies();
                 let _ = sender.send(());
             },
             CoreResourceMsg::DeleteCookies(request, sender) => {
@@ -470,6 +476,7 @@ impl ResourceChannelManager {
                     .cookie_jar
                     .write()
                     .clear_storage(request.as_ref());
+                http_state.save_cookies();
                 if let Some(sender) = sender {
                     let _ = sender.send(());
                 }
@@ -480,6 +487,7 @@ impl ResourceChannelManager {
                     .cookie_jar
                     .write()
                     .delete_cookie_with_name(&request, name);
+                http_state.save_cookies();
                 return true;
             },
             CoreResourceMsg::DeleteCookieAsync(cookie_store_id, url, name) => {
@@ -487,6 +495,7 @@ impl ResourceChannelManager {
                     .cookie_jar
                     .write()
                     .delete_cookie_with_name(&url, name);
+                http_state.save_cookies();
                 self.send_cookie_response(cookie_store_id, CookieData::Delete(Ok(())));
             },
             CoreResourceMsg::FetchRedirect(request_builder, res_init, sender) => {
@@ -508,6 +517,7 @@ impl ResourceChannelManager {
                     source,
                     http_state,
                 );
+                http_state.save_cookies();
                 if let Some(sender) = sender {
                     let _ = sender.send(());
                 }
@@ -521,6 +531,7 @@ impl ResourceChannelManager {
                         http_state,
                     );
                 }
+                http_state.save_cookies();
             },
             CoreResourceMsg::SetCookieForUrlAsync(cookie_store_id, url, cookie, source) => {
                 self.resource_manager.set_cookie_for_url(
@@ -529,6 +540,7 @@ impl ResourceChannelManager {
                     source,
                     http_state,
                 );
+                http_state.save_cookies();
                 self.send_cookie_response(cookie_store_id, CookieData::Set(Ok(())));
             },
             CoreResourceMsg::GetCookieStringForUrl(url, consumer, source) => {
@@ -584,6 +596,7 @@ impl ResourceChannelManager {
                     source,
                     http_state,
                 );
+                http_state.save_cookies();
                 http_state
                     .embedder_proxy
                     .send(NetToEmbedderMsg::EmbedderCookieOperationResponse(
@@ -592,6 +605,7 @@ impl ResourceChannelManager {
             },
             CoreResourceMsg::EmbedderClearCookies(operation_id) => {
                 http_state.cookie_jar.write().clear_storage(None);
+                http_state.save_cookies();
                 http_state
                     .embedder_proxy
                     .send(NetToEmbedderMsg::EmbedderCookieOperationResponse(
@@ -600,6 +614,7 @@ impl ResourceChannelManager {
             },
             CoreResourceMsg::EmbedderClearSessionCookies(operation_id) => {
                 http_state.cookie_jar.write().clear_session_cookies();
+                http_state.save_cookies();
                 http_state
                     .embedder_proxy
                     .send(NetToEmbedderMsg::EmbedderCookieOperationResponse(

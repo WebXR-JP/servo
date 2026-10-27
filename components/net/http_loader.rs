@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::iter::FromIterator;
+use std::path::PathBuf;
 use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -118,9 +119,34 @@ pub struct HttpState {
     pub client: ServoClient,
     pub override_manager: CertificateErrorOverrideManager,
     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    /// Cookie の保存先ディレクトリ。`None` の場合は保存しない（incognito 用）。
+    pub cookie_config_dir: Option<PathBuf>,
+    /// Cookie 保存の書き込みを直列化するロック。
+    pub cookie_save_lock: Mutex<()>,
 }
 
 impl HttpState {
+    /// Cookie jar の内容を `cookie_jar.json` へ保存する。
+    ///
+    /// Cookie を変更したスレッドが毎回呼ぶ。終了時だけの保存では
+    /// 強制終了やクラッシュでログイン Cookie が失われるため、変更時に保存する。
+    /// 書き込みは [`HttpState::cookie_save_lock`] で直列化する。
+    /// jar の read ロックを保持したまま書くのは、書き込み中に別スレッドが
+    /// 変更して中途半端な内容を書かないようにするためである。
+    pub fn save_cookies(&self) {
+        let Some(config_dir) = self.cookie_config_dir.as_deref() else {
+            return;
+        };
+        // 保存中に他の保存が割り込まないよう直列化する。
+        let _guard = self.cookie_save_lock.lock();
+        // 書き込み中に jar が変更されないよう read ロックを保持したまま書く。
+        let jar = self.cookie_jar.read();
+        if let Err(error) = servo_base::try_write_json_to_file(&*jar, config_dir, "cookie_jar.json")
+        {
+            warn!("Cookie を保存できない: {error}");
+        }
+    }
+
     pub(crate) fn memory_reports(&self, suffix: &str, ops: &mut MallocSizeOfOps) -> Vec<Report> {
         vec![
             Report {
@@ -358,7 +384,11 @@ fn set_request_cookies(
     }
 }
 
-fn set_cookie_for_url(cookie_jar: &RwLock<CookieStorage>, request: &ServoUrl, cookie_val: &str) {
+fn set_cookie_for_url(
+    cookie_jar: &RwLock<CookieStorage>,
+    request: &ServoUrl,
+    cookie_val: &str,
+) {
     let mut cookie_jar = cookie_jar.write();
     let source = CookieSource::HTTP;
 
@@ -2436,8 +2466,10 @@ async fn http_network_fetch(
 
     // TODO this step isn't possible yet
     // Step 15
-    if credentials_flag {
+    if credentials_flag && response.headers.contains_key(header::SET_COOKIE) {
         set_cookies_from_headers(&url, &response.headers, &context.state.cookie_jar);
+        // Set-Cookie があるときだけ保存する。無いレスポンスで毎回ファイルを書かないため。
+        context.state.save_cookies();
     }
     context
         .state
