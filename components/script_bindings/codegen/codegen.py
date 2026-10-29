@@ -7583,10 +7583,26 @@ class CGDescriptor(CGThing):
 
         # Add imports
         # These are inside the generated module
+        imports = ['crate::import::module::*']
+        # Variadic DOM-interface arguments are stored as unrooted native pointers while
+        # converting each JavaScript value, then rooted as `Dom` entries in the vector.
+        # The generic import module only exposes both helpers to test bindings.
+        has_variadic_interface_argument = any(
+            argument.variadic and argument.type.isGeckoInterface()
+            for member in descriptor.interface.members
+            if member.isMethod()
+            for _, arguments in member.signatures()
+            for argument in arguments
+        )
+        if has_variadic_interface_argument:
+            imports += [
+                'crate::conversions::native_from_handlevalue',
+                'crate::root::Dom',
+                'crate::root::DomSlice',
+            ]
         cgRoot = CGImports(cgRoot, descriptors=[descriptor], callbacks=[],
-                           dictionaries=[], enums=[], typedefs=[], imports=[
-            'crate::import::module::*',
-        ], config=config)
+                           dictionaries=[], enums=[], typedefs=[], imports=imports,
+                           config=config)
 
         cgRoot = CGWrapper(CGNamespace(toBindingNamespace(descriptor.name),
                                        cgRoot, public=True),

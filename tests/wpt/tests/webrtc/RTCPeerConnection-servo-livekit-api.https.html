@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Servo WebRTC sender API</title>
+<link rel="help" href="https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-getsenders">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+test(t => {
+  const pc = new RTCPeerConnection();
+  t.add_cleanup(() => pc.close());
+  assert_array_equals(pc.getSenders(), []);
+  assert_array_equals(pc.getTransceivers(), []);
+  assert_equals(pc.connectionState, 'new');
+}, 'a new connection has no senders or transceivers');
+
+test(t => {
+  const context = new AudioContext();
+  const track = context.createMediaStreamDestination().stream.getAudioTracks()[0];
+  const pc = new RTCPeerConnection();
+  t.add_cleanup(() => { pc.close(); return context.close(); });
+
+  const sender = pc.addTrack(track);
+  assert_equals(sender.track, track);
+  assert_array_equals(pc.getSenders(), [sender]);
+  assert_equals(pc.getTransceivers()[0].sender, sender);
+  assert_throws_dom('InvalidAccessError', () => pc.addTrack(track));
+
+}, 'addTrack registers one synthetic audio track with the sender and controller');
+
+test(t => {
+  const pc = new RTCPeerConnection();
+  t.add_cleanup(() => pc.close());
+  const audio = pc.addTransceiver('audio', { direction: 'recvonly' });
+  const video = pc.addTransceiver('video', { direction: 'recvonly' });
+  assert_equals(audio.direction, 'recvonly');
+  assert_equals(video.direction, 'recvonly');
+  assert_equals(audio.sender.track, null);
+  assert_array_equals(pc.getTransceivers(), [audio, video]);
+  assert_array_equals(pc.getSenders(), [audio.sender, video.sender]);
+}, 'receive-only audio and video transceivers have distinct senders');
+
+promise_test(async t => {
+  const context = new AudioContext();
+  const stream = context.createMediaStreamDestination().stream;
+  const track = stream.getAudioTracks()[0];
+  const pc = new RTCPeerConnection();
+  t.add_cleanup(() => { pc.close(); return context.close(); });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+  const sender = pc.addTransceiver(track, {
+    direction: 'sendonly', streams: [stream], sendEncodings: [{ maxBitrate: 32000 }],
+  });
+  assert_equals(sender.sender.track, track);
+  const offer = await pc.createOffer();
+  assert_true(offer.sdp.includes('a=recvonly'));
+  assert_true(offer.sdp.includes('a=sendonly'));
+  assert_true(offer.sdp.includes('a=msid:' + stream.id + ' ' + track.id));
+}, 'an offer preserves the identity and direction of a synthetic audio track');
+
+test(t => {
+  const pc = new RTCPeerConnection();
+  t.add_cleanup(() => pc.close());
+  pc.setConfiguration({ iceServers: [] });
+  assert_throws_dom('SyntaxError', () => pc.setConfiguration({ iceServers: [{ urls: 'stun:localhost:0' }] }));
+}, 'ICE configuration is applied and rejects an invalid port');
+
+test(() => {
+  const pc = new RTCPeerConnection();
+  pc.close();
+  assert_equals(pc.connectionState, 'closed');
+}, 'close sets connectionState to closed');
+</script>

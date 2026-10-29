@@ -269,16 +269,31 @@ impl Backend for GStreamerBackend {
 
     fn create_audioinput_stream(&self, set: MediaTrackConstraintSet) -> Option<MediaStreamId> {
         if self.capture_mocking.load(Ordering::Acquire) {
-            // XXXManishearth we should caps filter this
-            return Some(self.create_audiostream());
+            // 合成入力は capture 制約を適用しないため、制約付き要求を成功させない。
+            if set.sample_rate.is_some()
+                || set.width.is_some()
+                || set.height.is_some()
+                || set.aspect.is_some()
+                || set.frame_rate.is_some()
+            {
+                return None;
+            }
+            return GStreamerMediaStream::try_create_audio().ok();
         }
         media_capture::create_audioinput_stream(set)
     }
 
     fn create_videoinput_stream(&self, set: MediaTrackConstraintSet) -> Option<MediaStreamId> {
         if self.capture_mocking.load(Ordering::Acquire) {
-            // XXXManishearth we should caps filter this
-            return Some(self.create_videostream());
+            if set.sample_rate.is_some()
+                || set.width.is_some()
+                || set.height.is_some()
+                || set.aspect.is_some()
+                || set.frame_rate.is_some()
+            {
+                return None;
+            }
+            return GStreamerMediaStream::try_create_video().ok();
         }
         media_capture::create_videoinput_stream(set)
     }

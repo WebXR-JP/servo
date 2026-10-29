@@ -15,6 +15,33 @@ pub trait MediaStream: Any + Send {
     fn as_mut_any(&mut self) -> &mut dyn Any;
     fn set_id(&mut self, id: registry::MediaStreamId);
     fn ty(&self) -> MediaStreamType;
+    /// このトラックの出力枝だけを有効・無効にする。
+    fn set_enabled(&mut self, _: bool) -> Result<(), String> {
+        Err(String::from(
+            "このメディアストリームは有効状態を変更できない",
+        ))
+    }
+    /// このトラックの出力枝を複製する。
+    fn clone_stream(&mut self) -> Result<registry::MediaStreamId, String> {
+        Err(String::from("このメディアストリームは複製できない"))
+    }
+    /// このトラックの出力枝を終了する。
+    fn stop(&mut self) -> Result<(), String> {
+        Err(String::from("このメディアストリームは終了できない"))
+    }
+    fn settings(&self) -> MediaStreamSettings {
+        MediaStreamSettings::default()
+    }
+}
+
+/// メディア入力の確定済み設定。未知または未確定の値は `None` とする。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MediaStreamSettings {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub aspect_ratio: Option<f64>,
+    pub frame_rate: Option<f64>,
+    pub sample_rate: Option<u32>,
 }
 
 /// A MediaSocket is a way for a backend to represent a

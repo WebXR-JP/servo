@@ -10,29 +10,41 @@ use crate::dom::bindings::codegen::Bindings::RTCRtpSenderBinding::{
     RTCRtcpParameters, RTCRtpParameters, RTCRtpSendParameters, RTCRtpSenderMethods,
 };
 use crate::dom::bindings::reflector::DomGlobal;
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::mediastreamtrack::MediaStreamTrack;
 use crate::dom::{Promise, RootedPromise};
 
 #[dom_struct]
 pub(crate) struct RTCRtpSender {
     reflector_: Reflector,
+    track: MutNullableDom<MediaStreamTrack>,
 }
 
 impl RTCRtpSender {
-    fn new_inherited() -> Self {
+    fn new_inherited(track: Option<&MediaStreamTrack>) -> Self {
         Self {
             reflector_: Reflector::new(),
+            track: MutNullableDom::new(track),
         }
     }
 
-    pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(Box::new(Self::new_inherited()), global, cx)
+    pub(crate) fn new(
+        cx: &mut JSContext,
+        global: &GlobalScope,
+        track: Option<&MediaStreamTrack>,
+    ) -> DomRoot<Self> {
+        reflect_dom_object_with_cx(Box::new(Self::new_inherited(track)), global, cx)
     }
 }
 
 impl RTCRtpSenderMethods<crate::DomTypeHolder> for RTCRtpSender {
+    /// <https://w3c.github.io/webrtc-pc/#dom-rtcrtpsender-track>
+    fn GetTrack(&self) -> Option<DomRoot<MediaStreamTrack>> {
+        self.track.get()
+    }
+
     /// <https://w3c.github.io/webrtc-pc/#dom-rtcrtpsender-getparameters>
     fn GetParameters(&self) -> RTCRtpSendParameters {
         RTCRtpSendParameters {

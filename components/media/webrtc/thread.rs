@@ -10,8 +10,10 @@ use servo_media_streams::MediaStreamType;
 
 use crate::datachannel::{DataChannelEvent, DataChannelId, DataChannelInit, DataChannelMessage};
 use crate::{
-    BundlePolicy, DescriptionType, IceCandidate, MediaStreamId, SdpType, SessionDescription,
-    WebRtcBackend, WebRtcControllerBackend, WebRtcSignaller,
+    BundlePolicy, DescriptionType, IceCandidate, IceConfiguration, MediaStreamId, OutgoingTrack,
+    RemoteTrackMetadata, SdpType, SessionDescription, TransceiverDirection, TransceiverId,
+    TransceiverKind, TransceiverState, WebRtcBackend, WebRtcControllerBackend, WebRtcError,
+    WebRtcSignaller,
 };
 
 #[derive(Clone)]
@@ -44,6 +46,15 @@ impl WebRtcController {
             .sender
             .send(RtcThreadEvent::ConfigureStun(stun_server, policy));
     }
+    pub fn set_ice_configuration(&self, config: IceConfiguration) -> Result<(), WebRtcError> {
+        let (reply, receiver) = channel();
+        self.sender
+            .send(RtcThreadEvent::SetIceConfiguration(config, reply))
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?;
+        receiver
+            .recv()
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?
+    }
     pub fn set_remote_description(
         &self,
         desc: SessionDescription,
@@ -74,6 +85,46 @@ impl WebRtcController {
     pub fn add_stream(&self, stream: &MediaStreamId) {
         let _ = self.sender.send(RtcThreadEvent::AddStream(*stream));
     }
+    pub fn add_transceiver(
+        &self,
+        kind: TransceiverKind,
+        direction: TransceiverDirection,
+        track: Option<OutgoingTrack>,
+    ) -> Result<TransceiverId, WebRtcError> {
+        let (reply, receiver) = channel();
+        self.sender
+            .send(RtcThreadEvent::AddTransceiver(
+                kind, direction, track, reply,
+            ))
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?;
+        receiver
+            .recv()
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?
+    }
+    pub fn set_transceiver_direction(
+        &self,
+        id: TransceiverId,
+        direction: TransceiverDirection,
+    ) -> Result<(), WebRtcError> {
+        let (reply, receiver) = channel();
+        self.sender
+            .send(RtcThreadEvent::SetTransceiverDirection(
+                id, direction, reply,
+            ))
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?;
+        receiver
+            .recv()
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?
+    }
+    pub fn get_transceivers(&self) -> Result<Vec<TransceiverState>, WebRtcError> {
+        let (reply, receiver) = channel();
+        self.sender
+            .send(RtcThreadEvent::GetTransceivers(reply))
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?;
+        receiver
+            .recv()
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))
+    }
     pub fn create_data_channel(&self, init: DataChannelInit) -> Option<DataChannelId> {
         let (sender, receiver) = channel();
         let _ = self
@@ -102,12 +153,25 @@ impl WebRtcController {
 
 pub enum RtcThreadEvent {
     ConfigureStun(String, BundlePolicy),
+    SetIceConfiguration(IceConfiguration, Sender<Result<(), WebRtcError>>),
     SetRemoteDescription(SessionDescription, Box<dyn FnOnce() + Send + 'static>),
     SetLocalDescription(SessionDescription, Box<dyn FnOnce() + Send + 'static>),
     AddIceCandidate(IceCandidate),
     CreateOffer(Box<dyn FnOnce(SessionDescription) + Send + 'static>),
     CreateAnswer(Box<dyn FnOnce(SessionDescription) + Send + 'static>),
     AddStream(MediaStreamId),
+    AddTransceiver(
+        TransceiverKind,
+        TransceiverDirection,
+        Option<OutgoingTrack>,
+        Sender<Result<TransceiverId, WebRtcError>>,
+    ),
+    SetTransceiverDirection(
+        TransceiverId,
+        TransceiverDirection,
+        Sender<Result<(), WebRtcError>>,
+    ),
+    GetTransceivers(Sender<Vec<TransceiverState>>),
     CreateDataChannel(DataChannelInit, Sender<Option<DataChannelId>>),
     CloseDataChannel(DataChannelId),
     SendDataChannelMessage(DataChannelId, DataChannelMessage),
@@ -123,7 +187,7 @@ pub enum RtcThreadEvent {
 pub enum InternalEvent {
     OnNegotiationNeeded,
     OnIceCandidate(IceCandidate),
-    OnAddStream(MediaStreamId, MediaStreamType),
+    OnAddStream(MediaStreamId, MediaStreamType, RemoteTrackMetadata),
     OnDataChannelEvent(DataChannelId, DataChannelEvent),
     DescriptionAdded(
         Box<dyn FnOnce() + Send + 'static>,
@@ -134,6 +198,7 @@ pub enum InternalEvent {
     UpdateSignalingState,
     UpdateGatheringState,
     UpdateIceConnectionState,
+    UpdateConnectionState,
 }
 
 pub fn handle_rtc_event(
@@ -142,6 +207,11 @@ pub fn handle_rtc_event(
 ) -> bool {
     let result = match event {
         RtcThreadEvent::ConfigureStun(server, policy) => controller.configure(&server, policy),
+        RtcThreadEvent::SetIceConfiguration(config, sender) => {
+            let result = controller.set_ice_configuration(config);
+            let _ = sender.send(result.clone());
+            result
+        },
         RtcThreadEvent::SetRemoteDescription(desc, cb) => {
             controller.set_remote_description(desc, cb)
         },
@@ -150,6 +220,20 @@ pub fn handle_rtc_event(
         RtcThreadEvent::CreateOffer(cb) => controller.create_offer(cb),
         RtcThreadEvent::CreateAnswer(cb) => controller.create_answer(cb),
         RtcThreadEvent::AddStream(media) => controller.add_stream(&media),
+        RtcThreadEvent::AddTransceiver(kind, direction, track, sender) => {
+            let result = controller.add_transceiver(kind, direction, track);
+            let _ = sender.send(result.clone());
+            result.map(|_| ())
+        },
+        RtcThreadEvent::SetTransceiverDirection(id, direction, sender) => {
+            let result = controller.set_transceiver_direction(id, direction);
+            let _ = sender.send(result.clone());
+            result
+        },
+        RtcThreadEvent::GetTransceivers(sender) => {
+            let _ = sender.send(controller.get_transceivers());
+            Ok(())
+        },
         RtcThreadEvent::CreateDataChannel(init, sender) => controller
             .create_data_channel(&init)
             .map(|id| {

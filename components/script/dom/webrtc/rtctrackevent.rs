@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use js::rust::HandleObject;
+use js::jsapi::Heap;
+use js::jsval::JSVal;
+use js::rust::{HandleObject, MutableHandleValue};
 use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
@@ -13,21 +15,37 @@ use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::event::Event;
+use crate::dom::mediastream::MediaStream;
 use crate::dom::mediastreamtrack::MediaStreamTrack;
+use crate::dom::rtcrtpreceiver::RTCRtpReceiver;
+use crate::dom::rtcrtptransceiver::RTCRtpTransceiver;
 use crate::dom::window::Window;
+use crate::realms::enter_auto_realm;
 
 #[dom_struct]
 pub(crate) struct RTCTrackEvent {
     event: Event,
     track: Dom<MediaStreamTrack>,
+    receiver: Dom<RTCRtpReceiver>,
+    transceiver: Dom<RTCRtpTransceiver>,
+    #[ignore_malloc_size_of = "mozjs"]
+    streams: Heap<JSVal>,
 }
 
 impl RTCTrackEvent {
-    fn new_inherited(track: &MediaStreamTrack) -> RTCTrackEvent {
+    fn new_inherited(
+        track: &MediaStreamTrack,
+        receiver: &RTCRtpReceiver,
+        transceiver: &RTCRtpTransceiver,
+    ) -> RTCTrackEvent {
         RTCTrackEvent {
             event: Event::new_inherited(),
             track: Dom::from_ref(track),
+            receiver: Dom::from_ref(receiver),
+            transceiver: Dom::from_ref(transceiver),
+            streams: Heap::default(),
         }
     }
 
@@ -38,8 +56,22 @@ impl RTCTrackEvent {
         bubbles: bool,
         cancelable: bool,
         track: &MediaStreamTrack,
+        receiver: &RTCRtpReceiver,
+        transceiver: &RTCRtpTransceiver,
+        streams: &[DomRoot<MediaStream>],
     ) -> DomRoot<RTCTrackEvent> {
-        Self::new_with_proto(cx, window, None, type_, bubbles, cancelable, track)
+        Self::new_with_proto(
+            cx,
+            window,
+            None,
+            type_,
+            bubbles,
+            cancelable,
+            track,
+            receiver,
+            transceiver,
+            streams,
+        )
     }
 
     fn new_with_proto(
@@ -50,10 +82,13 @@ impl RTCTrackEvent {
         bubbles: bool,
         cancelable: bool,
         track: &MediaStreamTrack,
+        receiver: &RTCRtpReceiver,
+        transceiver: &RTCRtpTransceiver,
+        streams: &[DomRoot<MediaStream>],
     ) -> DomRoot<RTCTrackEvent> {
         let trackevent = reflect_dom_object_with_proto(
             cx,
-            Box::new(RTCTrackEvent::new_inherited(track)),
+            Box::new(RTCTrackEvent::new_inherited(track, receiver, transceiver)),
             window,
             proto,
         );
@@ -61,6 +96,11 @@ impl RTCTrackEvent {
             let event = trackevent.upcast::<Event>();
             event.init_event(type_, bubbles, cancelable);
         }
+        let mut realm = enter_auto_realm(cx, window);
+        let cx = &mut realm.current_realm();
+        rooted!(&in(cx) let mut frozen_streams: JSVal);
+        to_frozen_array(cx, streams, frozen_streams.handle_mut());
+        trackevent.streams.set(*frozen_streams);
         trackevent
     }
 }
@@ -82,12 +122,27 @@ impl RTCTrackEventMethods<crate::DomTypeHolder> for RTCTrackEvent {
             init.parent.bubbles,
             init.parent.cancelable,
             &init.track,
+            &init.receiver,
+            &init.transceiver,
+            &init.streams,
         ))
     }
 
     /// <https://w3c.github.io/webrtc-pc/#dom-rtctrackevent-track>
     fn Track(&self) -> DomRoot<MediaStreamTrack> {
         DomRoot::from_ref(&*self.track)
+    }
+
+    fn Receiver(&self) -> DomRoot<RTCRtpReceiver> {
+        DomRoot::from_ref(&*self.receiver)
+    }
+
+    fn Transceiver(&self) -> DomRoot<RTCRtpTransceiver> {
+        DomRoot::from_ref(&*self.transceiver)
+    }
+
+    fn Streams(&self, mut retval: MutableHandleValue) {
+        retval.set(self.streams.get());
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-istrusted>

@@ -32,7 +32,7 @@ impl AddToCaps for Constrain<u32> {
         builder: gstreamer::caps::Builder<NoFeature>,
     ) -> Option<gstreamer::caps::Builder<NoFeature>> {
         match self {
-            Constrain::Value(v) => Some(builder.field(name, v)),
+            Constrain::Value(v) => Some(builder.field(name, into_i32(*v))),
             Constrain::Range(r) => {
                 let min = into_i32(r.min.unwrap_or(min));
                 let max = into_i32(r.max.unwrap_or(max));
@@ -65,7 +65,7 @@ impl AddToCaps for Constrain<f64> {
     ) -> Option<gstreamer::caps::Builder<NoFeature>> {
         match self {
             Constrain::Value(v) => {
-                Some(builder.field("name", gstreamer::Fraction::approximate_f64(*v)?))
+                Some(builder.field(name, gstreamer::Fraction::approximate_f64(*v)?))
             },
             Constrain::Range(r) => {
                 let min = r
@@ -154,12 +154,16 @@ fn create_input_stream(
     let devices = GstMediaDevices::new();
     devices
         .get_track(stream_type == MediaStreamType::Video, constraint_set)
-        .map(|track| {
-            let f = match stream_type {
-                MediaStreamType::Audio => GStreamerMediaStream::create_audio_from,
-                MediaStreamType::Video => GStreamerMediaStream::create_video_from,
-            };
-            f(track.element)
+        .and_then(|track| {
+            match stream_type {
+                MediaStreamType::Audio => {
+                    GStreamerMediaStream::try_create_audio_from(track.element)
+                },
+                MediaStreamType::Video => {
+                    GStreamerMediaStream::try_create_video_from(track.element)
+                },
+            }
+            .ok()
         })
 }
 
@@ -169,4 +173,27 @@ pub fn create_audioinput_stream(constraint_set: MediaTrackConstraintSet) -> Opti
 
 pub fn create_videoinput_stream(constraint_set: MediaTrackConstraintSet) -> Option<MediaStreamId> {
     create_input_stream(MediaStreamType::Video, constraint_set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_constraints_use_gstreamer_field_names_and_types() {
+        gstreamer::init().unwrap();
+        let constraints = MediaTrackConstraintSet {
+            sample_rate: Some(Constrain::Value(48_000)),
+            frame_rate: Some(Constrain::Value(30.0)),
+            ..Default::default()
+        };
+        let caps = into_caps(constraints, "audio/x-raw").unwrap();
+        let fields = caps.structure(0).unwrap();
+        assert_eq!(fields.get::<i32>("rate").unwrap(), 48_000);
+        assert_eq!(
+            fields.get::<gstreamer::Fraction>("framerate").unwrap(),
+            gstreamer::Fraction::new(30, 1)
+        );
+        assert!(!fields.has_field("name"));
+    }
 }

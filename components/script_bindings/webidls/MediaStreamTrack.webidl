@@ -9,16 +9,29 @@ interface MediaStreamTrack : EventTarget {
     readonly        attribute DOMString kind;
     readonly        attribute DOMString id;
     // readonly        attribute DOMString label;
-    //                 attribute boolean enabled;
+    [SetterThrows] attribute boolean enabled;
     // readonly        attribute boolean muted;
     //                 attribute EventHandler onmute;
     //                 attribute EventHandler onunmute;
-    // readonly        attribute MediaStreamTrackState readyState;
+    readonly        attribute MediaStreamTrackState readyState;
     //                 attribute EventHandler onended;
-    MediaStreamTrack clone();
-    // void stop();
+    [Throws] MediaStreamTrack clone();
+    [Throws] undefined stop();
     // MediaTrackCapabilities getCapabilities();
-    // MediaTrackConstraints getConstraints();
-    // MediaTrackSettings getSettings();
+    MediaTrackConstraints getConstraints();
+    MediaTrackSettings getSettings();
     // Promise<void> applyConstraints(optional MediaTrackConstraints constraints);
+};
+
+dictionary MediaTrackSettings {
+    unsigned long width;
+    unsigned long height;
+    double aspectRatio;
+    double frameRate;
+    unsigned long sampleRate;
+};
+
+enum MediaStreamTrackState {
+    "live",
+    "ended"
 };

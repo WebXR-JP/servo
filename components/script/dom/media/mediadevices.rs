@@ -9,6 +9,7 @@ use script_bindings::reflector::reflect_dom_object_with_cx;
 use servo_media::ServoMedia;
 use servo_media::streams::MediaStreamType;
 use servo_media::streams::capture::{Constrain, ConstrainRange, MediaTrackConstraintSet};
+use servo_media::streams::registry::stop_stream;
 
 use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::MediaDevicesBinding::{
@@ -18,6 +19,7 @@ use crate::dom::bindings::codegen::UnionTypes::{
     BooleanOrMediaTrackConstraints, ClampedUnsignedLongOrConstrainULongRange as ConstrainULong,
     DoubleOrConstrainDoubleRange as ConstrainDouble,
 };
+use crate::dom::bindings::error::Error;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::eventtarget::EventTarget;
@@ -52,18 +54,92 @@ impl MediaDevicesMethods<crate::DomTypeHolder> for MediaDevices {
         constraints: &MediaStreamConstraints,
     ) -> RootedPromise {
         let p = Promise::new_in_realm(cx);
+        let audio_constraints = convert_constraints(&constraints.audio);
+        let video_constraints = convert_constraints(&constraints.video);
+        if audio_constraints.is_none() && video_constraints.is_none() {
+            p.reject_error(
+                cx,
+                Error::Type(c"At least one of audio or video must be requested".to_owned()),
+            );
+            return p;
+        }
+
         let media = ServoMedia::get();
+        let mut audio_track = None;
+        let mut audio_id = None;
+        if let Some(audio_constraint_set) = audio_constraints {
+            let Some(audio) = media.create_audioinput_stream(audio_constraint_set) else {
+                p.reject_error(cx, Error::NotFound(None));
+                return p;
+            };
+            audio_id = Some(audio);
+            let track = match &constraints.audio {
+                BooleanOrMediaTrackConstraints::Boolean(true) => {
+                    MediaStreamTrack::new(cx, &self.global(), audio, MediaStreamType::Audio)
+                },
+                BooleanOrMediaTrackConstraints::MediaTrackConstraints(track_constraints) => {
+                    MediaStreamTrack::new_with_constraints(
+                        cx,
+                        &self.global(),
+                        audio,
+                        MediaStreamType::Audio,
+                        track_constraints,
+                    )
+                },
+                BooleanOrMediaTrackConstraints::Boolean(false) => {
+                    let _ = stop_stream(&audio);
+                    p.reject_error(
+                        cx,
+                        Error::Type(c"At least one of audio or video must be requested".to_owned()),
+                    );
+                    return p;
+                },
+            };
+            audio_track = Some(track);
+        }
+
+        let mut video_track = None;
+        if let Some(video_constraint_set) = video_constraints {
+            let Some(video) = media.create_videoinput_stream(video_constraint_set) else {
+                if let Some(audio) = audio_id {
+                    let _ = stop_stream(&audio);
+                }
+                p.reject_error(cx, Error::NotFound(None));
+                return p;
+            };
+            let track = match &constraints.video {
+                BooleanOrMediaTrackConstraints::Boolean(true) => {
+                    MediaStreamTrack::new(cx, &self.global(), video, MediaStreamType::Video)
+                },
+                BooleanOrMediaTrackConstraints::MediaTrackConstraints(track_constraints) => {
+                    MediaStreamTrack::new_with_constraints(
+                        cx,
+                        &self.global(),
+                        video,
+                        MediaStreamType::Video,
+                        track_constraints,
+                    )
+                },
+                BooleanOrMediaTrackConstraints::Boolean(false) => {
+                    let _ = stop_stream(&video);
+                    if let Some(audio) = audio_id {
+                        let _ = stop_stream(&audio);
+                    }
+                    p.reject_error(
+                        cx,
+                        Error::Type(c"At least one of audio or video must be requested".to_owned()),
+                    );
+                    return p;
+                },
+            };
+            video_track = Some(track);
+        }
+
         let stream = MediaStream::new(cx, &self.global());
-        if let Some(constraints) = convert_constraints(&constraints.audio) &&
-            let Some(audio) = media.create_audioinput_stream(constraints)
-        {
-            let track = MediaStreamTrack::new(cx, &self.global(), audio, MediaStreamType::Audio);
+        if let Some(track) = audio_track {
             stream.add_track(&track);
         }
-        if let Some(constraints) = convert_constraints(&constraints.video) &&
-            let Some(video) = media.create_videoinput_stream(constraints)
-        {
-            let track = MediaStreamTrack::new(cx, &self.global(), video, MediaStreamType::Video);
+        if let Some(track) = video_track {
             stream.add_track(&track);
         }
 
