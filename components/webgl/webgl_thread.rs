@@ -2998,6 +2998,30 @@ fn image_to_tex_image_data(
             pixels.truncate(pixel_count * 2);
             pixels
         },
+        // R/RG 系は DOM 画像(AO マップ等)の単一・2 チャネル転送で使う。
+        // 輝度への変換はせず、単純にチャネルを落とす。
+        (TexFormat::Red, TexDataType::UnsignedByte) |
+        (TexFormat::R8, TexDataType::UnsignedByte) => {
+            for i in 0..pixel_count {
+                let p = pixels[i * 4];
+                pixels[i] = p;
+            }
+            pixels.truncate(pixel_count);
+            pixels
+        },
+        (TexFormat::RG, TexDataType::UnsignedByte) |
+        (TexFormat::RG8, TexDataType::UnsignedByte) => {
+            for i in 0..pixel_count {
+                let (r, g) = {
+                    let rgba = &pixels[i * 4..i * 4 + 4];
+                    (rgba[0], rgba[1])
+                };
+                pixels[i * 2] = r;
+                pixels[i * 2 + 1] = g;
+            }
+            pixels.truncate(pixel_count * 2);
+            pixels
+        },
         (TexFormat::RGBA, TexDataType::UnsignedShort4444) => {
             for i in 0..pixel_count {
                 let p = {
@@ -3086,6 +3110,32 @@ fn image_to_tex_image_data(
             }
             data
         },
+        // 既存の RGB/RGBA Float 分岐は `u8 as f32` をそのまま書いているが、
+        // 新規の R/RG 分岐は画像由来バイトの正規化値 ([0, 1]) で格納する。
+        // 既存分岐の挙動は変えない。
+        (TexFormat::Red, TexDataType::Float) |
+        (TexFormat::R16f, TexDataType::Float) |
+        (TexFormat::R32f, TexDataType::Float) => {
+            for rgba8 in pixels.chunks_mut(4) {
+                let p = rgba8[0] as f32 / 255.0;
+                NativeEndian::write_f32(rgba8, p);
+            }
+            pixels
+        },
+        (TexFormat::RG, TexDataType::Float) |
+        (TexFormat::RG16f, TexDataType::Float) |
+        (TexFormat::RG32f, TexDataType::Float) => {
+            let mut data = Vec::<u8>::with_capacity(pixel_count * 8);
+            for rgba8 in pixels.chunks(4) {
+                data
+                    .write_f32::<NativeEndian>(rgba8[0] as f32 / 255.0)
+                    .unwrap();
+                data
+                    .write_f32::<NativeEndian>(rgba8[1] as f32 / 255.0)
+                    .unwrap();
+            }
+            data
+        },
 
         (TexFormat::RGBA, TexDataType::HalfFloat) |
         (TexFormat::RGBA16f, TexDataType::HalfFloat) => {
@@ -3147,6 +3197,25 @@ fn image_to_tex_image_data(
                 let a = f16::from_f32(rgba8[3] as f32).to_bits();
                 NativeEndian::write_u16(&mut rgba8[0..2], lum);
                 NativeEndian::write_u16(&mut rgba8[2..4], a);
+            }
+            pixels
+        },
+        (TexFormat::Red, TexDataType::HalfFloat) |
+        (TexFormat::R16f, TexDataType::HalfFloat) => {
+            for i in 0..pixel_count {
+                let p = f16::from_f32(pixels[i * 4] as f32).to_bits();
+                NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
+            }
+            pixels.truncate(pixel_count * 2);
+            pixels
+        },
+        (TexFormat::RG, TexDataType::HalfFloat) |
+        (TexFormat::RG16f, TexDataType::HalfFloat) => {
+            for rgba8 in pixels.chunks_mut(4) {
+                let r = f16::from_f32(rgba8[0] as f32).to_bits();
+                let g = f16::from_f32(rgba8[1] as f32).to_bits();
+                NativeEndian::write_u16(&mut rgba8[0..2], r);
+                NativeEndian::write_u16(&mut rgba8[2..4], g);
             }
             pixels
         },
@@ -3359,5 +3428,141 @@ impl FramebufferRebindingInfo {
                 self.viewport[3],
             )
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pixels::PixelFormat;
+
+    // 2 画素の RGBA8 入力。R/B の順序とチャネルの落とし方を確認するための値。
+    fn two_pixels_rgba8() -> Vec<u8> {
+        vec![10, 20, 30, 40, 50, 60, 70, 80]
+    }
+
+    fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| NativeEndian::read_f32(c))
+            .collect()
+    }
+
+    fn read_f16_le(bytes: &[u8]) -> Vec<f16> {
+        bytes
+            .chunks_exact(2)
+            .map(|c| f16::from_bits(NativeEndian::read_u16(c)))
+            .collect()
+    }
+
+    // Red/RG の UnsignedByte 変換で、期待する長さとチャネル順序になることを確かめる。
+    #[test]
+    fn red_rg_unsigned_byte_keeps_channel_order() {
+        let red = image_to_tex_image_data(
+            PixelFormat::RGBA8,
+            TexFormat::Red,
+            TexDataType::UnsignedByte,
+            two_pixels_rgba8(),
+        );
+        assert_eq!(red, vec![10, 50]);
+
+        let r8 = image_to_tex_image_data(
+            PixelFormat::RGBA8,
+            TexFormat::R8,
+            TexDataType::UnsignedByte,
+            two_pixels_rgba8(),
+        );
+        assert_eq!(r8, vec![10, 50]);
+
+        let rg = image_to_tex_image_data(
+            PixelFormat::RGBA8,
+            TexFormat::RG,
+            TexDataType::UnsignedByte,
+            two_pixels_rgba8(),
+        );
+        assert_eq!(rg, vec![10, 20, 50, 60]);
+
+        let rg8 = image_to_tex_image_data(
+            PixelFormat::RGBA8,
+            TexFormat::RG8,
+            TexDataType::UnsignedByte,
+            two_pixels_rgba8(),
+        );
+        assert_eq!(rg8, vec![10, 20, 50, 60]);
+    }
+
+    // BGRA8 入力では R/B を入れ替えたうえで R/RG を取り出すことを確かめる。
+    #[test]
+    fn red_rg_unsigned_byte_swaps_bgra8_first() {
+        // BGRA8 としての (B, G, R, A) = (30, 20, 10, 40)。
+        let red = image_to_tex_image_data(
+            PixelFormat::BGRA8,
+            TexFormat::Red,
+            TexDataType::UnsignedByte,
+            vec![30, 20, 10, 40],
+        );
+        assert_eq!(red, vec![10]);
+    }
+
+    // Red/RG の Float 変換で、正規化値 ([0, 1]) の f32 が期待する順序で並ぶことを確かめる。
+    #[test]
+    fn red_rg_float_is_normalized() {
+        let red = image_to_tex_image_data(
+            PixelFormat::RGBA8,
+            TexFormat::R32f,
+            TexDataType::Float,
+            two_pixels_rgba8(),
+        );
+        assert_eq!(red.len(), 2 * 4);
+        let values = read_f32_le(&red);
+        assert_eq!(values, vec![10.0 / 255.0, 50.0 / 255.0]);
+
+        let rg = image_to_tex_image_data(
+            PixelFormat::RGBA8,
+            TexFormat::RG32f,
+            TexDataType::Float,
+            two_pixels_rgba8(),
+        );
+        assert_eq!(rg.len(), 2 * 8);
+        let values = read_f32_le(&rg);
+        assert_eq!(
+            values,
+            vec![10.0 / 255.0, 20.0 / 255.0, 50.0 / 255.0, 60.0 / 255.0]
+        );
+    }
+
+    // Red/RG の HalfFloat 変換で、チャネルあたり 2 バイトで期待する順序になることを確かめる。
+    #[test]
+    fn red_rg_half_float_keeps_channel_order() {
+        let red = image_to_tex_image_data(
+            PixelFormat::RGBA8,
+            TexFormat::R16f,
+            TexDataType::HalfFloat,
+            two_pixels_rgba8(),
+        );
+        assert_eq!(red.len(), 2 * 2);
+        let values = read_f16_le(&red);
+        assert_eq!(
+            values,
+            vec![f16::from_f32(10.0), f16::from_f32(50.0)]
+        );
+
+        let rg = image_to_tex_image_data(
+            PixelFormat::RGBA8,
+            TexFormat::RG16f,
+            TexDataType::HalfFloat,
+            two_pixels_rgba8(),
+        );
+        assert_eq!(rg.len(), 2 * 4);
+        let values = read_f16_le(&rg);
+        assert_eq!(
+            values,
+            vec![
+                f16::from_f32(10.0),
+                f16::from_f32(20.0),
+                f16::from_f32(50.0),
+                f16::from_f32(60.0),
+            ]
+        );
     }
 }
