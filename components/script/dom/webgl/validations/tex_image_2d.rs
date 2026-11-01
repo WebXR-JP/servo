@@ -705,6 +705,7 @@ impl WebGLValidator for CompressedTexSubImage2DValidator<'_> {
 pub(crate) struct TexStorageValidator<'a> {
     common_validator: CommonTexImage2DValidator<'a>,
     dimensions: u8,
+    levels: i32,
     depth: i32,
 }
 
@@ -731,16 +732,20 @@ impl<'a> TexStorageValidator<'a> {
         depth: i32,
     ) -> Self {
         TexStorageValidator {
+            // `levels` is the mipmap level count, not the common validator's `level`.
+            // Pass level 0 to the common validator and validate `levels` separately;
+            // otherwise `max_size >> level` and `level > 0 && !POT` fire incorrectly.
             common_validator: CommonTexImage2DValidator::new(
                 context,
                 target,
-                levels,
+                0,
                 internal_format,
                 width,
                 height,
                 0,
             ),
             dimensions,
+            levels,
             depth,
         }
     }
@@ -752,10 +757,13 @@ impl WebGLValidator for TexStorageValidator<'_> {
 
     fn validate(self) -> Result<Self::ValidatedOutput, TexImageValidationError> {
         let context = self.common_validator.context;
+        // The common validator runs with level 0, so width/height are compared
+        // directly with max_size and NPOT textures are accepted. It also checks
+        // the target, format, border, and binding.
         let CommonTexImage2DValidatorResult {
             texture,
             target,
-            level,
+            level: _,
             internal_format,
             width,
             height,
@@ -766,7 +774,8 @@ impl WebGLValidator for TexStorageValidator<'_> {
             context.webgl_error(InvalidValue);
             return Err(TexImageValidationError::DepthTooLow);
         }
-        if level < 1 {
+        // `levels` must be at least 1 for texStorage* (GL ES 3.0).
+        if self.levels < 1 {
             context.webgl_error(InvalidValue);
             return Err(TexImageValidationError::LevelTooLow);
         }
@@ -788,8 +797,17 @@ impl WebGLValidator for TexStorageValidator<'_> {
             return Err(TexImageValidationError::InvalidTextureFormat);
         }
 
-        let max_level = cmp::max(width, height).ilog2() + 1;
-        if level > max_level {
+        // The maximum number of levels is the length of the mip chain
+        // determined by the largest dimension. width/height/depth are
+        // guaranteed to be at least 1 here.
+        let largest = cmp::max(cmp::max(width, height), self.depth as u32);
+        // No path yields 0, but avoid ilog2(0) for defensive clarity.
+        let max_level = if largest == 0 {
+            0
+        } else {
+            largest.ilog2() + 1
+        };
+        if (self.levels as u32) > max_level {
             context.webgl_error(InvalidOperation);
             return Err(TexImageValidationError::LevelTooHigh);
         }
@@ -804,7 +822,7 @@ impl WebGLValidator for TexStorageValidator<'_> {
         Ok(TexStorageValidatorResult {
             texture,
             target,
-            levels: level,
+            levels: self.levels as u32,
             internal_format,
             width,
             height,

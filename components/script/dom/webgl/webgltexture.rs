@@ -281,7 +281,13 @@ impl WebGLTexture {
             return Err(WebGLError::InvalidOperation);
         }
 
-        if !base_image_info.is_power_of_two() {
+        // NPOT mipmap generation is only forbidden in WebGL1.
+        // WebGL2 supports a complete mip chain for NPOT textures.
+        let is_webgl1 = match self.upcast().context() {
+            Some(context) => context.webgl_version() == WebGLVersion::WebGL1,
+            None => return Err(WebGLError::ContextLost),
+        };
+        if is_webgl1 && !base_image_info.is_power_of_two() {
             return Err(WebGLError::InvalidOperation);
         }
 
@@ -592,8 +598,10 @@ impl WebGLTexture {
         height: u32,
         depth: u32,
     ) -> WebGLResult<()> {
-        // Handled by the caller
-        assert!(!self.is_immutable());
+        // A second texStorage call is INVALID_OPERATION, not a panic.
+        if self.is_immutable() {
+            return Err(WebGLError::InvalidOperation);
+        }
         assert!(self.target().is_some());
 
         let target_id = target.as_gl_constant();
