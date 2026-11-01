@@ -5,6 +5,7 @@
 use std::cell::Cell;
 
 use script_bindings::cell::{DomRefCell, Ref};
+use script_bindings::script_runtime::runtime_is_alive;
 use script_bindings::weakref::WeakRef;
 use servo_canvas_traits::webgl::{
     ActiveAttribInfo, WebGLCommand, WebGLError, WebGLResult, WebGLVersion, WebGLVertexArrayId,
@@ -261,9 +262,16 @@ impl VertexArrayObject {
 
 impl Drop for VertexArrayObject {
     fn drop(&mut self) {
-        if self.id.is_some() {
-            self.delete(Operation::Fallible);
+        if self.id.is_none() {
+            return;
         }
+        // During runtime teardown the finalization order is arbitrary, so the buffers
+        // referenced by Dom<WebGLBuffer> may already be gone. The GL context is being
+        // destroyed anyway, so skip the cleanup that touches other DOM objects.
+        if !runtime_is_alive() {
+            return;
+        }
+        self.delete(Operation::Fallible);
     }
 }
 
