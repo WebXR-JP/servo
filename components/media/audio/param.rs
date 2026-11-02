@@ -541,7 +541,10 @@ impl AutomationEvent {
         next_event: Option<&AutomationEvent>,
     ) -> bool {
         match self {
-            AutomationEvent::SetValueAtTime(_, time) => *time == current_tick,
+            // `setValueAtTime` は指定時刻以降ずっと有効。予約した時刻が
+            // 音声スレッドの処理時点ですでに過去になっていても適用する
+            //（等値だけだと、`currentTime` に予約した値が落ちて既定値のままになる）。
+            AutomationEvent::SetValueAtTime(_, time) => *time <= current_tick,
             // https://webaudio.github.io/web-audio-api/#dom-audioparam-linearramptovalueattime
             AutomationEvent::RampToValueAtTime(..) => {
                 // Ramp always has a done time.
@@ -648,7 +651,7 @@ impl AutomationEvent {
 
         match *self {
             AutomationEvent::SetValueAtTime(val, time) => {
-                if current_tick == time {
+                if current_tick >= time {
                     *value = val;
                     *value_time = time;
                     true
