@@ -7,8 +7,8 @@ use std::default::Default;
 use std::f64::consts::PI;
 
 use dom_struct::dom_struct;
-use embedder_traits::MouseButton;
-use euclid::Point2D;
+use embedder_traits::{InputEvent, MouseButton, WebViewVector};
+use euclid::{Point2D, Vector2D};
 use js::context::JSContext;
 use js::rust::HandleObject;
 use keyboard_types::Modifiers;
@@ -83,6 +83,11 @@ pub(crate) struct MouseEvent {
 
     #[no_trace]
     point_in_target: Cell<Option<Point2D<f32, CSSPixel>>>,
+
+    /// <https://w3c.github.io/pointerlock/#dom-mouseevent-movementx>
+    /// Pointer Lock 中の相対移動量。非ロック時はゼロ。
+    #[no_trace]
+    movement: Cell<Vector2D<i32, CSSPixel>>,
 }
 
 impl MouseEvent {
@@ -96,6 +101,7 @@ impl MouseEvent {
             button: Cell::new(MouseButton::Primary),
             buttons: Cell::new(MouseButtons::empty()),
             point_in_target: Cell::new(None),
+            movement: Cell::new(Vector2D::new(0, 0)),
         }
     }
 
@@ -267,6 +273,8 @@ impl MouseEvent {
             None,
         );
 
+        mouse_event.set_movement(Self::movement_from_input(window, input_event));
+
         let event = mouse_event.upcast::<Event>();
         event.set_composed(composed);
         event.set_trusted(true);
@@ -384,6 +392,8 @@ impl MouseEvent {
         );
 
         pointer_event.upcast::<Event>().set_composed(composed);
+        // movementX/Y は PointerEvent へも引き継ぐ（MouseEvent を継承するため）。
+        pointer_event.set_movement(self.movement.get());
 
         pointer_event
     }
@@ -462,6 +472,36 @@ impl MouseEvent {
 
     pub(crate) fn buttons(&self) -> MouseButtons {
         self.buttons.get()
+    }
+
+    pub(crate) fn set_movement(&self, movement: Vector2D<i32, CSSPixel>) {
+        self.movement.set(movement);
+    }
+
+    /// embedder からの `MouseMoveEvent.movement` を CSS px の整数へ換算する。
+    /// `Page` はそのまま丸め、`Device` は DPR で割って CSS へ直して丸める。
+    pub(crate) fn movement_from_input(
+        window: &Window,
+        input_event: &ConstellationInputEvent,
+    ) -> Vector2D<i32, CSSPixel> {
+        let InputEvent::MouseMove(move_event) = &input_event.event.event else {
+            return Vector2D::new(0, 0);
+        };
+        match move_event.movement {
+            WebViewVector::Page(vector) => {
+                Vector2D::new(vector.x.round() as i32, vector.y.round() as i32)
+            },
+            WebViewVector::Device(vector) => {
+                let scale = window.device_pixel_ratio().get();
+                if scale == 0.0 {
+                    return Vector2D::new(0, 0);
+                }
+                Vector2D::new(
+                    (vector.x / scale).round() as i32,
+                    (vector.y / scale).round() as i32,
+                )
+            },
+        }
     }
 }
 
@@ -639,6 +679,16 @@ impl MouseEventMethods<crate::DomTypeHolder> for MouseEvent {
     /// <https://w3c.github.io/pointerevents/#dom-mouseevent-buttons>
     fn Buttons(&self) -> u16 {
         self.buttons.get().bits()
+    }
+
+    /// <https://w3c.github.io/pointerlock/#dom-mouseevent-movementx>
+    fn MovementX(&self) -> i32 {
+        self.movement.get().x
+    }
+
+    /// <https://w3c.github.io/pointerlock/#dom-mouseevent-movementy>
+    fn MovementY(&self) -> i32 {
+        self.movement.get().y
     }
 
     /// <https://w3c.github.io/pointerevents/#dom-mouseevent-relatedtarget>

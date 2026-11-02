@@ -1396,6 +1396,10 @@ impl ScriptThread {
                     .profile_event(ScriptThreadEventCategory::ExitFullscreen, Some(id), || {
                         self.handle_exit_fullscreen(id, cx);
                     }),
+                MixedMessage::FromConstellation(ScriptThreadMessage::ExitPointerLock(id)) => self
+                    .profile_event(ScriptThreadEventCategory::DocumentEvent, Some(id), || {
+                        self.handle_exit_pointer_lock(id, cx);
+                    }),
                 _ => {
                     sequential.push(event);
                 },
@@ -1887,6 +1891,7 @@ impl ScriptThread {
             },
             msg @ ScriptThreadMessage::SpawnPipeline(..) |
             msg @ ScriptThreadMessage::ExitFullScreen(..) |
+            msg @ ScriptThreadMessage::ExitPointerLock(..) |
             msg @ ScriptThreadMessage::ExitScriptThread => {
                 panic!("should have handled {:?} already", msg)
             },
@@ -2771,6 +2776,15 @@ impl ScriptThread {
         if let Some(document) = document {
             let mut realm = enter_auto_realm(cx, &*document);
             document.exit_fullscreen(&mut realm);
+        }
+    }
+
+    /// native 起点の Pointer Lock 解除。embedder へは返さない。
+    fn handle_exit_pointer_lock(&self, id: PipelineId, cx: &mut js::context::JSContext) {
+        let document = self.documents.borrow().find_document(id);
+        if let Some(document) = document {
+            let mut realm = enter_auto_realm(cx, &*document);
+            document.exit_pointer_lock_from_embedder(&mut realm);
         }
     }
 

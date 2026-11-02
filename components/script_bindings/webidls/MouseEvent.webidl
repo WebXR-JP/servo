@@ -24,6 +24,10 @@ interface MouseEvent : UIEvent {
     readonly    attribute EventTarget?   relatedTarget;
     // Introduced in DOM Level 3
     readonly    attribute unsigned short buttons;
+    // https://w3c.github.io/pointerlock/#dom-mouseevent-movementx
+    readonly    attribute long           movementX;
+    // https://w3c.github.io/pointerlock/#dom-mouseevent-movementy
+    readonly    attribute long           movementY;
     boolean getModifierState (DOMString keyArg);
 };
 

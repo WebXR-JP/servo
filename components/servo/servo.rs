@@ -111,7 +111,8 @@ use crate::site_data_manager::{CookieOperationResponse, SiteDataManager};
 use crate::webview::{MINIMUM_WEBVIEW_SIZE, WebView, WebViewInner};
 use crate::webview_delegate::{
     AllowOrDenyRequest, AuthenticationRequest, BluetoothDeviceSelectionRequest, EmbedderControl,
-    FilePicker, NavigationRequest, PermissionRequest, ProtocolHandlerRegistration, WebResourceLoad,
+    FilePicker, NavigationRequest, PermissionRequest, PointerLockRequest,
+    ProtocolHandlerRegistration, WebResourceLoad,
 };
 
 #[cfg(feature = "media-gstreamer")]
@@ -614,6 +615,24 @@ impl ServoInner {
                     webview
                         .delegate()
                         .notify_fullscreen_state_changed(webview, fullscreen);
+                }
+            },
+            EmbedderMsg::RequestPointerLock(webview_id, generation, callback) => {
+                let request = PointerLockRequest::new_from_callback(
+                    generation,
+                    callback,
+                    self.servo_errors.sender(),
+                );
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    webview.delegate().request_pointer_lock(webview, request);
+                }
+                // webview が無ければここで request が drop され、その世代の既定 deny が送られる。
+            },
+            EmbedderMsg::NotifyPointerLockStateChanged(webview_id, locked, generation) => {
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    webview
+                        .delegate()
+                        .notify_pointer_lock_changed(webview, locked, generation);
                 }
             },
             EmbedderMsg::GetSelectedBluetoothDevice(webview_id, items, response_sender) => {

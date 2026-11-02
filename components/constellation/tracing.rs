@@ -65,6 +65,7 @@ mod from_embedder {
                 Self::ForwardInputEvent(_webview_id, event, ..) => event.log_target(),
                 Self::RefreshCursor(..) => target!("RefreshCursor"),
                 Self::ExitFullScreen(_) => target!("ExitFullScreen"),
+                Self::ExitPointerLock(_) => target!("ExitPointerLock"),
                 Self::MediaSessionAction(_) => target!("MediaSessionAction"),
                 Self::SetWebViewHidden(_, _) => target!("SetWebViewHidden"),
                 Self::SetScrollStates(..) => target!("SetScrollStates"),

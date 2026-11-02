@@ -6,7 +6,7 @@ use std::cell::Cell;
 
 use dom_struct::dom_struct;
 use embedder_traits::MouseButton;
-use euclid::Point2D;
+use euclid::{Point2D, Vector2D};
 use js::context::JSContext;
 use js::rust::HandleObject;
 use keyboard_types::Modifiers;
@@ -219,6 +219,11 @@ impl PointerEvent {
             .map(|event| event.as_traced())
             .collect();
         ev
+    }
+    /// Pointer Lock の movement を内包する MouseEvent へ引き継ぐ。
+    /// `MouseEvent` が継承元の実体を持つため、ここで委譲する。
+    pub(crate) fn set_movement(&self, movement: Vector2D<i32, CSSPixel>) {
+        self.mouseevent.set_movement(movement);
     }
 }
 

@@ -126,7 +126,7 @@ use crate::dom::bindings::error::{Error, ErrorInfo, ErrorResult, Fallible};
 use crate::dom::bindings::frozenarray::CachedFrozenArray;
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::refcounted::Trusted;
+use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{
     Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout, ToLayoutOptional, UnrootedDom,
@@ -161,6 +161,7 @@ use crate::dom::domimplementation::DOMImplementation;
 use crate::dom::domstringlist::DOMStringList;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
+use crate::dom::pointerlock::PointerLockWaiters;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::execcommand::basecommand::{CommandName, DefaultSingleLineContainerName};
@@ -528,6 +529,29 @@ pub(crate) struct Document {
 
     /// Entry node for fullscreen.
     fullscreen_element: MutNullableDom<Element>,
+    /// Entry node for pointer lock.
+    /// <https://w3c.github.io/pointerlock/#dom-document-pointerlockelement>
+    pointer_lock_element: MutNullableDom<Element>,
+    /// Whether a pointer lock request is waiting for the embedder response.
+    /// embedder 所有の grab との往復中の再入を防ぐ。
+    pointer_lock_pending: Cell<bool>,
+    /// pending 中の要求の世代。stale な遅延応答の取り違えを防ぐ。
+    /// 同じ要素の「要求→キャンセル→再要求」で古い応答が新しい要求に適用されないようにする。
+    pointer_lock_pending_generation: Cell<Option<u64>>,
+    /// pending 中の要求対象要素。同一要素への同時要求の合流判定に使う。
+    pointer_lock_pending_element: MutNullableDom<Element>,
+    /// ロック中の世代。解除通知に載せ、stale な解放が別世代の grab を解かないようにする。
+    pointer_lock_locked_generation: Cell<Option<u64>>,
+    /// 一次 promise の pin。キャンセル時に一次 promise も settle するため保持する。
+    /// 空の trace で、実体は promise 保持表で GC 保護する。
+    #[ignore_malloc_size_of = "TrustedPromise pins live JS promises outside the heap graph"]
+    pointer_lock_primary: RefCell<Option<TrustedPromise>>,
+    /// 合流した待機 promise 群。応答時に一次 promise と同じ結果で解決する。
+    /// 中身の `TrustedPromise` は promise 保持表で GC 保護するため trace 対象外とする。
+    /// 専用のラッパ型にすることで `#[no_trace]` の導出ガードを通す。
+    #[no_trace]
+    #[ignore_malloc_size_of = "TrustedPromise pins live JS promises outside the heap graph"]
+    pointer_lock_waiters: PointerLockWaiters,
     /// Map from ID to set of form control elements that have that ID as
     /// their 'form' content attribute. Used to reset form controls
     /// whenever any element with the same ID as the form attribute
@@ -1097,6 +1121,10 @@ impl Document {
             ClientContextId::build(pipeline_id.namespace_id.0, pipeline_id.index.0.get());
 
         if activity != DocumentActivity::FullyActive {
+            // 非アクティブ化では Pointer Lock を先に畳む。suspend より前。
+            if self.pointer_lock_pending() || self.is_pointer_locked() {
+                self.exit_pointer_lock(cx, true);
+            }
             if !self.window_detached() {
                 self.window().suspend(cx);
             }
@@ -4115,6 +4143,13 @@ impl Document {
             ignore_opens_during_unload_counter: Default::default(),
             spurious_animation_frames: Cell::new(0),
             fullscreen_element: MutNullableDom::new(None),
+            pointer_lock_element: MutNullableDom::new(None),
+            pointer_lock_pending: Cell::new(false),
+            pointer_lock_pending_generation: Cell::new(None),
+            pointer_lock_pending_element: MutNullableDom::new(None),
+            pointer_lock_locked_generation: Cell::new(None),
+            pointer_lock_primary: RefCell::new(None),
+            pointer_lock_waiters: PointerLockWaiters::default(),
             form_id_listener_map: Default::default(),
             interactive_time: DomRefCell::new(interactive_time),
             tti_window: DomRefCell::new(InteractiveWindow::default()),
@@ -4730,6 +4765,42 @@ impl Document {
 
     pub(crate) fn set_fullscreen_element(&self, element: Option<&Element>) {
         self.fullscreen_element.set(element);
+    }
+
+    /// Pointer Lock の保持セル。`pointerlock.rs` の状態遷移から使う。
+    /// フィールド自体は `dom_struct` の要請で非公開にする。
+    pub(crate) fn pointer_lock_element_holder(&self) -> &MutNullableDom<Element> {
+        &self.pointer_lock_element
+    }
+
+    /// Pointer Lock 保留フラグのセル。`pointerlock.rs` の状態遷移から使う。
+    pub(crate) fn pointer_lock_pending_cell(&self) -> &Cell<bool> {
+        &self.pointer_lock_pending
+    }
+
+    /// Pointer Lock の pending 要求の世代セル。`pointerlock.rs` から使う。
+    pub(crate) fn pointer_lock_pending_generation_cell(&self) -> &Cell<Option<u64>> {
+        &self.pointer_lock_pending_generation
+    }
+
+    /// ロック中の世代セル。`pointerlock.rs` から使う。
+    pub(crate) fn pointer_lock_locked_generation_cell(&self) -> &Cell<Option<u64>> {
+        &self.pointer_lock_locked_generation
+    }
+
+    /// 一次 promise の pin。`pointerlock.rs` の応答・取消処理から使う。
+    pub(crate) fn pointer_lock_primary(&self) -> &RefCell<Option<TrustedPromise>> {
+        &self.pointer_lock_primary
+    }
+
+    /// Pointer Lock の pending 対象要素の保持セル。`pointerlock.rs` から使う。
+    pub(crate) fn pointer_lock_pending_element_holder(&self) -> &MutNullableDom<Element> {
+        &self.pointer_lock_pending_element
+    }
+
+    /// 合流した待機 promise 群。`pointerlock.rs` の応答・取消処理から使う。
+    pub(crate) fn pointer_lock_waiters(&self) -> &PointerLockWaiters {
+        &self.pointer_lock_waiters
     }
 
     fn reset_form_owner_for_listeners(&self, cx: &mut JSContext, id: &Atom) {
@@ -7047,6 +7118,20 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     // https://fullscreen.spec.whatwg.org/#handler-document-onfullscreenerror
     event_handler!(fullscreenerror, GetOnfullscreenerror, SetOnfullscreenerror);
 
+    // https://w3c.github.io/pointerlock/#handler-document-onpointerlockchange
+    event_handler!(
+        pointerlockchange,
+        GetOnpointerlockchange,
+        SetOnpointerlockchange
+    );
+
+    // https://w3c.github.io/pointerlock/#handler-document-onpointerlockerror
+    event_handler!(
+        pointerlockerror,
+        GetOnpointerlockerror,
+        SetOnpointerlockerror
+    );
+
     // https://fullscreen.spec.whatwg.org/#handler-document-onfullscreenchange
     event_handler!(
         fullscreenchange,
@@ -7072,6 +7157,16 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     /// <https://fullscreen.spec.whatwg.org/#dom-document-exitfullscreen>
     fn ExitFullscreen(&self, cx: &mut CurrentRealm) -> RootedPromise {
         self.exit_fullscreen(cx)
+    }
+
+    /// <https://w3c.github.io/pointerlock/#dom-document-pointerlockelement>
+    fn GetPointerLockElement(&self) -> Option<DomRoot<Element>> {
+        self.pointer_lock_element()
+    }
+
+    /// <https://w3c.github.io/pointerlock/#dom-document-exitpointerlock>
+    fn ExitPointerLock(&self, cx: &mut JSContext) {
+        self.exit_pointer_lock(cx, true);
     }
 
     // check-tidy: no specs after this line

@@ -154,6 +154,14 @@ partial interface Element {
   Promise<undefined> requestFullscreen();
 };
 
+// https://w3c.github.io/pointerlock/
+partial interface Element {
+  Promise<undefined> requestPointerLock(optional PointerLockOptions options = {});
+};
+dictionary PointerLockOptions {
+  boolean unadjustedMovement = false;
+};
+
 // https://w3c.github.io/pointerevents/#extensions-to-the-element-interface
 partial interface Element {
   [Throws] undefined setPointerCapture(long pointerId);

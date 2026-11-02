@@ -1393,6 +1393,9 @@ where
             EmbedderToConstellationMessage::ExitFullScreen(webview_id) => {
                 self.handle_exit_fullscreen_msg(webview_id);
             },
+            EmbedderToConstellationMessage::ExitPointerLock(webview_id) => {
+                self.handle_exit_pointer_lock_msg(webview_id);
+            },
             EmbedderToConstellationMessage::MediaSessionAction(action) => {
                 self.handle_media_session_action_msg(action);
             },
@@ -5942,6 +5945,22 @@ where
             let _ = pipeline
                 .event_loop
                 .send(ScriptThreadMessage::ExitFullScreen(pipeline.id));
+        }
+    }
+
+    /// Called when the embedder exits from pointer lock mode (native 起点の解除).
+    /// `handle_exit_fullscreen_msg` と同じ形で対象 pipeline へ送る。
+    #[servo_tracing::instrument(skip_all)]
+    fn handle_exit_pointer_lock_msg(&mut self, webview_id: WebViewId) {
+        let browsing_context_id = BrowsingContextId::from(webview_id);
+        if let Some(browsing_context) = self.browsing_contexts.get(&browsing_context_id) {
+            let pipeline_id = browsing_context.pipeline_id;
+            let Some(pipeline) = self.pipelines.get(&pipeline_id) else {
+                return warn!("{pipeline_id}: Exited pointer lock after closing",);
+            };
+            let _ = pipeline
+                .event_loop
+                .send(ScriptThreadMessage::ExitPointerLock(pipeline.id));
         }
     }
 

@@ -148,6 +148,41 @@ impl WebViewVector {
             Self::Page(vector) => *vector * scale,
         }
     }
+
+    /// ゼロ移動量。合算の初期値に使う。
+    /// バリアントは Page に寄せる（embedder は movement を Page で送る）。
+    pub fn zero() -> Self {
+        Self::Page(Vector2D::new(0.0, 0.0))
+    }
+
+    /// ゼロ移動量か。合算漏れの単体検証に使う。
+    pub fn is_zero(&self) -> bool {
+        match self {
+            Self::Device(vector) => vector.x == 0.0 && vector.y == 0.0,
+            Self::Page(vector) => vector.x == 0.0 && vector.y == 0.0,
+        }
+    }
+}
+
+/// mousemove 合算用。同一バリアント同士だけ成分加算する。
+/// バリアントが食い違う場合は新しい値で上書きする（scale 情報が無いため変換できない）。
+/// embedder は Page で統一して送るため、通常は加算経路を通る。
+impl std::ops::AddAssign for WebViewVector {
+    fn add_assign(&mut self, rhs: Self) {
+        match (self, rhs) {
+            (Self::Device(left), Self::Device(right)) => {
+                left.x += right.x;
+                left.y += right.y;
+            },
+            (Self::Page(left), Self::Page(right)) => {
+                left.x += right.x;
+                left.y += right.y;
+            },
+            (slot, other) => {
+                *slot = other;
+            },
+        }
+    }
 }
 
 impl From<DeviceVector2D> for WebViewVector {
@@ -308,6 +343,17 @@ pub struct AuthenticationResponse {
 pub enum AllowOrDeny {
     Allow,
     Deny,
+}
+
+/// Page content の Pointer Lock 要求への応答。世代で要求と対応付ける。
+/// 同じ要素の「要求→キャンセル→再要求」で古い応答が新しい要求に適用される
+/// 取り違えと、stale な解放が別世代の grab を解くことを防ぐ。
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PointerLockResponse {
+    /// grab してよいか。embedder が OS の grab に成功した場合のみ真。
+    pub allowed: bool,
+    /// 対応する要求の世代。
+    pub generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -503,6 +549,13 @@ pub enum EmbedderMsg {
     GetScreenMetrics(WebViewId, GenericSender<ScreenMetrics>),
     /// Entered or exited fullscreen.
     NotifyFullscreenStateChanged(WebViewId, bool),
+    /// Page content requested Pointer Lock. Embedder owns the OS cursor grab.
+    /// 第2引数は要求の世代。応答と解放通知に対応付ける。
+    /// Drop時は deny として扱う（応答喪失で成功に見せない）。
+    RequestPointerLock(WebViewId, u64, GenericCallback<PointerLockResponse>),
+    /// Script 側の Pointer Lock 状態が変わった。`false` で embedder は grab 解放へ。
+    /// 第3引数は対象ロックの世代。一致する grab だけ解放する。
+    NotifyPointerLockStateChanged(WebViewId, bool, u64),
     /// The [`LoadStatus`] of the Given `WebView` has changed.
     NotifyLoadStatusChanged(WebViewId, LoadStatus),
     /// Open dialog to select bluetooth device.

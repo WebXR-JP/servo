@@ -10,9 +10,10 @@ use embedder_traits::{
     ConfirmResponse, ConsoleLogLevel, ContextMenuAction, ContextMenuElementInformation,
     ContextMenuItem, Cursor, EmbedderControlId, EmbedderControlResponse, FilePickerRequest,
     FilterPattern, InputEventId, InputEventResult, InputMethodType, LoadStatus, MediaSessionEvent,
-    NewWebViewDetails, Notification, PermissionFeature, PromptResponse, RgbColor, ScreenGeometry,
-    SelectElementOptionOrOptgroup, SelectElementRequest, SimpleDialogRequest, TraversalId,
-    WebResourceRequest, WebResourceResponse, WebResourceResponseMsg,
+    NewWebViewDetails, Notification, PermissionFeature, PointerLockResponse, PromptResponse,
+    RgbColor, ScreenGeometry, SelectElementOptionOrOptgroup, SelectElementRequest,
+    SimpleDialogRequest, TraversalId, WebResourceRequest, WebResourceResponse,
+    WebResourceResponseMsg,
 };
 use paint_api::rendering_context::RenderingContext;
 use servo_base::generic_channel::{GenericCallback, GenericSender, SendError};
@@ -135,6 +136,60 @@ impl AllowOrDenyRequest {
     pub fn deny(mut self) {
         if let Err(error) = self.0.send(AllowOrDeny::Deny) {
             self.1.raise_response_send_error(error);
+        }
+    }
+}
+
+/// Page content の Pointer Lock 要求。embedder が OS の cursor grab を所有する。
+/// 明示の allow/deny が無ければ drop 時に deny する（応答喪失で成功に見せない）。
+/// 応答と解放通知は世代で要求と対応付ける。
+pub struct PointerLockRequest {
+    generation: u64,
+    responder: AutomaticResponder<PointerLockResponse>,
+    error_sender: ServoErrorSender,
+}
+
+impl PointerLockRequest {
+    pub(crate) fn new_from_callback(
+        generation: u64,
+        callback: GenericCallback<PointerLockResponse>,
+        error_sender: ServoErrorSender,
+    ) -> Self {
+        Self {
+            generation,
+            responder: AutomaticResponder::new_same_process(
+                Box::new(callback),
+                PointerLockResponse {
+                    allowed: false,
+                    generation,
+                },
+            ),
+            error_sender,
+        }
+    }
+
+    /// 対応する要求の世代。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// OS の grab に成功した場合に呼ぶ。script 側の promise が resolve される。
+    pub fn allow(mut self) {
+        if let Err(error) = self.responder.send(PointerLockResponse {
+            allowed: true,
+            generation: self.generation,
+        }) {
+            self.error_sender.raise_response_send_error(error);
+        }
+    }
+
+    /// grab できない場合に呼ぶ。成功扱いにしない。drop でも同じ結果になる。
+    pub fn deny(mut self) {
+        if let Err(error) = self.responder.send(PointerLockResponse {
+            allowed: false,
+            generation: self.generation,
+        }) {
+            self.error_sender.raise_response_send_error(error);
         }
     }
 }
@@ -979,6 +1034,16 @@ pub trait WebViewDelegate {
     /// the page will enter or leave fullscreen state internally according to the [Fullscreen
     /// API](https://fullscreen.spec.whatwg.org/).
     fn notify_fullscreen_state_changed(&self, _webview: WebView, _is_fullscreen: bool) {}
+
+    /// Page content requested Pointer Lock (`Element.requestPointerLock()`).
+    /// The embedder owns the OS cursor grab. Allow to grab, deny (or drop) to reject.
+    /// 世代付きで応答する。Drop時はその世代の deny として扱う。
+    fn request_pointer_lock(&self, _webview: WebView, _request: PointerLockRequest) {}
+
+    /// Script 側の Pointer Lock 状態が変わった。`locked == false` のとき
+    /// embedder は世代が一致する grab だけ解放し、カーソル表示復帰を行う。
+    /// native 起点の解除では engine へ返さない（無限往復を避ける）。
+    fn notify_pointer_lock_changed(&self, _webview: WebView, _locked: bool, _generation: u64) {}
 
     /// Whether or not to allow a [`WebView`] to load a URL in its main frame or one of its
     /// nested `<iframe>`s. [`NavigationRequest`]s are accepted by default.

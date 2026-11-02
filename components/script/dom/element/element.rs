@@ -110,6 +110,7 @@ use crate::dom::bindings::domname::{
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::num::Finite;
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::csp::{CspReporting, InlineCheckType, SourcePosition};
@@ -4103,6 +4104,16 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         doc.enter_fullscreen(cx, self)
     }
 
+    /// <https://w3c.github.io/pointerlock/#dom-element-requestpointerlock>
+    fn RequestPointerLock(
+        &self,
+        cx: &mut CurrentRealm,
+        options: &crate::dom::bindings::codegen::Bindings::ElementBinding::PointerLockOptions,
+    ) -> RootedPromise {
+        let doc = self.owner_document();
+        doc.request_pointer_lock(cx, self, options)
+    }
+
     /// <https://w3c.github.io/pointerevents/#dom-element-setpointercapture>
     fn SetPointerCapture(&self, pointer_id: i32) -> ErrorResult {
         let document = self.owner_document();
@@ -4905,6 +4916,25 @@ impl VirtualMethods for Element {
         let fullscreen = doc.fullscreen_element();
         if fullscreen.as_deref() == Some(self) {
             doc.exit_fullscreen(cx);
+        }
+
+        // Pointer Lock 中の要素が取り外されたら解除する。祖先削除でも
+        // 対象自身の unbind で発火するため、ここだけで足りる。
+        // ただし unbind 中は script/layout blocker が立っており、同期的に
+        // pointerlockchange を発火すると panic する。DOM が安定してから
+        // 遅延タスクで解除する（fullscreen の exit は非同期なので直接呼べる）。
+        if doc.pointer_lock_element().as_deref() == Some(self) {
+            let trusted_doc = Trusted::new(&*doc);
+            doc.add_delayed_task(task!(PointerLockElementRemoved: |cx, trusted_doc: Trusted<Document>| {
+                let doc = trusted_doc.root();
+                let removed = doc
+                    .pointer_lock_element()
+                    .as_deref()
+                    .is_some_and(|element| !element.upcast::<Node>().is_connected());
+                if removed {
+                    doc.exit_pointer_lock(cx, true);
+                }
+            }));
         }
 
         self.unregister_current_id_and_name_attribute(cx);

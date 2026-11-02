@@ -240,9 +240,9 @@ impl DocumentEventHandler {
     }
 
     /// Note a pending input event, to be processed at the next `update_the_rendering` task.
-    pub(crate) fn note_pending_input_event(&self, event: ConstellationInputEvent) {
+    pub(crate) fn note_pending_input_event(&self, mut event: ConstellationInputEvent) {
         let mut pending_input_events = self.pending_input_events.borrow_mut();
-        if matches!(event.event.event, InputEvent::MouseMove(..)) {
+        if let InputEvent::MouseMove(ref mut new_move_event) = event.event.event {
             // First try to replace any existing mouse move event.
             if let Some(mouse_move_event) = self
                 .mouse_move_event_index
@@ -252,6 +252,13 @@ impl DocumentEventHandler {
                 self.coalesced_mouse_move_event_ids
                     .borrow_mut()
                     .push(mouse_move_event.event.id);
+                // mousemove の合算では movement を合算する。座標は最新の点を使う。
+                // Pointer Lock 中の視点回転が合算で欠落しないようにする。
+                if let InputEvent::MouseMove(ref existing_move_event) =
+                    mouse_move_event.event.event
+                {
+                    new_move_event.movement += existing_move_event.movement;
+                }
                 *mouse_move_event = event;
                 return;
             }
@@ -602,6 +609,54 @@ impl DocumentEventHandler {
         let released_disconnected =
             self.release_disconnected_pointer_capture(cx, pointer_id, "mouse", true);
 
+        // Pointer Lock 中は専用分岐へ。同じ座標でも early-return しない。
+        // hover 更新・drag gesture・cursor 更新はしない。
+        if let Some(locked) = self.window.Document().pointer_lock_element() {
+            // paint のヒットテストは座標取得のためだけに使う。
+            // 固定点送りのため失敗しても movement 配送は続ける。
+            let hit_test_result = self.window.hit_test_from_input_event(
+                HitTestFlags::empty(),
+                input_event,
+            );
+            // 座標が取れない場合は最後の点を使う。どちらも無ければ捨てる。
+            let fallback_point = self.most_recent_mousemove_point.get();
+            let Some(hit_test_result) = hit_test_result.or_else(|| {
+                let point = fallback_point?;
+                self.window
+                    .hit_test_from_point_in_viewport(HitTestFlags::empty(), point)
+            }) else {
+                return;
+            };
+            self.most_recent_mousemove_point
+                .set(Some(hit_test_result.point_in_frame));
+
+            // 配送先はロック対象。pointer capture があればそちらを優先する。
+            let pointer_target = self
+                .get_pointer_capture_target(pointer_id)
+                .map(DomRoot::upcast::<EventTarget>)
+                .unwrap_or_else(|| DomRoot::from_ref(locked.upcast::<EventTarget>()));
+
+            let mouse_event = MouseEvent::new_for_platform_motion_event(
+                cx,
+                &self.window,
+                FireMouseEventType::Move,
+                &hit_test_result,
+                input_event,
+            );
+
+            // pointermove を先に、mousemove を後に fire（既存の順序に合わせる）。
+            let pointer_event = mouse_event.to_pointer_event(cx, Atom::from("pointermove"));
+            pointer_event.upcast::<Event>().set_composed(true);
+            pointer_event.upcast::<Event>().fire(cx, &pointer_target);
+
+            if !released_disconnected {
+                self.process_pending_pointer_capture(cx, pointer_id, "mouse", true);
+            }
+
+            mouse_event.upcast::<Event>().fire(cx, &pointer_target);
+            return;
+        }
+
         let hit_test_flags = if self
             .drag_gesture
             .borrow()
@@ -946,13 +1001,19 @@ impl DocumentEventHandler {
                 .set_sequential_focus_navigation_starting_point(&hit_test_result.node);
         }
 
-        let Some(element) = hit_test_result
+        let Some(hit_element) = hit_test_result
             .node
             .inclusive_ancestors(ShadowIncluding::Yes)
             .find_map(DomRoot::downcast::<Element>)
         else {
             return;
         };
+        // Pointer Lock 中は hit-test の要素ではなくロック対象を target にする。
+        // 座標は固定点の hit-test 結果をそのまま使う。pointer capture があれば
+        // 後段の pointer_target 解決でそちらが優先される。
+        let element: DomRoot<Element> = document
+            .pointer_lock_element()
+            .unwrap_or(hit_element);
 
         let node = element.upcast::<Node>();
         debug!("{:?} on {:?}", mouse_button_event.action, node.debug_str());

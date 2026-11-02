@@ -9,7 +9,9 @@ use keyboard_types::{Code, CompositionEvent, Key, KeyState, Location, Modifiers}
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 
-use crate::WebViewPoint;
+use crate::{WebViewPoint, WebViewVector};
+use euclid::Vector2D;
+use style_traits::CSSPixel;
 
 /// An opaque id for an [`InputEvent`].
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -258,6 +260,9 @@ pub enum MouseButtonAction {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct MouseMoveEvent {
     pub point: WebViewPoint,
+    /// Pointer Lock 中の相対移動量。非ロック時はゼロ。
+    /// `note_pending_input_event` の合算で蓄積される。
+    pub movement: WebViewVector,
     #[doc(hidden)]
     // An internal flag used to avoid refreshing the cursor in response to move
     // events for touch devices since they are simulated in Servo using mouse events.
@@ -268,6 +273,18 @@ impl MouseMoveEvent {
     pub fn new(point: WebViewPoint) -> Self {
         Self {
             point,
+            // 合算の加算を同バリアントに保つため、既定は Page のゼロにする。
+            // embedder（xrift-client）は movement を Page(CSS px) で送る。
+            movement: WebViewVector::Page(Vector2D::new(0.0, 0.0)),
+            is_compatibility_event_for_touch: false,
+        }
+    }
+
+    /// Pointer Lock 中の相対移動量を添えて作る。
+    pub fn new_with_movement(point: WebViewPoint, movement: WebViewVector) -> Self {
+        Self {
+            point,
+            movement,
             is_compatibility_event_for_touch: false,
         }
     }
@@ -276,6 +293,7 @@ impl MouseMoveEvent {
     pub fn new_compatibility_for_touch(point: WebViewPoint) -> Self {
         Self {
             point,
+            movement: WebViewVector::Page(Vector2D::<f32, CSSPixel>::new(0.0, 0.0)),
             is_compatibility_event_for_touch: true,
         }
     }

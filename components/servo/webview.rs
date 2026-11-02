@@ -699,6 +699,15 @@ impl WebView {
             .send(EmbedderToConstellationMessage::ExitFullScreen(self.id()));
     }
 
+    /// Tell the currently active page in this [`WebView`] to exit Pointer Lock.
+    /// native 起点の解除に使う。engine へ `ExitPointerLock` を送り、
+    /// script 側は embedder へ返さない（無限往復を避ける）。
+    pub fn exit_pointer_lock(&self) {
+        self.servo()
+            .constellation_proxy()
+            .send(EmbedderToConstellationMessage::ExitPointerLock(self.id()));
+    }
+
     /// Toggle the given [`WebRenderDebugOption`] from its current state.
     ///
     /// Note that this method toggles the debugging options globally i.e., it affects

@@ -197,6 +197,14 @@ partial interface Document {
   // readonly attribute HTMLAllCollection all;
 };
 
+// https://w3c.github.io/pointerlock/
+partial interface Document {
+  readonly attribute Element? pointerLockElement;
+  undefined exitPointerLock();
+  attribute EventHandler onpointerlockchange;
+  attribute EventHandler onpointerlockerror;
+};
+
 // https://fullscreen.spec.whatwg.org/#api
 partial interface Document {
   [LegacyLenientSetter] readonly attribute boolean fullscreenEnabled;
