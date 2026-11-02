@@ -22,6 +22,7 @@ pub mod local_directory_listing;
 pub mod protocols;
 pub mod request_interceptor;
 pub mod resource_thread;
+pub mod session_persistence;
 pub mod subresource_integrity;
 #[cfg(feature = "test-util")]
 pub mod test_util;

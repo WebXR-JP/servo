@@ -93,6 +93,7 @@ font-types = "0.12"
 fontconfig_sys = { package = "yeslogic-fontconfig-sys", version = "6" }
 fontsan = { version = "0.7", default-features = false, features = ["libz-sys", "wuff"] }
 freetype-sys = "0.23"
+fs4 = "1.1"
 fst = "0.4"
 futures = { version = "0.3", default-features = false }
 futures-core = { version = "0.3", default-features = false }
@@ -144,6 +145,7 @@ js = { package = "mozjs", version = "=0.26.4", default-features = false, feature
 k12 = "0.5"
 keccak = "0.2"
 keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }
+keyring = "4.2"
 kurbo = { version = "0.13.1", features = ["euclid"] }
 libc = "0.2"
 log = "0.4.32"

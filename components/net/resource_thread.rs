@@ -70,6 +70,7 @@ use crate::http_cache::{HttpCache, HttpCacheAssignment};
 use crate::http_loader::{HttpState, http_redirect_fetch};
 use crate::protocols::ProtocolRegistry;
 use crate::request_interceptor::RequestInterceptor;
+use crate::session_persistence::{SessionFile, SessionPersistence};
 use crate::websocket_loader::create_handshake_request;
 
 /// Load a file with CA certificate and produce a RootCertStore with the results.
@@ -206,13 +207,19 @@ fn create_http_states(
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
 ) -> (Arc<HttpState>, Arc<HttpState>) {
     let mut hsts_list = HstsList::default();
-    let mut auth_cache = AuthCache::default();
-    let mut cookie_jar = CookieStorage::new(150);
     if let Some(config_dir) = config_dir {
-        servo_base::read_json_from_file(&mut auth_cache, config_dir, "auth_cache.json");
         servo_base::read_json_from_file(&mut hsts_list, config_dir, "hsts_list.json");
-        servo_base::read_json_from_file(&mut cookie_jar, config_dir, "cookie_jar.json");
     }
+    // 鍵は起動時に一度だけ取得し、public 用と private 用で共有・無効化を分ける。
+    let session_persistence = Arc::new(SessionPersistence::new(config_dir));
+    let auth_cache: AuthCache = session_persistence
+        .read(SessionFile::AuthCache)
+        .unwrap_or_default();
+    let cookie_jar: CookieStorage = session_persistence
+        .read(SessionFile::Cookies)
+        .unwrap_or_else(|| CookieStorage::new(150));
+    // 読み込み失敗時は `read` 側でそのファイルの保存を停止済みのため、
+    // 空の内容で終了時保存が元ファイルを消すことはない。
 
     let override_manager = CertificateErrorOverrideManager::new();
     let http_state = HttpState {
@@ -228,7 +235,7 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy: embedder_proxy.clone(),
-        cookie_config_dir: config_dir.map(|path| path.to_path_buf()),
+        session_persistence,
         cookie_save_lock: Mutex::new(()),
     };
 
@@ -246,7 +253,7 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy,
-        cookie_config_dir: None,
+        session_persistence: Arc::new(SessionPersistence::disabled()),
         cookie_save_lock: Mutex::new(()),
     };
 
@@ -678,11 +685,24 @@ impl ResourceChannelManager {
                 sender.send_or_ignore(total);
             },
             CoreResourceMsg::Exit(sender) => {
-                if let Some(ref config_dir) = self.config_dir {
+                // 保存停止中は書かず、空の内容で元ファイルを消さない。
+                // 失敗は警告に留め、終了処理自体は継続する。
+                // Cookie 保存は `save_cookies` に寄せ、`cookie_save_lock` の迂回を防ぐ。
+                // auth_cache の保存は `write` の `write_lock` で直列化される。
+                if http_state
+                    .session_persistence
+                    .is_enabled(SessionFile::AuthCache)
+                {
                     let auth_cache = http_state.auth_cache.read();
-                    servo_base::write_json_to_file(&*auth_cache, config_dir, "auth_cache.json");
-                    let jar = http_state.cookie_jar.read();
-                    servo_base::write_json_to_file(&*jar, config_dir, "cookie_jar.json");
+                    if let Err(error) = http_state
+                        .session_persistence
+                        .write(SessionFile::AuthCache, &*auth_cache)
+                    {
+                        warn!("auth_cache を保存できない: {error}");
+                    }
+                }
+                http_state.save_cookies();
+                if let Some(ref config_dir) = self.config_dir {
                     let hsts = http_state.hsts_list.read();
                     servo_base::write_json_to_file(&*hsts, config_dir, "hsts_list.json");
                 }

@@ -27,6 +27,7 @@ async-recursion = { workspace = true }
 async-tungstenite = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 content-security-policy = { workspace = true }
 cookie = { workspace = true }
@@ -36,6 +37,7 @@ devtools_traits = { workspace = true }
 embedder_traits = { workspace = true }
 fst = { workspace = true }
 fonts = { workspace = true }
+fs4 = { workspace = true }
 futures = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
@@ -49,6 +51,7 @@ hyper_serde = { workspace = true }
 imsz = { workspace = true }
 ipc-channel = { workspace = true }
 itertools = { workspace = true }
+keyring = { workspace = true }
 log = { workspace = true }
 malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
@@ -79,6 +82,7 @@ servo-url = { workspace = true }
 servo_arc = { workspace = true }
 sea-query = { workspace = true }
 sea-query-rusqlite = { workspace = true }
+serde_json = { workspace = true }
 smallvec = { workspace = true }
 tempfile = { workspace = true }
 time = { workspace = true }
@@ -111,3 +115,8 @@ workspace = true
 [[test]]
 name = "main"
 path = "tests/main.rs"
+
+[[test]]
+name = "session_persistence"
+path = "tests/session_persistence.rs"
+required-features = ["test-util"]

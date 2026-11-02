@@ -4,7 +4,6 @@
 
 use std::collections::HashSet;
 use std::iter::FromIterator;
-use std::path::PathBuf;
 use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -97,6 +96,7 @@ use crate::http_cache::{
     invalidate_cached_resources, refresh,
 };
 use crate::resource_thread::{AuthCache, AuthCacheEntry};
+use crate::session_persistence::{SessionFile, SessionPersistence};
 use crate::websocket_loader::start_websocket;
 
 /// The various states an entry of the HttpCache can be in.
@@ -119,8 +119,8 @@ pub struct HttpState {
     pub client: ServoClient,
     pub override_manager: CertificateErrorOverrideManager,
     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
-    /// Cookie の保存先ディレクトリ。`None` の場合は保存しない（incognito 用）。
-    pub cookie_config_dir: Option<PathBuf>,
+    /// Cookie の暗号化永続化。無効な場合は保存しない（incognito 用）。
+    pub session_persistence: StdArc<SessionPersistence>,
     /// Cookie 保存の書き込みを直列化するロック。
     pub cookie_save_lock: Mutex<()>,
 }
@@ -133,15 +133,22 @@ impl HttpState {
     /// 書き込みは [`HttpState::cookie_save_lock`] で直列化する。
     /// jar の read ロックを保持したまま書くのは、書き込み中に別スレッドが
     /// 変更して中途半端な内容を書かないようにするためである。
+    /// 永続化が無効な場合は何もしない。無効化の理由は起動時に警告済みのため、
+    /// ここでは警告せず、保存のたびのログにもしない。
     pub fn save_cookies(&self) {
-        let Some(config_dir) = self.cookie_config_dir.as_deref() else {
+        if !self
+            .session_persistence
+            .is_enabled(SessionFile::Cookies)
+        {
             return;
-        };
+        }
         // 保存中に他の保存が割り込まないよう直列化する。
         let _guard = self.cookie_save_lock.lock();
         // 書き込み中に jar が変更されないよう read ロックを保持したまま書く。
         let jar = self.cookie_jar.read();
-        if let Err(error) = servo_base::try_write_json_to_file(&*jar, config_dir, "cookie_jar.json")
+        if let Err(error) = self
+            .session_persistence
+            .write(SessionFile::Cookies, &*jar)
         {
             warn!("Cookie を保存できない: {error}");
         }

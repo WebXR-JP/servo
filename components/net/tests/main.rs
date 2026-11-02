@@ -123,7 +123,7 @@ fn create_http_state(fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>) -> Http
         )),
         override_manager,
         embedder_proxy: fc.unwrap_or_else(|| create_generic_embedder_proxy()),
-        cookie_config_dir: None,
+        session_persistence: Arc::new(net::session_persistence::SessionPersistence::disabled()),
         cookie_save_lock: Mutex::new(()),
     }
 }
