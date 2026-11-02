@@ -117,6 +117,8 @@ use crate::webview_delegate::{
 
 #[cfg(feature = "media-gstreamer")]
 mod media_platform {
+    use std::path::PathBuf;
+
     use servo_media_gstreamer::GStreamerBackend;
 
     use super::ServoMedia;
@@ -134,9 +136,20 @@ mod media_platform {
             let plugin_list = crate::gstreamer_plugins::gstreamer_plugins();
             match GStreamerBackend::init_with_plugins(plugin_dir, &plugin_list) {
                 Ok(b) => b,
-                Err(e) => {
-                    log::error!("Error initializing GStreamer: {:?}", e);
-                    std::process::exit(1);
+                Err(error) => {
+                    // 配布物では exe の隣にプラグインを置くが、開発ビルドでは
+                    // 置かれていないことが多い。その場合はシステムの GStreamer
+                    // プラグイン（Homebrew など）へフォールバックする。
+                    log::warn!(
+                        "同梱の GStreamer プラグインを読めないため、システムの登録済みプラグインを使う: {error:?}"
+                    );
+                    match GStreamerBackend::init_with_plugins::<&str>(PathBuf::new(), &[]) {
+                        Ok(b) => b,
+                        Err(error) => {
+                            log::error!("Error initializing GStreamer: {error:?}");
+                            std::process::exit(1);
+                        },
+                    }
                 },
             }
         });

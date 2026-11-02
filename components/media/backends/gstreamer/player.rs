@@ -552,16 +552,53 @@ impl GStreamerPlayer {
             .map_err(|e| PlayerError::Backend(e.to_string()))?;
 
         if let Some(ref audio_renderer) = self.audio_renderer {
-            let audio_sink =
+            // `AudioRenderer` reads the samples as interleaved F32, but the format
+            // negotiated by the decoder depends on the container (for example WAV is
+            // usually S16LE). Convert and pin the caps before handing buffers to
+            // Servo; otherwise the bytes are reinterpreted as f32 and produce
+            // non-finite values (audible as loud noise).
+            let audio_sink_element =
                 gstreamer::ElementFactory::make("appsink")
                     .build()
                     .map_err(|error| {
                         PlayerError::Backend(format!("appsink creation failed: {error:?}"))
                     })?;
+            let convert = gstreamer::ElementFactory::make("audioconvert")
+                .build()
+                .map_err(|error| {
+                    PlayerError::Backend(format!("audioconvert creation failed: {error:?}"))
+                })?;
+            let capsfilter = gstreamer::ElementFactory::make("capsfilter")
+                .build()
+                .map_err(|error| {
+                    PlayerError::Backend(format!("capsfilter creation failed: {error:?}"))
+                })?;
+            let caps = gstreamer::Caps::builder("audio/x-raw")
+                .field("format", "F32LE")
+                .field("layout", "interleaved")
+                .build();
+            capsfilter.set_property("caps", &caps);
 
-            pipeline.set_property("audio-sink", &audio_sink);
+            let audio_bin = gstreamer::Bin::new();
+            audio_bin
+                .add_many([&convert, &capsfilter, &audio_sink_element])
+                .map_err(|error| PlayerError::Backend(error.to_string()))?;
+            gstreamer::Element::link_many([&convert, &capsfilter, &audio_sink_element])
+                .map_err(|error| PlayerError::Backend(error.to_string()))?;
+            let sink_pad = convert.static_pad("sink").ok_or_else(|| {
+                PlayerError::Backend(String::from("audioconvert has no sink pad"))
+            })?;
+            let ghost_pad = gstreamer::GhostPad::with_target(&sink_pad)
+                .map_err(|error| PlayerError::Backend(error.to_string()))?;
+            audio_bin
+                .add_pad(&ghost_pad)
+                .map_err(|error| PlayerError::Backend(error.to_string()))?;
 
-            let audio_sink = audio_sink.dynamic_cast::<gstreamer_app::AppSink>().unwrap();
+            pipeline.set_property("audio-sink", &audio_bin);
+
+            let audio_sink = audio_sink_element
+                .dynamic_cast::<gstreamer_app::AppSink>()
+                .map_err(|_| PlayerError::Backend(String::from("appsink downcast failed")))?;
 
             let weak_audio_renderer = Arc::downgrade(audio_renderer);
 
