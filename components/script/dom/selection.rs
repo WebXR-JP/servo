@@ -1585,6 +1585,13 @@ struct FlatTreeSelection<'no_gc> {
 }
 
 impl<'no_gc> FlatTreeSelection<'no_gc> {
+    /// Whether this selection is collapsed. A collapsed selection selects no content,
+    /// so like Chrome it must not paint replaced elements (canvas, img, ...) as selected.
+    /// (`UnrootedDom` equality compares the underlying pointer address.)
+    fn is_collapsed(&self) -> bool {
+        self.start.container == self.end.container && self.start.offset == self.end.offset
+    }
+
     /// Get the [`FlatTreeSelection`] for this [`Selection`], returning `None` if the [`Selection`]
     /// doesn't have a range or if that flat tree range is unrenderable (for instance, because one
     /// or both of the endpoints is not in the flat tree).
@@ -1804,8 +1811,13 @@ impl<'no_gc> VisibleSelectionFlagUpdate<'no_gc> {
                 flat_tree_selection.range_for_character_data(character_data)
             });
             self.set_character_data_selection(character_data, range);
-        } else if node.set_element_selection(flat_tree_selection.is_some()) {
-            self.needs_new_display_list = true;
+        } else {
+            // A collapsed selection selects no content, so like Chrome replaced elements
+            // must not be painted as selected. CharacterData keeps its existing behavior.
+            let selected = flat_tree_selection.is_some_and(|selection| !selection.is_collapsed());
+            if node.set_element_selection(selected) {
+                self.needs_new_display_list = true;
+            }
         }
     }
 

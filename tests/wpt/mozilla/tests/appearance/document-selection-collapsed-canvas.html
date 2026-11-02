@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Collapsed document selection should not show canvas as selected</title>
+    <link rel="match" href="document-selection-collapsed-canvas-ref.html">
+</head>
+
+<canvas id="target" width="100" height="100"></canvas>
+
+<script>
+    // Clicking a replaced element creates a collapsed selection inside it,
+    // but a collapsed selection selects nothing, so it must not be tinted.
+    const canvas = document.getElementById("target");
+    const context = canvas.getContext("2d");
+    context.fillStyle = "#c04020";
+    context.fillRect(0, 0, 100, 100);
+    document.getSelection().collapse(canvas, 0);
+</script>

@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Collapsed document selection should not show images as selected</title>
+    <link rel="match" href="document-selection-collapsed-image-ref.html">
+</head>
+
+<div id="target">
+    <!-- This data URL is a fully transparent image. -->
+    <img id="target-img" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" style="display: block; width: 100px; height: 100px; background: rgb(192, 64, 32);">
+</div>
+
+<script>
+    // Clicking a replaced element creates a collapsed selection inside it,
+    // but a collapsed selection selects nothing, so it must not be tinted.
+    document.getSelection().collapse(document.getElementById("target-img"), 0);
+</script>

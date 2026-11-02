@@ -299,8 +299,22 @@ impl<'dom> LayoutDom<'dom, Node> {
 
     pub(crate) fn replaced_is_selected(&self) -> bool {
         let unsafe_self = self.unsafe_get();
-        unsafe_self.get_flag(NodeFlags::OVERLAPS_DOCUMENT_SELECTION) &&
-            !unsafe_self.get_flag(NodeFlags::SELECTION_INHIBITED)
+        if !unsafe_self.get_flag(NodeFlags::OVERLAPS_DOCUMENT_SELECTION) ||
+            unsafe_self.get_flag(NodeFlags::SELECTION_INHIBITED)
+        {
+            return false;
+        }
+        // A collapsed selection selects no content, so like Chrome replaced elements
+        // such as canvas and img must not be painted with the selection tint. This
+        // mirrors the `None` cases of `selection_for_text_node` above, which also
+        // leaves the flags behind for caret painting of text.
+        let Some(selection) = self.owner_doc_for_layout().visible_selection_for_layout() else {
+            return false;
+        };
+        let Some(range) = selection.range_for_layout().as_ref() else {
+            return false;
+        };
+        !range.collapsed()
     }
 
     pub(crate) fn image_url(self) -> Option<ServoUrl> {
