@@ -897,6 +897,18 @@ impl WebGLRenderingContext {
         size: Size2D<u32>,
         source: TexSource,
     ) {
+        // DOM 画像由来の転送は `image_transfer_data_types()` に載っている
+        // (format, type) の組だけ送る。対象は `prepare_pixels()` の第 1 引数に
+        // 入る `internal_format` である。対応外は送らずに弾く。
+        if let TexSource::Pixels(ref pixels) = source {
+            if pixels.pixel_format().is_some() &&
+                !internal_format.image_transfer_data_types().contains(&data_type)
+            {
+                self.webgl_error(InvalidOperation);
+                return;
+            }
+        }
+
         // TexImage2D depth is always equal to 1.
         handle_potential_webgl_error!(
             self,
@@ -1003,6 +1015,16 @@ impl WebGLRenderingContext {
         let effective_data_type = self
             .extension_manager
             .effective_type(data_type.as_gl_constant());
+
+        // DOM 画像由来の転送は `image_transfer_data_types()` に載っている
+        // (format, type) の組だけ送る。対象は `prepare_pixels()` の第 1 引数に
+        // 入る `format` である。対応外は送らずに弾く。
+        if pixels.pixel_format().is_some() &&
+            !format.image_transfer_data_types().contains(&data_type)
+        {
+            self.webgl_error(InvalidOperation);
+            return;
+        }
 
         // TODO(emilio): convert colorspace if requested.
         self.send_command(WebGLCommand::TexSubImage2D {

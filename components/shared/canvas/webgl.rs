@@ -1406,6 +1406,70 @@ impl TexFormat {
     pub fn usable_as_internal(self) -> bool {
         !self.compatible_data_types().is_empty()
     }
+
+    pub fn image_transfer_data_types(self) -> &'static [TexDataType] {
+        // `webgl_thread` の `image_to_tex_image_data()` が変換できる組と
+        // 厳密に対応する。DOM 画像由来の転送可否の判定に使う。
+        match self {
+            TexFormat::RGBA => &[
+                TexDataType::UnsignedByte,
+                TexDataType::UnsignedShort4444,
+                TexDataType::UnsignedShort5551,
+                TexDataType::Float,
+                TexDataType::HalfFloat,
+            ][..],
+            TexFormat::RGBA8 => &[TexDataType::UnsignedByte][..],
+            TexFormat::RGBA32f => &[TexDataType::Float][..],
+            TexFormat::RGBA16f => &[TexDataType::HalfFloat][..],
+            TexFormat::RGB => &[
+                TexDataType::UnsignedByte,
+                TexDataType::UnsignedShort565,
+                TexDataType::Float,
+                TexDataType::HalfFloat,
+            ][..],
+            TexFormat::RGB8 => &[TexDataType::UnsignedByte][..],
+            TexFormat::RGB32f => &[TexDataType::Float][..],
+            TexFormat::RGB16f => &[TexDataType::HalfFloat][..],
+            TexFormat::Alpha => &[
+                TexDataType::UnsignedByte,
+                TexDataType::Float,
+                TexDataType::HalfFloat,
+            ][..],
+            TexFormat::Alpha32f => &[TexDataType::Float][..],
+            TexFormat::Alpha16f => &[TexDataType::HalfFloat][..],
+            TexFormat::Luminance => &[
+                TexDataType::UnsignedByte,
+                TexDataType::Float,
+                TexDataType::HalfFloat,
+            ][..],
+            TexFormat::Luminance32f => &[TexDataType::Float][..],
+            TexFormat::Luminance16f => &[TexDataType::HalfFloat][..],
+            TexFormat::LuminanceAlpha => &[
+                TexDataType::UnsignedByte,
+                TexDataType::Float,
+                TexDataType::HalfFloat,
+            ][..],
+            TexFormat::LuminanceAlpha32f => &[TexDataType::Float][..],
+            TexFormat::LuminanceAlpha16f => &[TexDataType::HalfFloat][..],
+            TexFormat::Red => &[
+                TexDataType::UnsignedByte,
+                TexDataType::Float,
+                TexDataType::HalfFloat,
+            ][..],
+            TexFormat::R8 => &[TexDataType::UnsignedByte][..],
+            TexFormat::R16f => &[TexDataType::Float, TexDataType::HalfFloat][..],
+            TexFormat::R32f => &[TexDataType::Float][..],
+            TexFormat::RG => &[
+                TexDataType::UnsignedByte,
+                TexDataType::Float,
+                TexDataType::HalfFloat,
+            ][..],
+            TexFormat::RG8 => &[TexDataType::UnsignedByte][..],
+            TexFormat::RG16f => &[TexDataType::Float, TexDataType::HalfFloat][..],
+            TexFormat::RG32f => &[TexDataType::Float][..],
+            _ => &[][..],
+        }
+    }
 }
 
 #[derive(PartialEq)]

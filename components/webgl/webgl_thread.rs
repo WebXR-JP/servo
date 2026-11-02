@@ -1684,7 +1684,7 @@ impl WebGLImpl {
                 pixel_format,
                 ref data,
             } => {
-                let pixels = prepare_pixels(
+                let Some(pixels) = prepare_pixels(
                     internal_format,
                     data_type,
                     size,
@@ -1693,7 +1693,9 @@ impl WebGLImpl {
                     y_axis_treatment,
                     pixel_format,
                     Cow::Borrowed(data),
-                );
+                ) else {
+                    return;
+                };
 
                 unsafe {
                     gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, unpacking_alignment as i32);
@@ -1725,7 +1727,7 @@ impl WebGLImpl {
                 pixel_format,
                 ref data,
             } => {
-                let pixels = prepare_pixels(
+                let Some(pixels) = prepare_pixels(
                     internal_format,
                     data_type,
                     size,
@@ -1734,7 +1736,9 @@ impl WebGLImpl {
                     y_axis_treatment,
                     pixel_format,
                     Cow::Borrowed(data),
-                );
+                ) else {
+                    return;
+                };
 
                 unsafe {
                     gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, unpacking_alignment as i32);
@@ -1790,7 +1794,7 @@ impl WebGLImpl {
                 pixel_format,
                 ref data,
             } => {
-                let pixels = prepare_pixels(
+                let Some(pixels) = prepare_pixels(
                     format,
                     data_type,
                     size,
@@ -1799,7 +1803,9 @@ impl WebGLImpl {
                     y_axis_treatment,
                     pixel_format,
                     Cow::Borrowed(data),
-                );
+                ) else {
+                    return;
+                };
 
                 unsafe {
                     gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, unpacking_alignment as i32);
@@ -2892,13 +2898,16 @@ fn prepare_pixels(
     y_axis_treatment: YAxisTreatment,
     pixel_format: Option<PixelFormat>,
     mut pixels: Cow<[u8]>,
-) -> Cow<[u8]> {
+) -> Option<Cow<[u8]>> {
     match alpha_treatment {
         Some(AlphaTreatment::Premultiply) => {
             if let Some(pixel_format) = pixel_format {
                 match pixel_format {
                     PixelFormat::BGRA8 | PixelFormat::RGBA8 => {},
-                    _ => unimplemented!("unsupported pixel format ({:?})", pixel_format),
+                    _ => {
+                        error!("unsupported pixel format ({:?})", pixel_format);
+                        return None;
+                    },
                 }
                 premultiply_inplace(TexFormat::RGBA, TexDataType::UnsignedByte, pixels.to_mut());
             } else {
@@ -2906,20 +2915,25 @@ fn prepare_pixels(
             }
         },
         Some(AlphaTreatment::Unmultiply) => {
-            assert!(pixel_format.is_some());
+            // Script 側は DOM 画像にだけ `Unmultiply` を付けるので、
+            // ここでは `pixel_format` が `Some` のはず。想定外は落とさず弾く。
+            if pixel_format.is_none() {
+                error!("unmultiply requested without pixel format");
+                return None;
+            }
             unmultiply_inplace::<false>(pixels.to_mut());
         },
         None => {},
     }
 
     if let Some(pixel_format) = pixel_format {
-        pixels = image_to_tex_image_data(
+        let converted = image_to_tex_image_data(
             pixel_format,
             internal_format,
             data_type,
             pixels.into_owned(),
-        )
-        .into();
+        )?;
+        pixels = converted.into();
     }
 
     if y_axis_treatment == YAxisTreatment::Flipped {
@@ -2935,7 +2949,7 @@ fn prepare_pixels(
         .into();
     }
 
-    pixels
+    Some(pixels)
 }
 
 /// Translates an image in rgba8 (red in the first byte) format to
@@ -2945,17 +2959,20 @@ fn image_to_tex_image_data(
     format: TexFormat,
     data_type: TexDataType,
     mut pixels: Vec<u8>,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     // hint for vector allocation sizing.
     let pixel_count = pixels.len() / 4;
 
     match pixel_format {
         PixelFormat::BGRA8 => pixels::rgba8_byte_swap_colors_inplace(&mut pixels),
         PixelFormat::RGBA8 => {},
-        _ => unimplemented!("unsupported pixel format ({:?})", pixel_format),
+        _ => {
+            error!("unsupported pixel format ({:?})", pixel_format);
+            return None;
+        },
     }
 
-    match (format, data_type) {
+    Some(match (format, data_type) {
         (TexFormat::RGBA, TexDataType::UnsignedByte) |
         (TexFormat::RGBA8, TexDataType::UnsignedByte) => pixels,
         (TexFormat::RGB, TexDataType::UnsignedByte) |
@@ -3220,11 +3237,16 @@ fn image_to_tex_image_data(
             pixels
         },
 
-        // Validation should have ensured that we only hit the
-        // above cases, but we haven't turned the (format, type)
-        // into an enum yet so there's a default case here.
-        _ => unreachable!("Unsupported formats {:?} {:?}", format, data_type),
-    }
+        // Script 側で未対応の組は送信前に弾く。すり抜けた場合は
+        // スレッドを落とさず GL コマンドを送らない。
+        _ => {
+            error!(
+                "unsupported (format, type) for DOM image upload: {:?} {:?}",
+                format, data_type
+            );
+            return None;
+        },
+    })
 }
 
 fn premultiply_inplace(format: TexFormat, data_type: TexDataType, pixels: &mut [u8]) {
@@ -3463,7 +3485,8 @@ mod tests {
             TexFormat::Red,
             TexDataType::UnsignedByte,
             two_pixels_rgba8(),
-        );
+        )
+        .expect("supported (format, type)");
         assert_eq!(red, vec![10, 50]);
 
         let r8 = image_to_tex_image_data(
@@ -3471,7 +3494,8 @@ mod tests {
             TexFormat::R8,
             TexDataType::UnsignedByte,
             two_pixels_rgba8(),
-        );
+        )
+        .expect("supported (format, type)");
         assert_eq!(r8, vec![10, 50]);
 
         let rg = image_to_tex_image_data(
@@ -3479,7 +3503,8 @@ mod tests {
             TexFormat::RG,
             TexDataType::UnsignedByte,
             two_pixels_rgba8(),
-        );
+        )
+        .expect("supported (format, type)");
         assert_eq!(rg, vec![10, 20, 50, 60]);
 
         let rg8 = image_to_tex_image_data(
@@ -3487,7 +3512,8 @@ mod tests {
             TexFormat::RG8,
             TexDataType::UnsignedByte,
             two_pixels_rgba8(),
-        );
+        )
+        .expect("supported (format, type)");
         assert_eq!(rg8, vec![10, 20, 50, 60]);
     }
 
@@ -3500,7 +3526,8 @@ mod tests {
             TexFormat::Red,
             TexDataType::UnsignedByte,
             vec![30, 20, 10, 40],
-        );
+        )
+        .expect("supported (format, type)");
         assert_eq!(red, vec![10]);
     }
 
@@ -3512,7 +3539,8 @@ mod tests {
             TexFormat::R32f,
             TexDataType::Float,
             two_pixels_rgba8(),
-        );
+        )
+        .expect("supported (format, type)");
         assert_eq!(red.len(), 2 * 4);
         let values = read_f32_le(&red);
         assert_eq!(values, vec![10.0 / 255.0, 50.0 / 255.0]);
@@ -3522,7 +3550,8 @@ mod tests {
             TexFormat::RG32f,
             TexDataType::Float,
             two_pixels_rgba8(),
-        );
+        )
+        .expect("supported (format, type)");
         assert_eq!(rg.len(), 2 * 8);
         let values = read_f32_le(&rg);
         assert_eq!(
@@ -3539,7 +3568,8 @@ mod tests {
             TexFormat::R16f,
             TexDataType::HalfFloat,
             two_pixels_rgba8(),
-        );
+        )
+        .expect("supported (format, type)");
         assert_eq!(red.len(), 2 * 2);
         let values = read_f16_le(&red);
         assert_eq!(
@@ -3552,7 +3582,8 @@ mod tests {
             TexFormat::RG16f,
             TexDataType::HalfFloat,
             two_pixels_rgba8(),
-        );
+        )
+        .expect("supported (format, type)");
         assert_eq!(rg.len(), 2 * 4);
         let values = read_f16_le(&rg);
         assert_eq!(
@@ -3564,5 +3595,150 @@ mod tests {
                 f16::from_f32(60.0),
             ]
         );
+    }
+
+    // 未対応の (format, type) では `None` を返し、panic しないことを確かめる。
+    #[test]
+    fn unsupported_image_transfer_returns_none() {
+        // `compatible_data_types()` には載っているが画像変換に無い組。
+        assert!(
+            image_to_tex_image_data(
+                PixelFormat::RGBA8,
+                TexFormat::RGB,
+                TexDataType::UnsignedShort5551,
+                two_pixels_rgba8(),
+            )
+            .is_none()
+        );
+        // sized 方向の未対応例。
+        assert!(
+            image_to_tex_image_data(
+                PixelFormat::RGBA8,
+                TexFormat::RGB565,
+                TexDataType::UnsignedByte,
+                two_pixels_rgba8(),
+            )
+            .is_none()
+        );
+        assert!(
+            image_to_tex_image_data(
+                PixelFormat::RGBA8,
+                TexFormat::R8,
+                TexDataType::Float,
+                two_pixels_rgba8(),
+            )
+            .is_none()
+        );
+    }
+
+    // 対応済みの組では `Some` が返ることを確かめる。
+    #[test]
+    fn supported_image_transfer_returns_some() {
+        for (format, data_type) in [
+            (TexFormat::RGBA, TexDataType::UnsignedByte),
+            (TexFormat::RGB, TexDataType::UnsignedByte),
+            (TexFormat::Red, TexDataType::UnsignedByte),
+            (TexFormat::RG, TexDataType::UnsignedByte),
+            (TexFormat::R8, TexDataType::UnsignedByte),
+            (TexFormat::RG8, TexDataType::UnsignedByte),
+            (TexFormat::Red, TexDataType::Float),
+            (TexFormat::RG, TexDataType::Float),
+            (TexFormat::R32f, TexDataType::Float),
+            (TexFormat::RG32f, TexDataType::Float),
+        ] {
+            assert!(
+                image_to_tex_image_data(
+                    PixelFormat::RGBA8,
+                    format,
+                    data_type,
+                    two_pixels_rgba8(),
+                )
+                .is_some(),
+                "expected Some for ({:?}, {:?})",
+                format,
+                data_type
+            );
+        }
+    }
+
+    // `image_transfer_data_types()` に載っている組は `Some` になり、
+    // 載っていない組は `None` になること。両者の同期崩れの検出用。
+    #[test]
+    fn image_transfer_data_types_matches_implementation() {
+        let formats = [
+            TexFormat::RGBA,
+            TexFormat::RGBA8,
+            TexFormat::RGBA32f,
+            TexFormat::RGBA16f,
+            TexFormat::RGB,
+            TexFormat::RGB8,
+            TexFormat::RGB32f,
+            TexFormat::RGB16f,
+            TexFormat::Alpha,
+            TexFormat::Alpha32f,
+            TexFormat::Alpha16f,
+            TexFormat::Luminance,
+            TexFormat::Luminance32f,
+            TexFormat::Luminance16f,
+            TexFormat::LuminanceAlpha,
+            TexFormat::LuminanceAlpha32f,
+            TexFormat::LuminanceAlpha16f,
+            TexFormat::Red,
+            TexFormat::R8,
+            TexFormat::R16f,
+            TexFormat::R32f,
+            TexFormat::RG,
+            TexFormat::RG8,
+            TexFormat::RG16f,
+            TexFormat::RG32f,
+            // 画像変換を持たない format の代表。空であることを確かめる。
+            TexFormat::R8SNorm,
+            TexFormat::RGB565,
+            TexFormat::DepthComponent,
+        ];
+        let data_types = [
+            TexDataType::Byte,
+            TexDataType::Int,
+            TexDataType::Short,
+            TexDataType::UnsignedByte,
+            TexDataType::UnsignedInt,
+            TexDataType::UnsignedInt10f11f11fRev,
+            TexDataType::UnsignedInt2101010Rev,
+            TexDataType::UnsignedInt5999Rev,
+            TexDataType::UnsignedInt248,
+            TexDataType::UnsignedShort,
+            TexDataType::UnsignedShort4444,
+            TexDataType::UnsignedShort5551,
+            TexDataType::UnsignedShort565,
+            TexDataType::Float,
+            TexDataType::HalfFloat,
+            TexDataType::Float32UnsignedInt248Rev,
+        ];
+        for format in formats {
+            let supported = format.image_transfer_data_types();
+            for data_type in data_types {
+                let result = image_to_tex_image_data(
+                    PixelFormat::RGBA8,
+                    format,
+                    data_type,
+                    two_pixels_rgba8(),
+                );
+                if supported.contains(&data_type) {
+                    assert!(
+                        result.is_some(),
+                        "expected Some for ({:?}, {:?})",
+                        format,
+                        data_type
+                    );
+                } else {
+                    assert!(
+                        result.is_none(),
+                        "expected None for ({:?}, {:?})",
+                        format,
+                        data_type
+                    );
+                }
+            }
+        }
     }
 }
