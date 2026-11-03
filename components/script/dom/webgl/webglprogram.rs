@@ -10,6 +10,7 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::cell::{DomRefCell, Ref};
 use script_bindings::reflector::reflect_dom_object;
+use script_bindings::script_runtime::runtime_is_alive;
 use script_bindings::weakref::WeakRef;
 use servo_base::text::Utf8CodeUnits;
 use servo_canvas_traits::webgl::{
@@ -110,18 +111,24 @@ impl DroppableWebGLProgram {
         Ok(shader)
     }
 
-    fn detach_shaders(&mut self) {
+    fn detach_shaders(&mut self, fallibility: Operation) {
         if let Some(ref mut shader) = self.fragment_shader {
             if let Some(root) = shader.root() {
                 root.decrement_attached_counter();
-                self.send_command(WebGLCommand::DetachShader(self.id, root.id()));
+                self.send_with_fallibility(
+                    WebGLCommand::DetachShader(self.id, root.id()),
+                    fallibility,
+                );
             }
             self.fragment_shader = None;
         }
         if let Some(ref mut shader) = self.vertex_shader {
             if let Some(root) = shader.root() {
                 root.decrement_attached_counter();
-                self.send_command(WebGLCommand::DetachShader(self.id, root.id()));
+                self.send_with_fallibility(
+                    WebGLCommand::DetachShader(self.id, root.id()),
+                    fallibility,
+                );
             }
             self.vertex_shader = None;
         }
@@ -151,24 +158,30 @@ impl DroppableWebGLProgram {
         self.marked_for_deletion = true;
         self.send_with_fallibility(WebGLCommand::DeleteProgram(self.id), operation_fallibility);
         if self.is_deleted() {
-            self.detach_shaders();
+            self.detach_shaders(operation_fallibility);
         }
     }
 
-    fn in_use(&mut self, value: bool) {
+    fn in_use(&mut self, value: bool, operation_fallibility: Operation) {
         if self.is_in_use == value {
             return;
         }
         self.is_in_use = value;
         if self.is_deleted() {
-            self.detach_shaders();
+            self.detach_shaders(operation_fallibility);
         }
     }
 }
 
 impl Drop for DroppableWebGLProgram {
     fn drop(&mut self) {
-        self.in_use(false);
+        // 実行時 teardown 中は finalize 順序が不定で、参照先の shader が既に
+        // 回収されている可能性がある。GL コンテキスト自体も破棄されるため、
+        // ここでの後始末は省略する。
+        if !runtime_is_alive() {
+            return;
+        }
+        self.in_use(false, Operation::Fallible);
         self.mark_for_deletion(Operation::Fallible);
     }
 }
@@ -251,23 +264,23 @@ impl WebGLProgram {
             operation_fallibility,
         );
         if self.is_deleted() {
-            self.detach_shaders();
+            self.detach_shaders(operation_fallibility);
         }
     }
 
-    pub(crate) fn in_use(&self, value: bool) {
+    pub(crate) fn in_use(&self, value: bool, operation_fallibility: Operation) {
         if self.is_in_use() == value {
             return;
         }
         self.set_is_in_use(value);
         if self.is_deleted() {
-            self.detach_shaders();
+            self.detach_shaders(operation_fallibility);
         }
     }
 
-    fn detach_shaders(&self) {
+    fn detach_shaders(&self, fallibility: Operation) {
         assert!(self.is_deleted());
-        self.droppable.borrow_mut().detach_shaders();
+        self.droppable.borrow_mut().detach_shaders(fallibility);
         if self.fragment_shader.get().is_some() {
             self.fragment_shader.set(None);
         }

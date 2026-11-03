@@ -2065,33 +2065,51 @@ impl CanvasContext for WebGLRenderingContext {
 
     fn resize(&self) {
         let size = self.size().cast();
-        let (sender, receiver) = webgl_channel().unwrap();
-        self.droppable
+        let Some((sender, receiver)) = webgl_channel() else {
+            error!("WebGL resize: WebGL チャネルを確保できないためリサイズを中断する");
+            return;
+        };
+        if self
+            .droppable
             .webgl_sender
             .send_resize(size, sender)
-            .unwrap();
+            .is_err()
+        {
+            warn!("WebGL resize: バックエンドへの送信に失敗したためリサイズを中断する");
+            return;
+        }
+
+        let resize_result = match receiver.recv() {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("WebGL resize: バックエンドが切断されたためリサイズを中断する");
+                return;
+            },
+        };
+        if let Err(msg) = resize_result {
+            error!("Error resizing WebGLContext: {}", msg);
+            return;
+        };
+
+        // バックエンド成功後に script 側の状態を更新する。失敗時に先に
+        // 更新すると script 側だけ新サイズになり不整合が残る。
         // FIXME(#21718) The backend is allowed to choose a size smaller than
         // what was requested
         self.size.set(size);
         self.reflector_
             .update_memory_size(self, size.cast::<usize>().area() * 4);
 
-        if let Err(msg) = receiver.recv().unwrap() {
-            error!("Error resizing WebGLContext: {}", msg);
-            return;
-        };
-
         // ClearColor needs to be restored because after a resize the GLContext is recreated
         // and the framebuffer is cleared using the default black transparent color.
         let color = self.current_clear_color.get();
-        self.send_command(WebGLCommand::ClearColor(color.0, color.1, color.2, color.3));
+        self.send_command_ignored(WebGLCommand::ClearColor(color.0, color.1, color.2, color.3));
 
         // WebGL Spec: Scissor rect must not change if the canvas is resized.
         // See: webgl/conformance-1.0.3/conformance/rendering/gl-scissor-canvas-dimensions.html
         // NativeContext handling library changes the scissor after a resize, so we need to reset the
         // default scissor when the canvas was created or the last scissor that the user set.
         let rect = self.current_scissor.get();
-        self.send_command(WebGLCommand::Scissor(rect.0, rect.1, rect.2, rect.3));
+        self.send_command_ignored(WebGLCommand::Scissor(rect.0, rect.1, rect.2, rect.3));
 
         // Bound texture must not change when the canvas is resized.
         // Right now surfman generates a new FBO and the bound texture is changed
@@ -2103,7 +2121,7 @@ impl CanvasContext for WebGLRenderingContext {
             .unwrap()
             .get()
         {
-            self.send_command(WebGLCommand::BindTexture(
+            self.send_command_ignored(WebGLCommand::BindTexture(
                 constants::TEXTURE_2D,
                 Some(texture.id()),
             ));
@@ -2114,7 +2132,7 @@ impl CanvasContext for WebGLRenderingContext {
         // Send a command to re-bind the framebuffer, if any.
         if let Some(fbo) = self.bound_draw_framebuffer.get() {
             let id = WebGLFramebufferBindingRequest::Explicit(fbo.id());
-            self.send_command(WebGLCommand::BindFramebuffer(constants::FRAMEBUFFER, id));
+            self.send_command_ignored(WebGLCommand::BindFramebuffer(constants::FRAMEBUFFER, id));
         }
     }
 
@@ -4479,10 +4497,12 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
             if program.is_in_use() {
                 return;
             }
-            program.in_use(true);
+            program.in_use(true, Operation::Infallible);
         }
         match self.current_program.get() {
-            Some(ref current) if program != Some(&**current) => current.in_use(false),
+            Some(ref current) if program != Some(&**current) => {
+                current.in_use(false, Operation::Infallible)
+            },
             _ => {},
         }
         self.send_command(WebGLCommand::UseProgram(program.map(|p| p.id())));
