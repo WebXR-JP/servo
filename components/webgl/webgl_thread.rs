@@ -870,7 +870,7 @@ impl WebGLThread {
             // surfman は残留 GL エラーを surface 作成失敗と誤判定するため、
             // surface を作り直す前に残留エラーを破棄して記録する。
             drain_pending_gl_errors(&data.gl, context_id, "swap_buffers");
-            // Ensure there are no pending GL errors from other parts of the pipeline.
+            // 残留 GL エラーは直前の drain で破棄済み。debug では念のため検査する。
             debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
             // Check to see if any of the current framebuffer bindings are the surface we're about
@@ -900,16 +900,17 @@ impl WebGLThread {
                     data.consecutive_swap_failures = 0;
                 },
                 // 既知の surface 作成失敗である。back buffer 交換前に失敗する
-                // ため、古い back buffer は有効で描画内容も残っている。古い表面の
-                // image を更新して renderer の待ちを解消し、次フレームで再試行する。
-                // フレームは捨てず、古い back buffer を提示する。
+                // ため既存 surface は残る。renderer は canvas image の更新を
+                // 待つので、external image を更新して待ちを解消し、次フレームで
+                // swap を再試行する。失敗フレームでどの surface が提示されるか
+                // （内容）は保証しない。
                 Err(surfman::Error::SurfaceCreationFailed(_)) => {
                     data.consecutive_swap_failures =
                         data.consecutive_swap_failures.saturating_add(1);
                     let failures = data.consecutive_swap_failures;
                     if failures == 1 || failures % 60 == 0 {
                         error!(
-                            "swap_buffers: surface 再作成に失敗したため古い back buffer を提示し再試行する \
+                            "swap_buffers: surface 再作成に失敗したため image を更新して次フレームで再試行する \
                              (context={context_id:?}, consecutive_failures={failures})"
                         );
                     }
