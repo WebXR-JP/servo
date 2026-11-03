@@ -2166,11 +2166,28 @@ impl CanvasContext for WebGLRenderingContext {
             sender,
         ));
         let (data, alpha_mode) = receiver.recv().unwrap();
+        // `glReadPixels` returns rows bottom-to-top, while `Snapshot` is
+        // top-to-bottom (the same orientation as a 2D canvas). Flip the rows
+        // so that a WebGL canvas used as a texture source (`texImage2D`,
+        // `texSubImage2D`) or as a `drawImage` source has the same
+        // orientation as in other browsers.
+        let mut data = data.to_vec();
+        let row_bytes = size.width as usize * 4;
+        let height = size.height as usize;
+        if row_bytes > 0 && height > 1 && data.len() >= row_bytes * height {
+            for y in 0..height / 2 {
+                let top = y * row_bytes;
+                let bottom = (height - 1 - y) * row_bytes;
+                for i in 0..row_bytes {
+                    data.swap(top + i, bottom + i);
+                }
+            }
+        }
         Some(Snapshot::from_vec(
             size.cast(),
             SnapshotPixelFormat::RGBA,
             alpha_mode,
-            data.to_vec(),
+            data,
         ))
     }
 
