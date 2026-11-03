@@ -2538,14 +2538,15 @@ impl HTMLMediaElement {
         let player_id = {
             let player_guard = player.lock().unwrap();
 
-            // We flag the media to enable download buffering when it's supposed to be big and
-            // that happens heuristically for videos with preload="auto" and audio that loops.
+            // 大きいと想定されるメディアで download buffering を有効化する。
+            // 動画かつ preload="auto" の場合に限る。loop する音声を含めると
+            // downloadbuffer 経路で GStreamer の assertion を踏むため対象外にする。
             let is_video = matches!(
                 self.media_type_id(),
                 HTMLMediaElementTypeId::HTMLVideoElement
             );
             let should_enable_download_buffering =
-                (is_video || self.Loop()) && self.Preload() == "auto";
+                is_video && self.Preload() == "auto";
             if let Err(error) =
                 player_guard.set_download_buffering_enabled(should_enable_download_buffering)
             {
