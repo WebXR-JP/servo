@@ -133,7 +133,17 @@ impl GstMediaDevices {
         if let Some(f) = f {
             let _ = self.monitor.remove_filter(f);
         }
-        match devices.front() {
+        // GStreamer の is-default を優先し、無ければ先頭を使う。
+        let selected = devices
+            .iter()
+            .find(|device| {
+                device
+                    .properties()
+                    .and_then(|properties| properties.get::<bool>("is-default").ok())
+                    .unwrap_or(false)
+            })
+            .or_else(|| devices.front());
+        match selected {
             Some(d) => {
                 let element = d.create_element(None).ok()?;
                 Some(GstMediaTrack { element })
