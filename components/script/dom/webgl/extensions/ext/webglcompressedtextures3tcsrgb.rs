@@ -37,7 +37,17 @@ impl WebGLExtension for WEBGLCompressedTextureS3TCSrgb {
     }
 
     fn is_supported(ext: &WebGLExtensions) -> bool {
-        ext.supports_gl_extension("GL_EXT_texture_compression_s3tc_srgb")
+        // 拡張文字列がある場合は従来どおり公開する。
+        // macOS のデスクトップ GL (GL 4.1) は拡張文字列に
+        // `GL_EXT_texture_compression_s3tc_srgb` を出さないが、
+        // sRGB S3TC の内部フォーマット (0x8C4C/0x8C4D/0x8C4F) を受け付ける。
+        // その環境では WebGL2 かつデスクトップ GL かつ S3TC 対応を条件に公開する。
+        // WebGL2 条件は `get_or_init_extension()` が `spec()` のバージョンを
+        // 見ないため、WebGL1 に露出させない目的で付ける。
+        ext.supports_gl_extension("GL_EXT_texture_compression_s3tc_srgb") ||
+            (ext.webgl_version() == WebGLVersion::WebGL2 &&
+                !ext.is_gles() &&
+                ext.supports_gl_extension("GL_EXT_texture_compression_s3tc"))
     }
 
     fn enable(ext: &WebGLExtensions) {

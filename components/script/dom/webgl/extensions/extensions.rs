@@ -482,6 +482,13 @@ impl WebGLExtensions {
     pub(crate) fn is_gles(&self) -> bool {
         self.api_type == GlType::Gles
     }
+
+    /// 拡張の対応判定で使う WebGL バージョンを返す。
+    /// `webgl_version` フィールドはバージョン別に公開可否を切り替える判定専用で、
+    /// 共通の `get_or_init_extension` / `get_supported_extensions` の判定は変えない。
+    pub(crate) fn webgl_version(&self) -> WebGLVersion {
+        self.webgl_version
+    }
 }
 
 // Helper structs
