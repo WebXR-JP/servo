@@ -2474,6 +2474,16 @@ pub(crate) fn bytes_from_chunk_jsval(
     cx: &mut JSContext,
     chunk: &RootedTraceableBox<Heap<JSVal>>,
 ) -> Result<Vec<u8>, Error> {
+    // 通常のストリームの chunk は `Uint8Array` である。`Vec::<u8>::from_jsval`
+    // は任意の iterable を受け付ける代わりに JS の iterator protocol を
+    // 1 バイトごとに呼ぶため、数十 MB の body では秒単位の停止になる。
+    // `Uint8Array` だけは view のバイト列を直接コピーする。
+    if let Ok(ConversionResult::Success(view)) =
+        js::typedarray::Uint8Array::from_jsval(cx, chunk.handle(), ())
+    {
+        return Ok(view.to_vec().unwrap_or_default());
+    }
+
     match Vec::<u8>::from_jsval(cx, chunk.handle(), ConversionBehavior::EnforceRange) {
         Ok(ConversionResult::Success(vec)) => Ok(vec),
         Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),
