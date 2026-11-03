@@ -82,6 +82,9 @@ pub(crate) struct GLContextData {
     /// The context should be removed, but the [`WebGLThread`] is currently waiting on
     /// WebRender to finish rendering to the context in order to delete it.
     marked_for_deletion: bool,
+    /// swap 直後の surface 再作成に連続で失敗した回数。復旧不能と判断した
+    /// コンテキストを描画対象から切り離すために使う。成功したら 0 に戻す。
+    consecutive_swap_failures: u32,
 }
 
 #[derive(Debug)]
@@ -271,6 +274,11 @@ pub(crate) struct WebGLThreadInit {
 
 // A size at which it should be safe to create GL contexts
 const SAFE_VIEWPORT_DIMS: [u32; 2] = [1024, 1024];
+
+// swap 直後の surface 再作成に何回連続で失敗したらそのコンテキストを
+// 描画対象から切り離すか。120 は 60fps で約 2 秒分であり、一時的な不調で
+// 即座に切り捨てず、復旧不能な破損を抱えたまま毎フレーム失敗し続けるのも避ける値である。
+const MAX_CONSECUTIVE_SWAP_FAILURES: u32 = 120;
 
 impl WebGLThread {
     /// Create a new instance of WebGLThread.
@@ -640,6 +648,7 @@ impl WebGLThread {
 
         if safe_size != size {
             debug!("Resizing swap chain from {:?} to {:?}", safe_size, size);
+            drain_pending_gl_errors(&gl, context_id, "create_webgl_context");
             swap_chain
                 .resize(&device, &mut ctx, size.to_i32())
                 .map_err(|err| format!("Failed to resize swap chain: {:?}", err))?;
@@ -698,6 +707,7 @@ impl WebGLThread {
                 state,
                 attributes,
                 marked_for_deletion: false,
+                consecutive_swap_failures: 0,
             },
         );
 
@@ -740,6 +750,7 @@ impl WebGLThread {
                 .requested_flags
                 .contains(ContextAttributeFlags::ALPHA);
             let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
+            drain_pending_gl_errors(&data.gl, context_id, "resize_webgl_context");
             swap_chain
                 .resize(&data.device, &mut data.ctx, size.to_i32())
                 .map_err(|err| format!("Failed to resize swap chain: {:?}", err))?;
@@ -857,6 +868,12 @@ impl WebGLThread {
                 .get_mut(&context_id)
                 .expect("Missing WebGL context");
 
+            // 復旧不能と判断済みのコンテキストは描画対象から切り離す。
+            // スレッド自体は生かし、他のコンテキストの提示を続ける。
+            if data.consecutive_swap_failures >= MAX_CONSECUTIVE_SWAP_FAILURES {
+                continue;
+            }
+
             // Ensure there are no pending GL errors from other parts of the pipeline.
             debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
@@ -872,18 +889,47 @@ impl WebGLThread {
                 .get(context_id)
                 .expect("Where's the swap chain?");
 
+            // surfman は残留 GL エラーを surface 作成失敗と誤判定するため、
+            // surface を作り直す直前に残留エラーを破棄する。
+            drain_pending_gl_errors(&data.gl, context_id, "swap_buffers");
             debug!("Swapping {:?}", context_id);
-            swap_chain
-                .swap_buffers(
-                    &data.device,
-                    &mut data.ctx,
-                    if data.attributes.preserve_drawing_buffer {
-                        PreserveBuffer::Yes(&data.gl)
-                    } else {
-                        PreserveBuffer::No
-                    },
-                )
-                .unwrap();
+            let swap_result = swap_chain.swap_buffers(
+                &data.device,
+                &mut data.ctx,
+                if data.attributes.preserve_drawing_buffer {
+                    PreserveBuffer::Yes(&data.gl)
+                } else {
+                    PreserveBuffer::No
+                },
+            );
+            match swap_result {
+                Ok(()) => {
+                    data.consecutive_swap_failures = 0;
+                },
+                // 旧 surface が残る安全な失敗であり、フレームを捨てて次回に備える。
+                // WebGL スレッドを落とさず、他のコンテキストの提示を続ける。
+                Err(surfman::Error::SurfaceCreationFailed(_)) => {
+                    data.consecutive_swap_failures =
+                        data.consecutive_swap_failures.saturating_add(1);
+                    let failures = data.consecutive_swap_failures;
+                    if failures == 1 || failures % 60 == 0 {
+                        error!(
+                            "swap_buffers: surface 再作成に失敗したためフレームを破棄する \
+                             (context={context_id:?}, consecutive_failures={failures})"
+                        );
+                    }
+                    continue;
+                },
+                // 失敗段階が不明であり、状態が壊れている可能性があるため切り離す。
+                Err(other) => {
+                    error!(
+                        "swap_buffers: 予期しない失敗のためコンテキストを切り離す \
+                         (context={context_id:?}, error={other:?})"
+                    );
+                    data.consecutive_swap_failures = MAX_CONSECUTIVE_SWAP_FAILURES;
+                    continue;
+                },
+            }
             debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
             if !data.attributes.preserve_drawing_buffer {
@@ -893,27 +939,45 @@ impl WebGLThread {
                     .requested_flags
                     .contains(ContextAttributeFlags::ALPHA);
                 let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
-                swap_chain
-                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
-                    .unwrap();
+                if let Err(err) =
+                    swap_chain.clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
+                {
+                    error!(
+                        "swap_buffers: clear_surface に失敗した (context={context_id:?}, error={err:?})"
+                    );
+                }
                 debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
             }
 
             // Rebind framebuffers as appropriate.
+            // swap 成功時は clear 成否にかかわらず必ず復元する。復元しないと
+            // 破棄済みの FBO が束縛されたまま残る。
             debug!("Rebinding {:?}", context_id);
             framebuffer_rebinding_info.apply(&data.device, &data.ctx, &data.gl);
             debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
+            let surface_info = match data.device.context_surface_info(&data.ctx) {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    warn!(
+                        "swap_buffers: surface 情報が無いためフレームを破棄する (context={context_id:?})"
+                    );
+                    continue;
+                },
+                Err(err) => {
+                    warn!(
+                        "swap_buffers: surface 情報の取得に失敗したためフレームを破棄する \
+                         (context={context_id:?}, error={err:?})"
+                    );
+                    continue;
+                },
+            };
             let SurfaceInfo {
                 size,
                 framebuffer_object,
                 id,
                 ..
-            } = data
-                .device
-                .context_surface_info(&data.ctx)
-                .unwrap()
-                .unwrap();
+            } = surface_info;
             debug!(
                 "... rebound framebuffer {:?}, new back buffer surface is {:?}",
                 framebuffer_object, id
@@ -3313,6 +3377,25 @@ fn flip_pixels_y(
     }
 
     flipped
+}
+
+/// surfman の `create_surface` は作成前から残っている GL エラーを surface 作成
+/// 失敗と誤判定する。surface を作り直す直前に残留エラーを破棄し、内容を記録する。
+fn drain_pending_gl_errors(gl: &glow::Context, context_id: WebGLContextId, phase: &str) {
+    let mut count = 0u32;
+    loop {
+        let error = unsafe { gl.get_error() };
+        if error == gl::NO_ERROR {
+            break;
+        }
+        count += 1;
+        if count <= 8 {
+            warn!("{phase}: 残留 GL エラー {error:#x} を破棄 (context={context_id:?})");
+        }
+    }
+    if count > 8 {
+        warn!("{phase}: 残留 GL エラーを {count} 件破棄 (context={context_id:?})");
+    }
 }
 
 // Clamp a size to the current GL context's max viewport
