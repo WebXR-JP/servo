@@ -899,18 +899,48 @@ impl WebGLThread {
                 Ok(()) => {
                     data.consecutive_swap_failures = 0;
                 },
-                // 既知の surface 作成失敗であり、フレームを捨てて次フレームで
-                // 再試行する。ログはレート制限し、成功するまで毎フレーム試す。
+                // 既知の surface 作成失敗である。back buffer 交換前に失敗する
+                // ため、古い back buffer は有効で描画内容も残っている。古い表面の
+                // image を更新して renderer の待ちを解消し、次フレームで再試行する。
+                // フレームは捨てず、古い back buffer を提示する。
                 Err(surfman::Error::SurfaceCreationFailed(_)) => {
                     data.consecutive_swap_failures =
                         data.consecutive_swap_failures.saturating_add(1);
                     let failures = data.consecutive_swap_failures;
                     if failures == 1 || failures % 60 == 0 {
                         error!(
-                            "swap_buffers: surface 再作成に失敗したためフレームを破棄し再試行する \
+                            "swap_buffers: surface 再作成に失敗したため古い back buffer を提示し再試行する \
                              (context={context_id:?}, consecutive_failures={failures})"
                         );
                     }
+                    let old_surface = match data.device.context_surface_info(&data.ctx) {
+                        Ok(Some(info)) => info,
+                        Ok(None) => {
+                            warn!(
+                                "swap_buffers: surface 情報が無いため image を更新せず再試行を待つ \
+                                 (context={context_id:?})"
+                            );
+                            continue;
+                        },
+                        Err(err) => {
+                            warn!(
+                                "swap_buffers: surface 情報の取得に失敗したため image を更新せず再試行を待つ \
+                                 (context={context_id:?}, error={err:?})"
+                            );
+                            continue;
+                        },
+                    };
+                    let size = old_surface.size;
+                    let has_alpha = data
+                        .state
+                        .requested_flags
+                        .contains(ContextAttributeFlags::ALPHA);
+                    self.update_webrender_image_for_context(
+                        context_id,
+                        size,
+                        has_alpha,
+                        canvas_epoch,
+                    );
                     continue;
                 },
                 // 未知の失敗は状態が不明なため、従来どおり明示的に失敗停止する。
