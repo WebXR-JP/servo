@@ -910,6 +910,8 @@ impl WebGLRenderingContext {
         }
 
         // TexImage2D depth is always equal to 1.
+        // WebGL2 の sized internalformat を保存し、深度テクスチャの FBO 完全性判定と一致させる。
+        // WebGL1 では format==internal_format なので従来通り。
         handle_potential_webgl_error!(
             self,
             texture.initialize(
@@ -917,7 +919,7 @@ impl WebGLRenderingContext {
                 size.width,
                 size.height,
                 1,
-                format,
+                internal_format,
                 level,
                 Some(data_type)
             )

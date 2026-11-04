@@ -36,9 +36,12 @@ impl WebGLExtension for EXTColorBufferFloat {
     }
 
     fn is_supported(ext: &WebGLExtensions) -> bool {
-        // ANGLE が広告する拡張名で判定する。
-        // 対象名は実機ログ（Meta XR Simulator 経由の ANGLE）で確認したものに限定する。
-        ext.supports_gl_extension("GL_EXT_color_buffer_float")
+        // GLES/ANGLE は拡張文字列、デスクトップ GL は WebGL2 で float color buffer を利用できるため公開する。
+        // macOS の GL 4.1 でも Chrome は公開している。XRift の HalfFloat 出力（MSAA 含む）に必要。
+        if ext.supports_gl_extension("GL_EXT_color_buffer_float") {
+            return true;
+        }
+        ext.webgl_version() == WebGLVersion::WebGL2 && !ext.is_gles()
     }
 
     // 有効化時の登録は不要である。浮動小数点形式の扱いは

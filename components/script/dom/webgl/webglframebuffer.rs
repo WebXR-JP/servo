@@ -288,18 +288,42 @@ impl WebGLFramebuffer {
         if self.check_status() != constants::FRAMEBUFFER_COMPLETE {
             return Err(WebGLError::InvalidFramebufferOperation);
         }
-        let color = match self.attachment(constants::COLOR_ATTACHMENT0) {
-            Some(WebGLFramebufferAttachmentRoot::Renderbuffer(rb)) => Some(rb.internal_format()),
-            _ => None,
-        };
-        let depth = match self.attachment(constants::DEPTH_ATTACHMENT) {
-            Some(WebGLFramebufferAttachmentRoot::Renderbuffer(rb)) => Some(rb.internal_format()),
-            _ => None,
-        };
-        let stencil = match self.attachment(constants::STENCIL_ATTACHMENT) {
-            Some(WebGLFramebufferAttachmentRoot::Renderbuffer(rb)) => Some(rb.internal_format()),
-            _ => None,
-        };
+        fn format_of(attachment: &Option<WebGLFramebufferAttachment>) -> Option<u32> {
+            match attachment {
+                Some(WebGLFramebufferAttachment::Renderbuffer(rb)) => Some(rb.internal_format()),
+                Some(WebGLFramebufferAttachment::Texture { texture, level }) => {
+                    if *level < 0 {
+                        return None;
+                    }
+                    texture
+                        .image_info_at_face(0, *level as u32)
+                        .map(|info| info.internal_format().as_gl_constant())
+                },
+                None => None,
+            }
+        }
+        let color = self
+            .attachment_binding(constants::COLOR_ATTACHMENT0)
+            .and_then(|binding| format_of(&binding.borrow()));
+        let mut depth = self
+            .attachment_binding(constants::DEPTH_ATTACHMENT)
+            .and_then(|binding| format_of(&binding.borrow()));
+        let mut stencil = self
+            .attachment_binding(constants::STENCIL_ATTACHMENT)
+            .and_then(|binding| format_of(&binding.borrow()));
+        // WebGL2 では DEPTH_STENCIL_ATTACHMENT が DEPTH/STENCIL 両方の別名になるため、
+        // 未設定側だけその形式で補う。
+        if self.webgl_version == WebGLVersion::WebGL2 && (depth.is_none() || stencil.is_none()) {
+            if let Some(binding) = self.attachment_binding(constants::DEPTH_STENCIL_ATTACHMENT) {
+                let depth_stencil = format_of(&binding.borrow());
+                if depth.is_none() {
+                    depth = depth_stencil;
+                }
+                if stencil.is_none() {
+                    stencil = depth_stencil;
+                }
+            }
+        }
         Ok((color, depth, stencil))
     }
 
@@ -413,7 +437,7 @@ impl WebGLFramebuffer {
         let webgl2_attachment_constraints = &[
             &[constants::DEPTH_STENCIL][..],
             &[constants::DEPTH_STENCIL][..],
-            &[][..],
+            &[constants::DEPTH24_STENCIL8, constants::DEPTH32F_STENCIL8][..],
         ];
         let empty_attachment_constrains = &[&[][..], &[][..], &[][..]];
         let extra_attachment_constraints = match self.webgl_version {

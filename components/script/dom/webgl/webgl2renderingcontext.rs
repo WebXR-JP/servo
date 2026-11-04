@@ -268,24 +268,34 @@ impl WebGL2RenderingContext {
             Some(program) => program,
             None => return,
         };
-        let groups = [
-            [
+        // 行列属性の base type は FLOAT。three.js の instanceMatrix（FLOAT_MAT4）を InvalidOperation にしないため。
+        let groups: [&[u32]; 3] = [
+            &[
                 constants::INT,
                 constants::INT_VEC2,
                 constants::INT_VEC3,
                 constants::INT_VEC4,
             ],
-            [
+            &[
                 constants::UNSIGNED_INT,
                 constants::UNSIGNED_INT_VEC2,
                 constants::UNSIGNED_INT_VEC3,
                 constants::UNSIGNED_INT_VEC4,
             ],
-            [
+            &[
                 constants::FLOAT,
                 constants::FLOAT_VEC2,
                 constants::FLOAT_VEC3,
                 constants::FLOAT_VEC4,
+                constants::FLOAT_MAT2,
+                constants::FLOAT_MAT3,
+                constants::FLOAT_MAT4,
+                constants::FLOAT_MAT2x3,
+                constants::FLOAT_MAT2x4,
+                constants::FLOAT_MAT3x2,
+                constants::FLOAT_MAT3x4,
+                constants::FLOAT_MAT4x2,
+                constants::FLOAT_MAT4x3,
             ],
         ];
         let vao = self.current_vao(cx);
