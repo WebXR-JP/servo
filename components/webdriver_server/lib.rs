@@ -17,7 +17,7 @@ use std::borrow::ToOwned;
 use std::cell::LazyCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::{env, fmt, process, thread};
@@ -140,12 +140,25 @@ pub fn start_server(
     event_loop_waker: Box<dyn EventLoopWaker>,
     default_preferences: Preferences,
 ) {
+    start_server_on(
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port),
+        embedder_sender,
+        event_loop_waker,
+        default_preferences,
+    );
+}
+
+pub fn start_server_on(
+    address: SocketAddrV4,
+    embedder_sender: Sender<WebDriverCommandMsg>,
+    event_loop_waker: Box<dyn EventLoopWaker>,
+    default_preferences: Preferences,
+) {
     let handler = Handler::new(embedder_sender, event_loop_waker, default_preferences);
 
     thread::Builder::new()
         .name("WebDriverHttpServer".to_owned())
         .spawn(move || {
-            let address = SocketAddrV4::new("0.0.0.0".parse().unwrap(), port);
             match webdriver::server::start(
                 SocketAddr::V4(address),
                 vec![],

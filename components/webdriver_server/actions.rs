@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use embedder_traits::{
     InputEvent, KeyboardEvent, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, TouchEvent,
     TouchEventType, TouchId, TouchPointerType, WebDriverCommandMsg, WebDriverScriptCommand,
-    WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    WebViewPoint, WebViewVector, WheelDelta, WheelEvent, WheelMode,
 };
-use euclid::Point2D;
+use euclid::{Point2D, Vector2D};
 use keyboard_types::webdriver::KeyInputState;
 use log::info;
 use rustc_hash::FxHashSet;
@@ -706,7 +706,11 @@ impl Handler {
             // this will always produce events including at least a pointerMove event.
             match subtype {
                 PointerType::Mouse => {
-                    let input_event = InputEvent::MouseMove(MouseMoveEvent::new(point));
+                    let dx = (x - *current_x) as f32;
+                    let dy = (y - *current_y) as f32;
+                    let movement = WebViewVector::Page(Vector2D::new(dx, dy));
+                    let input_event =
+                        InputEvent::MouseMove(MouseMoveEvent::new_with_movement(point, movement));
                     self.send_blocking_input_event_to_embedder(input_event);
                 },
                 // In the case where the pointerType is "pen" or "touch", and buttons is empty,
