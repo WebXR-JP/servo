@@ -3,8 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel};
-#[cfg(test)]
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, channel};
 use std::time::Duration;
 
 use byte_slice_cast::*;
@@ -17,6 +16,100 @@ use servo_media_streams::registry::{MediaStreamId, get_stream, stop_stream, unre
 
 use crate::media_stream::GStreamerMediaStream;
 
+// audiobuffersplit は既定 strict-buffer-size=false のため、EOS などで 128 フレームに
+// 満たない端数バッファを流す。そのまま Block::for_vec に渡すと 128 の倍数前提の
+// assertion で panic するため、ここで 128 フレーム分が溜まるまで蓄積する。
+struct BlockAssembler {
+    channels: Option<usize>,
+    pending: Vec<f32>,
+    blocks: Vec<Block>,
+}
+
+impl BlockAssembler {
+    fn new() -> Self {
+        Self {
+            channels: None,
+            pending: Vec::new(),
+            blocks: Vec::new(),
+        }
+    }
+
+    /// 受け取ったサンプルを蓄積し、完成した 128 フレームのブロックを返す。
+    /// 端数は次回に繰り越す。
+    fn push(&mut self, samples: &[f32], channels: usize) -> std::vec::Drain<'_, Block> {
+        self.blocks.clear();
+        if channels == 0 || channels > u8::MAX as usize {
+            self.pending.clear();
+            return self.blocks.drain(..);
+        }
+        if self.channels != Some(channels) {
+            self.pending.clear();
+            self.channels = Some(channels);
+        }
+        self.pending.extend_from_slice(samples);
+        let block_len = FRAMES_PER_BLOCK_USIZE * channels;
+        while self.pending.len() >= block_len {
+            let remainder = self.pending.split_off(block_len);
+            let samples = std::mem::replace(&mut self.pending, remainder);
+            self.blocks.push(Block::for_vec(samples));
+        }
+        self.blocks.drain(..)
+    }
+}
+
+/// 音声ブロックの受信。データが途切れたらブロックせず None を返す。
+struct BlockReceiver {
+    starved: AtomicBool,
+    label: String,
+}
+
+impl BlockReceiver {
+    fn new(label: String) -> Self {
+        Self {
+            starved: AtomicBool::new(false),
+            label,
+        }
+    }
+
+    /// 次のブロックを待つ。一定時間データが来なければ None を返し、
+    /// 以降はデータが戻るまで待たずに None を返し続ける。
+    fn recv(&self, rx: &Receiver<Block>) -> Option<Block> {
+        // タイムアウト値を毎回待つとグラフ全体が 20ms/ブロックに絞られてしまうため、
+        // 一度途切れたらデータが戻るまでブロックしない。
+        const PULL_TIMEOUT: Duration = Duration::from_millis(20);
+        // 一度途切れたら、データが戻るまでブロックしない。ブロックしたままレンダースレッドを
+        // 止めると、createMediaStreamSource を同期で待つページのJSスレッドまで固まる。
+        if self.starved.load(Ordering::Acquire) {
+            return match rx.try_recv() {
+                Ok(block) => {
+                    self.starved.store(false, Ordering::Release);
+                    log::info!("音声ストリーム {} のデータが戻った", self.label);
+                    Some(block)
+                },
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => None,
+            };
+        }
+        match rx.recv_timeout(PULL_TIMEOUT) {
+            Ok(block) => Some(block),
+            Err(RecvTimeoutError::Timeout) => {
+                self.starved.store(true, Ordering::Release);
+                log::warn!(
+                    "音声ストリーム {} が {} ms データを出さないため無音で埋める",
+                    self.label,
+                    PULL_TIMEOUT.as_millis()
+                );
+                None
+            },
+            Err(RecvTimeoutError::Disconnected) => {
+                self.starved.store(true, Ordering::Release);
+                log::warn!("音声ストリーム {} が終了した", self.label);
+                None
+            },
+        }
+    }
+}
+
 pub struct GStreamerAudioStreamReader {
     rx: Receiver<Block>,
     pipeline: gstreamer::Pipeline,
@@ -25,6 +118,7 @@ pub struct GStreamerAudioStreamReader {
     reader_stream: Option<MediaStreamId>,
     owns_pipeline: bool,
     stopped: AtomicBool,
+    receiver: BlockReceiver,
 }
 
 struct ReaderBranchGuard {
@@ -161,12 +255,20 @@ impl GStreamerAudioStreamReader {
         for e in &elements {
             e.sync_state_with_parent().map_err(|e| e.to_string())?;
         }
+        let mut assembler = BlockAssembler::new();
         appsink.set_callbacks(
             gstreamer_app::AppSinkCallbacks::builder()
                 .new_sample(move |appsink| {
                     let sample = appsink
                         .pull_sample()
                         .map_err(|_| gstreamer::FlowError::Eos)?;
+                    let channels = sample
+                        .caps()
+                        .and_then(|caps| gstreamer_audio::AudioInfo::from_caps(caps).ok())
+                        .map(|info| info.channels() as usize);
+                    let Some(channels) = channels else {
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
                     let buffer = sample.buffer_owned().ok_or(gstreamer::FlowError::Error)?;
 
                     let buffer = buffer
@@ -177,13 +279,21 @@ impl GStreamerAudioStreamReader {
                         .as_slice_of::<f32>()
                         .map_err(|_| gstreamer::FlowError::Error)?;
 
-                    let block = Block::for_vec(floatref.into());
-                    tx.send(block).map_err(|_| gstreamer::FlowError::Error)?;
+                    for block in assembler.push(floatref, channels) {
+                        tx.send(block).map_err(|_| gstreamer::FlowError::Error)?;
+                    }
                     Ok(gstreamer::FlowSuccess::Ok)
                 })
                 .build(),
         );
         let reader_stream = branch_guard.map(ReaderBranchGuard::keep);
+        let stream_label = format!("{}", stream.id());
+        log::info!(
+            "音声 reader を開始: stream={} rate={} 独立pipeline={}",
+            stream_label,
+            sample_rate,
+            owns_pipeline
+        );
         Ok(Self {
             rx,
             pipeline,
@@ -195,6 +305,7 @@ impl GStreamerAudioStreamReader {
             reader_stream,
             owns_pipeline,
             stopped: AtomicBool::new(false),
+            receiver: BlockReceiver::new(stream_label),
         })
     }
 }
@@ -236,8 +347,8 @@ impl Drop for GStreamerAudioStreamReader {
 }
 
 impl AudioStreamReader for GStreamerAudioStreamReader {
-    fn pull(&self) -> Block {
-        self.rx.recv().unwrap()
+    fn pull(&self) -> Option<Block> {
+        self.receiver.recv(&self.rx)
     }
 
     fn start(&self) {
@@ -353,5 +464,118 @@ mod tests {
             "reader の停止が既存 pipeline を止めない"
         );
         assert!(reader_branch_unregistered, "reader 用 track 枝を破棄する");
+    }
+}
+
+#[cfg(test)]
+mod block_assembler_tests {
+    use super::*;
+
+    #[test]
+    fn push_full_block_for_two_channels() {
+        let mut assembler = BlockAssembler::new();
+        let samples = vec![0.5; FRAMES_PER_BLOCK_USIZE * 2];
+        let blocks: Vec<_> = assembler.push(&samples, 2).collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].data_chan(0).len(), FRAMES_PER_BLOCK_USIZE);
+        assert_eq!(blocks[0].data_chan(1).len(), FRAMES_PER_BLOCK_USIZE);
+        assert_eq!(blocks[0].chan_count(), 2);
+    }
+
+    #[test]
+    fn push_carries_over_remainder() {
+        let mut assembler = BlockAssembler::new();
+        let first = vec![1.0; 300];
+        assert_eq!(assembler.push(&first, 2).len(), 1);
+        let second = vec![2.0; 212];
+        let blocks: Vec<_> = assembler.push(&second, 2).collect();
+        assert_eq!(blocks.len(), 1);
+        // 300 + 212 = 512 = 2 ブロック分が端数の繰り越しで完成する。
+        // 2 ブロック目は前回の端数 44 (1.0) と今回の 212 (2.0) の継ぎ目を含む。
+        let chan0 = blocks[0].data_chan(0);
+        assert!(chan0.contains(&1.0));
+        assert!(chan0.contains(&2.0));
+    }
+
+    #[test]
+    fn push_discards_pending_on_channel_change() {
+        let mut assembler = BlockAssembler::new();
+        // 2ch で端数 100 を溜める。
+        assert_eq!(assembler.push(&vec![1.0; 100], 2).len(), 0);
+        // 1ch に変わると端数は破棄され、1ch 基準でブロックが作られる。
+        let blocks: Vec<_> = assembler
+            .push(&vec![2.0; FRAMES_PER_BLOCK_USIZE], 1)
+            .collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].chan_count(), 1);
+        assert!(blocks[0].data_chan(0).iter().all(|&s| s == 2.0));
+    }
+
+    #[test]
+    fn push_with_zero_channels_does_not_panic_and_recovers() {
+        let mut assembler = BlockAssembler::new();
+        assert_eq!(assembler.push(&vec![1.0; 256], 0).len(), 0);
+        let blocks: Vec<_> = assembler
+            .push(&vec![1.0; FRAMES_PER_BLOCK_USIZE * 2], 2)
+            .collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].chan_count(), 2);
+    }
+
+    #[test]
+    fn push_below_one_block_returns_nothing() {
+        let mut assembler = BlockAssembler::new();
+        assert_eq!(assembler.push(&vec![1.0; 100], 2).len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod block_receiver_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    #[test]
+    fn empty_channel_returns_none_and_becomes_starved() {
+        let (_tx, rx) = channel();
+        let receiver = BlockReceiver::new(String::from("test"));
+        assert!(receiver.recv(&rx).is_none());
+        assert!(receiver.starved.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn starved_recv_does_not_block() {
+        let (_tx, rx) = channel();
+        let receiver = BlockReceiver::new(String::from("test"));
+        assert!(receiver.recv(&rx).is_none());
+        let start = Instant::now();
+        for _ in 0..50 {
+            assert!(receiver.recv(&rx).is_none());
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "starved 中は待たずに None を返す"
+        );
+    }
+
+    #[test]
+    fn data_recovers_from_starved_and_waits_again() {
+        let (tx, rx) = channel();
+        let receiver = BlockReceiver::new(String::from("test"));
+        assert!(receiver.recv(&rx).is_none());
+        assert!(receiver.starved.load(Ordering::Acquire));
+        tx.send(Block::for_channels_explicit(1)).unwrap();
+        assert!(receiver.recv(&rx).is_some());
+        assert!(!receiver.starved.load(Ordering::Acquire));
+        assert!(receiver.recv(&rx).is_none());
+        assert!(receiver.starved.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn disconnected_sender_returns_none() {
+        let (tx, rx) = channel::<Block>();
+        drop(tx);
+        let receiver = BlockReceiver::new(String::from("test"));
+        assert!(receiver.recv(&rx).is_none());
     }
 }

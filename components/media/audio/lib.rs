@@ -58,7 +58,11 @@ pub trait AudioBackend {
 }
 
 pub trait AudioStreamReader {
-    fn pull(&self) -> block::Block;
+    /// 次の 128 フレームを返す。まだデータが無い場合は None を返す。
+    ///
+    /// 呼び出し側（MediaStreamSourceNode）は None を無音として扱う。
+    /// 実装はレンダースレッドを長時間ブロックしてはならない。
+    fn pull(&self) -> Option<block::Block>;
     fn start(&self);
     fn stop(&self);
 }

@@ -144,8 +144,8 @@ pub struct DummyPlayer;
 pub struct DummyStreamReader;
 
 impl AudioStreamReader for DummyStreamReader {
-    fn pull(&self) -> Block {
-        Default::default()
+    fn pull(&self) -> Option<Block> {
+        Some(Default::default())
     }
     fn start(&self) {}
     fn stop(&self) {}
