@@ -19,9 +19,14 @@ use crate::media_stream::GStreamerMediaStream;
 // audiobuffersplit は既定 strict-buffer-size=false のため、EOS などで 128 フレームに
 // 満たない端数バッファを流す。そのまま Block::for_vec に渡すと 128 の倍数前提の
 // assertion で panic するため、ここで 128 フレーム分が溜まるまで蓄積する。
+//
+// 入力は audioconvert の NonInterleaved（planar）出力で、リサンプル後の
+// バッファ長は 128 フレームとは限らない。チャンネルごとに蓄積しないと、
+// バッファ境界で L/R の位置がずれてチャンネルが混ざり、ステレオ音声が
+// ノイズ状になる。
 struct BlockAssembler {
     channels: Option<usize>,
-    pending: Vec<f32>,
+    pending: Vec<Vec<f32>>,
     blocks: Vec<Block>,
 }
 
@@ -34,8 +39,8 @@ impl BlockAssembler {
         }
     }
 
-    /// 受け取ったサンプルを蓄積し、完成した 128 フレームのブロックを返す。
-    /// 端数は次回に繰り越す。
+    /// 受け取った planar サンプルをチャンネルごとに蓄積し、完成した
+    /// 128 フレームのブロックを返す。端数は次回に繰り越す。
     fn push(&mut self, samples: &[f32], channels: usize) -> std::vec::Drain<'_, Block> {
         self.blocks.clear();
         if channels == 0 || channels > u8::MAX as usize {
@@ -43,15 +48,25 @@ impl BlockAssembler {
             return self.blocks.drain(..);
         }
         if self.channels != Some(channels) {
-            self.pending.clear();
+            self.pending = vec![Vec::new(); channels];
             self.channels = Some(channels);
         }
-        self.pending.extend_from_slice(samples);
-        let block_len = FRAMES_PER_BLOCK_USIZE * channels;
-        while self.pending.len() >= block_len {
-            let remainder = self.pending.split_off(block_len);
-            let samples = std::mem::replace(&mut self.pending, remainder);
-            self.blocks.push(Block::for_vec(samples));
+        let frames = samples.len() / channels;
+        if frames == 0 {
+            return self.blocks.drain(..);
+        }
+        for (channel, pending) in self.pending.iter_mut().enumerate() {
+            let start = channel * frames;
+            pending.extend_from_slice(&samples[start..start + frames]);
+        }
+        while self.pending.first().is_some_and(|p| p.len() >= FRAMES_PER_BLOCK_USIZE) {
+            let mut block = Vec::with_capacity(FRAMES_PER_BLOCK_USIZE * channels);
+            for pending in self.pending.iter_mut() {
+                let remainder = pending.split_off(FRAMES_PER_BLOCK_USIZE);
+                block.extend_from_slice(pending);
+                *pending = remainder;
+            }
+            self.blocks.push(Block::for_vec(block));
         }
         self.blocks.drain(..)
     }
@@ -256,19 +271,30 @@ impl GStreamerAudioStreamReader {
             e.sync_state_with_parent().map_err(|e| e.to_string())?;
         }
         let mut assembler = BlockAssembler::new();
+        let mut logged_layout = false;
         appsink.set_callbacks(
             gstreamer_app::AppSinkCallbacks::builder()
                 .new_sample(move |appsink| {
                     let sample = appsink
                         .pull_sample()
                         .map_err(|_| gstreamer::FlowError::Eos)?;
-                    let channels = sample
+                    let info = sample
                         .caps()
-                        .and_then(|caps| gstreamer_audio::AudioInfo::from_caps(caps).ok())
-                        .map(|info| info.channels() as usize);
-                    let Some(channels) = channels else {
+                        .and_then(|caps| gstreamer_audio::AudioInfo::from_caps(caps).ok());
+                    let Some(info) = info else {
                         return Ok(gstreamer::FlowSuccess::Ok);
                     };
+                    if !logged_layout {
+                        log::info!(
+                            "受信音声の caps: layout={:?} format={:?} channels={} rate={}",
+                            info.layout(),
+                            info.format(),
+                            info.channels(),
+                            info.rate()
+                        );
+                        logged_layout = true;
+                    }
+                    let channels = info.channels() as usize;
                     let buffer = sample.buffer_owned().ok_or(gstreamer::FlowError::Error)?;
 
                     let buffer = buffer
