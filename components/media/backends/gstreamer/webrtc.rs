@@ -2077,36 +2077,6 @@ pub fn construct(
         .name("sendrecv")
         .build()
         .map_err(|error| format!("webrtcbin element not found: {error:?}"))?;
-    // 受信音声のジッタで rtpjitterbuffer が枯渇すると、Opus の PLC/欠落が
-    // ロボット声や金属的なノイズとして聞こえる。既定の 200 ms では実際の
-    // ネットワークで足りないことがあるため、300 ms まで許容する。
-    webrtc.set_property("latency", 300u32);
-    // opusdec の PLC と in-band FEC は既定で無効。パケット損失時に欠落を
-    // 隠せず、声が途切れる・ロボット声になる。decodebin が追加する
-    // opusdec を深い階層から見つけて有効にする。PLC を効かせるには
-    // rtpjitterbuffer の do-lost も必要。
-    pipeline.connect_deep_element_added(|_, _, element| {
-        let Some(factory) = element.factory() else {
-            return;
-        };
-        match factory.name().as_str() {
-            "opusdec" => {
-                for property in ["plc", "use-inband-fec"] {
-                    if element.find_property(property).is_some() {
-                        element.set_property(property, true);
-                    }
-                }
-                log::info!("受信 Opus デコーダの PLC と in-band FEC を有効にした");
-            },
-            "rtpjitterbuffer" => {
-                if element.find_property("do-lost").is_some() {
-                    element.set_property("do-lost", true);
-                    log::info!("受信 rtpjitterbuffer の do-lost を有効にした");
-                }
-            },
-            _ => {},
-        }
-    });
     let mut controller = GStreamerWebRtcController {
         webrtc,
         pipeline,
