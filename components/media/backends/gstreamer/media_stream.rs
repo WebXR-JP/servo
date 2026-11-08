@@ -733,13 +733,13 @@ impl GStreamerMediaStream {
             MediaStreamType::Video => {
                 let vp8enc = gstreamer::ElementFactory::make("vp8enc")
                     .property("deadline", 1i64)
-                    .property("error-resilient", "default")
+                    .property_from_str("error-resilient", "default")
                     .property("cpu-used", -16i32)
                     .property("lag-in-frames", 0i32)
                     .build()?;
 
                 let rtpvp8pay = gstreamer::ElementFactory::make("rtpvp8pay")
-                    .property("picture-id-mode", "15-bit")
+                    .property_from_str("picture-id-mode", "15-bit")
                     .property("mtu", 1200u32)
                     .build()?;
                 let queue2 = gstreamer::ElementFactory::make("queue").build()?;
