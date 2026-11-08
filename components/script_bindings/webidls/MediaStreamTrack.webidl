@@ -29,6 +29,7 @@ dictionary MediaTrackSettings {
     double aspectRatio;
     double frameRate;
     unsigned long sampleRate;
+    DOMString deviceId;
 };
 
 enum MediaStreamTrackState {

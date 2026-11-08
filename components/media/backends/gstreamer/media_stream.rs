@@ -45,6 +45,8 @@ struct SharedSource {
     tee: gstreamer::Element,
     branches: usize,
     closed: bool,
+    /// 選択したデバイスの公開 ID。合成入力では `None`。
+    device_id: Option<String>,
 }
 
 struct CaptureBranch {
@@ -249,50 +251,54 @@ impl MediaStream for GStreamerMediaStream {
     }
 
     fn settings(&self) -> MediaStreamSettings {
+        // caps が未確定でも device_id は返す。早期 return で捨てない。
+        let device_id = self
+            .branch
+            .as_ref()
+            .and_then(|branch| branch.source.lock().unwrap().device_id.clone());
+        let mut settings = MediaStreamSettings {
+            device_id,
+            ..Default::default()
+        };
         let Some(branch) = self.branch.as_ref() else {
-            return MediaStreamSettings::default();
+            return settings;
         };
         let source = branch.source.lock().unwrap();
         let Some(pad) = source.tee.static_pad("sink") else {
-            return MediaStreamSettings::default();
+            return settings;
         };
         let Some(caps) = pad.current_caps() else {
-            return MediaStreamSettings::default();
+            return settings;
         };
         if !caps.is_fixed() || caps.size() != 1 {
-            return MediaStreamSettings::default();
+            return settings;
         }
         let Some(caps) = caps.structure(0) else {
-            return MediaStreamSettings::default();
+            return settings;
         };
-        let width = caps
+        settings.width = caps
             .get::<i32>("width")
             .ok()
             .and_then(|width| u32::try_from(width).ok());
-        let height = caps
+        settings.height = caps
             .get::<i32>("height")
             .ok()
             .and_then(|height| u32::try_from(height).ok());
-        let aspect_ratio = width
-            .zip(height)
+        settings.aspect_ratio = settings
+            .width
+            .zip(settings.height)
             .and_then(|(width, height)| (height != 0).then_some(width as f64 / height as f64));
-        let frame_rate = caps
+        settings.frame_rate = caps
             .get::<gstreamer::Fraction>("framerate")
             .ok()
             .and_then(|rate| {
                 (rate.denom() != 0).then_some(rate.numer() as f64 / rate.denom() as f64)
             });
-        let sample_rate = caps
+        settings.sample_rate = caps
             .get::<i32>("rate")
             .ok()
             .and_then(|rate| u32::try_from(rate).ok());
-        MediaStreamSettings {
-            width,
-            height,
-            aspect_ratio,
-            frame_rate,
-            sample_rate,
-        }
+        settings
     }
 }
 
@@ -405,7 +411,10 @@ impl GStreamerMediaStream {
         Ok(stream)
     }
 
-    fn create_shared(source: gstreamer::Element) -> Result<Arc<Mutex<SharedSource>>, String> {
+    fn create_shared_with_device(
+        source: gstreamer::Element,
+        device_id: Option<String>,
+    ) -> Result<Arc<Mutex<SharedSource>>, String> {
         let pipeline = gstreamer::Pipeline::with_name("gstreamer media track source");
         pipeline.set_start_time(gstreamer::ClockTime::NONE);
         pipeline.set_base_time(*BACKEND_BASE_TIME);
@@ -438,6 +447,7 @@ impl GStreamerMediaStream {
             tee,
             branches: 0,
             closed: false,
+            device_id,
         })))
     }
 
@@ -475,6 +485,15 @@ impl GStreamerMediaStream {
                 .pipeline
                 .add_many([&queue, &sink])
                 .map_err(|error| error.to_string())?;
+            queue.link(&sink).map_err(|error| error.to_string())?;
+            // 下流から先に親状態へ揃える。tee と繋ぐ前に受入可能にしておくことで、
+            // ライブ入力がまだ NULL の pad へ送出して送出タスクを止めるのを防ぐ。
+            // tee 側の接続は活性 pad 同士で行うため、その後の送出は直ちに流れる。
+            sink.sync_state_with_parent()
+                .map_err(|error| error.to_string())?;
+            queue
+                .sync_state_with_parent()
+                .map_err(|error| error.to_string())?;
             let requested_pad = source_guard
                 .tee
                 .request_pad_simple("src_%u")
@@ -487,12 +506,6 @@ impl GStreamerMediaStream {
                 .link(&queue_pad)
                 .map_err(|error| error.to_string())?;
             linked = true;
-            queue.link(&sink).map_err(|error| error.to_string())?;
-            queue
-                .sync_state_with_parent()
-                .map_err(|error| error.to_string())?;
-            sink.sync_state_with_parent()
-                .map_err(|error| error.to_string())?;
             Ok(())
         })();
         if let Err(error) = setup_result {
@@ -544,7 +557,15 @@ impl GStreamerMediaStream {
         source: gstreamer::Element,
         type_: MediaStreamType,
     ) -> Result<MediaStreamId, String> {
-        let shared = Self::create_shared(source)?;
+        Self::create_shared_from_with_device(source, type_, None)
+    }
+
+    fn create_shared_from_with_device(
+        source: gstreamer::Element,
+        type_: MediaStreamType,
+        device_id: Option<String>,
+    ) -> Result<MediaStreamId, String> {
+        let shared = Self::create_shared_with_device(source, device_id)?;
         match Self::create_branch(shared.clone(), type_) {
             Ok(id) => Ok(id),
             Err(error) => {
@@ -586,6 +607,48 @@ impl GStreamerMediaStream {
         self.elements.last().unwrap().clone()
     }
 
+    /// 枝の全要素を親パイプラインの状態へ同期する。
+    ///
+    /// 親が PLAYING の場合、枝全体を PLAYING に揃える。attach 直後でも別経路で
+    /// 枝を作った場合でも、link 前に送出側が止まっていないことを保証するために使う。
+    /// 要素を Null に落とさないため、送出中のタスクを壊さない。
+    /// 止まった送出タスクの起こし直しには使えない（同状態への同期は無操作のため）。
+    /// 起こし直しは [`Self::restart_branch_flow`] を使う。
+    pub fn sync_branch_with_parent(&self) -> Result<(), String> {
+        if self.pipeline.is_none() {
+            return Err(String::from("パイプラインに接続していない枝は同期できない"));
+        }
+        for element in &self.elements {
+            element
+                .sync_state_with_parent()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// 止まった枝全体の送出を起こし直す。
+    ///
+    /// 上流要素がまだ NULL/READY の下流へ送出すると送出タスクが止まり、その後の
+    /// 同状態への同期では復旧しない。起こし直しでは上流から順に READY へ落として
+    /// 送出を止め、下流から順に親状態へ戻すことで、上流が送出を始める時点で下流が
+    /// 受入可能になっていることを保証する。
+    pub fn restart_branch_flow(&self) -> Result<(), String> {
+        if self.pipeline.is_none() {
+            return Err(String::from("パイプラインに接続していない枝は起こし直せない"));
+        }
+        for element in &self.elements {
+            element
+                .set_state(gstreamer::State::Ready)
+                .map_err(|error| error.to_string())?;
+        }
+        for element in self.elements.iter().rev() {
+            element
+                .sync_state_with_parent()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Returns the pipeline that currently owns this stream's elements.
     pub fn attached_pipeline(&self) -> Option<gstreamer::Pipeline> {
         self.pipeline.clone()
@@ -616,7 +679,11 @@ impl GStreamerMediaStream {
         let elements: Vec<_> = self.elements.iter().collect();
         pipeline.add_many(&elements[..]).unwrap();
         gstreamer::Element::link_many(&elements[..]).unwrap();
-        for element in elements {
+        // 下流から順に親状態へ揃える。上流から揃えると、上流の送出タスクがまだ
+        // NULL/READY の下流へ送出して止まり、その後の同期では復旧しないことがある。
+        // 下流から揃えれば、上流が送出を始める時点で下流は受入可能になっている。
+        // 親が PLAYING でない場合（初期接続など）は順序による差は無い。
+        for element in elements.iter().rev() {
             element.sync_state_with_parent().unwrap();
         }
         self.pipeline = Some(pipeline.clone());
@@ -705,6 +772,13 @@ impl GStreamerMediaStream {
         Self::create_shared_from(source, MediaStreamType::Video)
     }
 
+    pub fn try_create_video_from_device(
+        source: gstreamer::Element,
+        device_id: Option<String>,
+    ) -> Result<MediaStreamId, String> {
+        Self::create_shared_from_with_device(source, MediaStreamType::Video, device_id)
+    }
+
     pub fn try_create_audio() -> Result<MediaStreamId, String> {
         let audiotestsrc = gstreamer::ElementFactory::make("audiotestsrc")
             .property_from_str("wave", "sine")
@@ -721,6 +795,13 @@ impl GStreamerMediaStream {
 
     pub fn try_create_audio_from(source: gstreamer::Element) -> Result<MediaStreamId, String> {
         Self::create_shared_from(source, MediaStreamType::Audio)
+    }
+
+    pub fn try_create_audio_from_device(
+        source: gstreamer::Element,
+        device_id: Option<String>,
+    ) -> Result<MediaStreamId, String> {
+        Self::create_shared_from_with_device(source, MediaStreamType::Audio, device_id)
     }
 
     pub fn create_proxy(ty: MediaStreamType) -> (MediaStreamId, GstreamerMediaSocket) {

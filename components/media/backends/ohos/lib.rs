@@ -171,17 +171,19 @@ impl Backend for OhosBackend {
     fn create_audioinput_stream(
         &self,
         _set: servo_media_streams::capture::MediaTrackConstraintSet,
-    ) -> Option<servo_media_streams::MediaStreamId> {
+    ) -> Result<servo_media_streams::MediaStreamId, servo_media_streams::capture::MediaStreamError>
+    {
         warn!("OhosBackend: create_audioinput_stream not supported");
-        None
+        Err(servo_media_streams::capture::MediaStreamError::NotFound)
     }
 
     fn create_videoinput_stream(
         &self,
         _set: servo_media_streams::capture::MediaTrackConstraintSet,
-    ) -> Option<servo_media_streams::MediaStreamId> {
+    ) -> Result<servo_media_streams::MediaStreamId, servo_media_streams::capture::MediaStreamError>
+    {
         warn!("OhosBackend: create_videoinput_stream not supported");
-        None
+        Err(servo_media_streams::capture::MediaStreamError::NotFound)
     }
 
     fn create_audio_context(

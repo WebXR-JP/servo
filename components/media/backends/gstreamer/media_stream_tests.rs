@@ -227,6 +227,33 @@ impl Drop for TestConsumer {
 }
 
 #[test]
+fn audio_from_device_reports_device_id_in_settings() {
+    gstreamer::init().expect("GStreamer を初期化できない");
+    let source = gstreamer::ElementFactory::make("audiotestsrc")
+        .property_from_str("wave", "sine")
+        .property("is-live", true)
+        .build()
+        .expect("audiotestsrc を作れない");
+    let id = GStreamerMediaStream::try_create_audio_from_device(source, Some("test-id".to_owned()))
+        .expect("デバイス付き音声トラックを作れない");
+    let settings = stream_settings(&id).expect("音声トラックが登録されていない");
+    assert_eq!(
+        settings.device_id.as_deref(),
+        Some("test-id"),
+        "選択デバイスの ID を settings で返す"
+    );
+    let clone = clone_stream(&id).expect("音声トラックを複製できない");
+    let clone_settings = stream_settings(&clone).expect("複製トラックが登録されていない");
+    assert_eq!(
+        clone_settings.device_id.as_deref(),
+        Some("test-id"),
+        "複製枝でも同じ device_id を返す"
+    );
+    stop_stream(&id).expect("元トラックを停止できない");
+    stop_stream(&clone).expect("複製トラックを停止できない");
+}
+
+#[test]
 fn clone_mute_and_stop_only_affect_that_audio_branch() {
     let original = TestTrack::audio();
     let clone = original.clone();

@@ -570,6 +570,10 @@ pub enum EmbedderMsg {
     /// with the user's decision, which resolves or rejects the pending promise
     /// without blocking the script thread.
     RequestWakeLockPermission(WebViewId, GenericCallback<AllowOrDeny>, WakeLockType),
+    /// マイク権限の非同期要求。TCC の許可・拒否を待って応答する。
+    /// コールバックは script スレッドを塞がず、保留中の getUserMedia を
+    /// 解決・拒否するために使う（wake lock と同じ往復）。
+    RequestMicrophonePermission(WebViewId, GenericCallback<AllowOrDeny>),
     /// Report the status of Devtools Server with a token that can be used to bypass the permission prompt.
     OnDevtoolsStarted(Result<u16, ()>, String),
     /// Ask the user to allow a devtools client to connect.

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
 use servo_media_streams::MediaStreamType;
-use servo_media_streams::registry::{MediaStreamId, get_stream};
+use servo_media_streams::registry::{MediaStreamId, get_stream, stop_stream};
 use servo_media_webrtc::{
     BundlePolicy, ConnectionState, DataChannelInit, IceCandidate, IceConfiguration,
     IceTransportPolicy, OutgoingTrack, SessionDescription, TransceiverDirection, TransceiverKind,
@@ -177,6 +177,106 @@ impl IncomingAudioConsumer {
             }
         }
     }
+
+    /// 古い音声が jitterbuffer や queue に残るため、切替直後は捨てる。
+    /// 切替前の周波数が測定に混ざらないようにする。捨てた件数を返す。
+    fn drain(&self, duration: Duration) -> usize {
+        let deadline = Instant::now() + duration;
+        let mut count = 0;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            if self
+                .sink
+                .try_pull_sample(gstreamer::ClockTime::from_nseconds(
+                    remaining.as_nanos() as u64
+                ))
+                .is_none()
+            {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// 左チャンネルの PCM を集める。無音（サンプルが来ない）なら空を返す。
+    fn collect_mono(&self, min_samples: usize, timeout: Duration) -> Vec<f32> {
+        let deadline = Instant::now() + timeout;
+        let mut mono = Vec::with_capacity(min_samples);
+        while mono.len() < min_samples {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Some(sample) = self
+                .sink
+                .try_pull_sample(gstreamer::ClockTime::from_nseconds(
+                    remaining.as_nanos() as u64
+                ))
+            else {
+                break;
+            };
+            let buffer = sample
+                .buffer()
+                .expect("decoded PCM sample should contain a buffer");
+            let bytes = buffer
+                .map_readable()
+                .expect("decoded PCM buffer should be readable");
+            mono.extend(
+                bytes
+                    .as_slice()
+                    .chunks_exact(2 * std::mem::size_of::<f32>())
+                    .map(|frame| f32::from_le_bytes(frame[..4].try_into().unwrap())),
+            );
+        }
+        mono
+    }
+}
+
+/// 単一周波数の強さを測る Goertzel 法。受信音声が何 Hz かを判定する。
+fn goertzel_magnitude(samples: &[f32], sample_rate: f32, target: f32) -> f64 {
+    let n = samples.len() as f64;
+    let k = (target as f64 * n / sample_rate as f64).round();
+    let omega = 2.0 * std::f64::consts::PI * k / n;
+    let (sine, cosine) = omega.sin_cos();
+    let coeff = 2.0 * cosine;
+    let (mut s_prev, mut s_prev2) = (0.0, 0.0);
+    for sample in samples {
+        let s = f64::from(*sample) + coeff * s_prev - s_prev2;
+        s_prev2 = s_prev;
+        s_prev = s;
+    }
+    let real = s_prev * cosine - s_prev2;
+    let imag = s_prev * sine;
+    (real * real + imag * imag).sqrt()
+}
+
+fn tone_track(freq: f64) -> MediaStreamId {
+    let source = gstreamer::ElementFactory::make("audiotestsrc")
+        .property_from_str("wave", "sine")
+        .property("is-live", true)
+        .property("freq", freq)
+        .build()
+        .expect("audio test source should be available");
+    GStreamerMediaStream::try_create_audio_from(source).expect("tone track should be created")
+}
+
+/// 受信音声が期待する周波数であることを確かめる。切替前後の実測値を返す。
+fn expect_tone(consumer: &IncomingAudioConsumer, expected: f32, other: f32) -> (f64, f64) {
+    // 切替直後の残留音声を捨ててから測る。
+    let drained = consumer.drain(Duration::from_millis(1500));
+    let samples = consumer.collect_mono(48_000, Duration::from_secs(5));
+    eprintln!("expect_tone: expected={expected} drained={drained} collected={}", samples.len());
+    assert!(
+        samples.len() >= 24_000,
+        "expected decoded PCM for {expected} Hz tone, got {} samples",
+        samples.len()
+    );
+    let got = goertzel_magnitude(&samples, 48_000.0, expected);
+    let not_expected = goertzel_magnitude(&samples, 48_000.0, other);
+    assert!(
+        got > 3.0 * not_expected,
+        "expected {expected} Hz tone to dominate (got {got} vs {other} Hz {not_expected})"
+    );
+    (got, not_expected)
 }
 
 impl Drop for IncomingAudioConsumer {
@@ -851,8 +951,211 @@ fn transceiver_api_sends_dom_msid_maps_tracks_and_delivers_incoming_pcm() {
 }
 
 #[test]
-fn ice_configuration_accepts_initial_turn_and_rejects_removal() {
+fn replace_track_switches_loopback_audio_without_renegotiation() {
     gstreamer::init().expect("GStreamer must initialize for the WebRTC loopback");
+
+    let (events_sender, events_receiver) = channel();
+    let offer_peer = Arc::new(Mutex::new(None));
+    let answer_peer = Arc::new(Mutex::new(None));
+    let offer = WebRtcController::new::<GStreamerBackend>(Box::new(LoopbackSignaller {
+        name: "offerer",
+        peer: offer_peer.clone(),
+        events: events_sender.clone(),
+    }));
+    let answer = WebRtcController::new::<GStreamerBackend>(Box::new(LoopbackSignaller {
+        name: "answerer",
+        peer: answer_peer.clone(),
+        events: events_sender,
+    }));
+    *offer_peer.lock().unwrap() = Some(answer.clone());
+    *answer_peer.lock().unwrap() = Some(offer.clone());
+    let peers = LoopbackPeers { offer, answer };
+
+    // 440 Hz を送る送信枝を作る。msid/track id はこの後の replace でも維持される。
+    let track_440 = tone_track(440.0);
+    let sender_id = peers
+        .offer
+        .add_transceiver(
+            TransceiverKind::Audio,
+            TransceiverDirection::SendRecv,
+            Some(OutgoingTrack {
+                source_stream: track_440,
+                stream_ids: vec!["replace-stream".into()],
+                track_id: "replace-track".into(),
+                audio_bitrate: None,
+            }),
+        )
+        .expect("webrtcbin should add and connect an audio transceiver");
+
+    let offer_description = wait_for_description(&peers.offer, |controller, completion| {
+        controller.create_offer(completion);
+    });
+    let transceiver_count = peers
+        .offer
+        .get_transceivers()
+        .expect("transceiver snapshots should be available")
+        .len();
+    assert_eq!(transceiver_count, 1);
+    set_description(&peers.offer, offer_description.clone(), false);
+    set_description(&peers.answer, offer_description, true);
+
+    let answer_description = wait_for_description(&peers.answer, |controller, completion| {
+        controller.create_answer(completion);
+    });
+    set_description(&peers.answer, answer_description.clone(), false);
+    set_description(&peers.offer, answer_description, true);
+
+    // 受信側で 440 Hz が届くのを待つ。
+    let incoming = loop {
+        match wait_for_event(&events_receiver) {
+            Event::IncomingAudio(_, stream_id, _) => break stream_id,
+            Event::Failed(name) => panic!("{name} peer connection failed"),
+            Event::Connected(_) => {},
+        }
+    };
+    let consumer = IncomingAudioConsumer::attach(incoming);
+    eprintln!("replace-step: initial-440");
+    let (mag_440, mag_880) = expect_tone(&consumer, 440.0, 880.0);
+
+    // 880 Hz へ切り替える。同じ SSRC/payload/sink pad を維持する。
+    let track_880 = tone_track(880.0);
+    peers
+        .offer
+        .replace_track(
+            sender_id,
+            Some(OutgoingTrack {
+                source_stream: track_880,
+                stream_ids: vec!["replace-stream-new".into()],
+                track_id: "replace-track-new".into(),
+                audio_bitrate: None,
+            }),
+        )
+        .expect("replaceTrack should switch the outgoing audio source");
+    eprintln!("replace-step: switched-880");
+    let (mag_880_after, mag_440_after) = expect_tone(&consumer, 880.0, 440.0);
+
+    // 送信停止（replaceTrack(null)）。無音になる。
+    peers
+        .offer
+        .replace_track(sender_id, None)
+        .expect("replaceTrack(null) should mute the outgoing audio");
+    consumer.drain(Duration::from_millis(1500));
+    let silent = consumer.collect_mono(24_000, Duration::from_secs(4));
+    if !silent.is_empty() {
+        let rms = (silent
+            .iter()
+            .map(|sample| f64::from(*sample).powi(2))
+            .sum::<f64>()
+            / silent.len() as f64)
+            .sqrt();
+        assert!(
+            rms < 0.05,
+            "replaceTrack(null) should mute the loopback audio, RMS was {rms}"
+        );
+    }
+
+    // 440 Hz へ戻せる。msid を維持したまま送出が再開する。
+    peers
+        .offer
+        .replace_track(
+            sender_id,
+            Some(OutgoingTrack {
+                source_stream: track_440,
+                stream_ids: vec!["replace-stream".into()],
+                track_id: "replace-track".into(),
+                audio_bitrate: None,
+            }),
+        )
+        .expect("replaceTrack should resume the previous outgoing audio source");
+    eprintln!("replace-step: resumed-440");
+    let (mag_440_resumed, _) = expect_tone(&consumer, 440.0, 880.0);
+
+    // LiveKit の順序（旧トラック stop 後に getUserMedia して replace）でも
+    // 切り替えられる。旧 440 Hz を止めて新しい 660 Hz へ替える。
+    let track_660 = tone_track(660.0);
+    stop_stream(&track_440).expect("the previous track should stop");
+    peers
+        .offer
+        .replace_track(
+            sender_id,
+            Some(OutgoingTrack {
+                source_stream: track_660,
+                stream_ids: vec!["replace-stream".into()],
+                track_id: "replace-track".into(),
+                audio_bitrate: None,
+            }),
+        )
+        .expect("replaceTrack should work after the previous track stopped");
+    eprintln!("replace-step: stopped-then-660");
+    let (mag_660, _) = expect_tone(&consumer, 660.0, 440.0);
+
+    // transceiver 数も m-line 数も増えない。SDP の msid/track id も変わらない。
+    let states = peers
+        .offer
+        .get_transceivers()
+        .expect("transceiver snapshots should be available");
+    assert_eq!(
+        states.len(),
+        transceiver_count,
+        "replaceTrack must not add transceivers"
+    );
+    let second_offer = wait_for_description(&peers.offer, |controller, completion| {
+        controller.create_offer(completion);
+    });
+    assert_eq!(
+        second_offer.sdp.matches("\nm=").count(),
+        1,
+        "replaceTrack must not add m-lines: {}",
+        second_offer.sdp
+    );
+    assert!(
+        second_offer.sdp.contains("replace-track")
+            && !second_offer.sdp.contains("replace-track-new"),
+        "the SDP msid/track ID must be preserved across replaceTrack: {}",
+        second_offer.sdp
+    );
+
+    // 種類の不一致と未知の transceiver は拒否する。
+    assert!(
+        peers
+            .offer
+            .replace_track(
+                sender_id,
+                Some(OutgoingTrack {
+                    source_stream: GStreamerMediaStream::create_video(),
+                    stream_ids: vec!["replace-stream".into()],
+                    track_id: "replace-track".into(),
+                    audio_bitrate: None,
+                }),
+            )
+            .is_err(),
+        "a video track must not replace an audio transceiver"
+    );
+    assert!(
+        peers
+            .offer
+            .replace_track(
+                servo_media_webrtc::TransceiverId(u64::MAX),
+                Some(OutgoingTrack {
+                    source_stream: track_660,
+                    stream_ids: vec!["replace-stream".into()],
+                    track_id: "replace-track".into(),
+                    audio_bitrate: None,
+                }),
+            )
+            .is_err(),
+        "an unknown transceiver ID must be rejected"
+    );
+
+    eprintln!(
+        "replaceTrack loopback: 440Hz {mag_440:.1} vs 880Hz {mag_880:.1}; \
+         after switch 880Hz {mag_880_after:.1} vs 440Hz {mag_440_after:.1}; \
+         resumed 440Hz {mag_440_resumed:.1}; stopped-then-660Hz {mag_660:.1}"
+    );
+}
+
+#[test]
+fn ice_configuration_accepts_initial_turn_and_rejects_removal() {    gstreamer::init().expect("GStreamer must initialize for the WebRTC loopback");
     let (events_sender, _) = channel();
     let controller = WebRtcController::new::<GStreamerBackend>(Box::new(LoopbackSignaller {
         name: "ice-config",

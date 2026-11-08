@@ -8,7 +8,7 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 use servo_media::webrtc::{
-    TransceiverDirection, TransceiverId, TransceiverState, WebRtcController,
+    TransceiverDirection, TransceiverId, TransceiverKind, TransceiverState, WebRtcController,
 };
 
 use crate::dom::bindings::codegen::Bindings::RTCRtpTransceiverBinding::{
@@ -45,8 +45,10 @@ impl RTCRtpTransceiver {
         track: Option<&MediaStreamTrack>,
         controller: WebRtcController,
         id: TransceiverId,
+        kind: TransceiverKind,
+        stream_ids: Vec<String>,
     ) -> Self {
-        let sender = RTCRtpSender::new(cx, global, track);
+        let sender = RTCRtpSender::new(cx, global, track, controller.clone(), id, kind, stream_ids);
         Self {
             reflector_: Reflector::new(),
             direction: Cell::new(direction),
@@ -66,8 +68,12 @@ impl RTCRtpTransceiver {
         mid: Option<DOMString>,
         controller: WebRtcController,
         id: TransceiverId,
+        kind: TransceiverKind,
+        stream_ids: Vec<String>,
     ) -> DomRoot<Self> {
-        let transceiver = Self::new(cx, global, direction, None, controller, id);
+        let transceiver = Self::new(
+            cx, global, direction, None, controller, id, kind, stream_ids,
+        );
         transceiver.set_remote(receiver, mid);
         transceiver
     }
@@ -79,10 +85,12 @@ impl RTCRtpTransceiver {
         track: Option<&MediaStreamTrack>,
         controller: WebRtcController,
         id: TransceiverId,
+        kind: TransceiverKind,
+        stream_ids: Vec<String>,
     ) -> DomRoot<Self> {
         reflect_dom_object_with_cx(
             Box::new(Self::new_inherited(
-                cx, global, direction, track, controller, id,
+                cx, global, direction, track, controller, id, kind, stream_ids,
             )),
             global,
             cx,

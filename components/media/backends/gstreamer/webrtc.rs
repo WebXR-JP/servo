@@ -3,8 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use std::{cmp, mem};
 
 use glib;
@@ -69,6 +70,10 @@ struct RegisteredTransceiver {
     outgoing_payloader: Option<gstreamer::Element>,
     outgoing_valve: Option<gstreamer::Element>,
     outgoing_capsfilter: Option<gstreamer::Element>,
+    /// 送信枝の入力切替器。encoder の手前に置き、replaceTrack では
+    /// sink pad を追加して active-pad を切り替えるだけにする。
+    /// 下流（encoder/payloader/sink pad）は繋ぎ替えない。
+    outgoing_selector: Option<gstreamer::Element>,
 }
 
 #[derive(Clone)]
@@ -112,6 +117,7 @@ impl TransceiverRegistry {
                 outgoing_payloader: None,
                 outgoing_valve: None,
                 outgoing_capsfilter: None,
+                outgoing_selector: None,
             },
         );
         Ok(id)
@@ -393,8 +399,8 @@ impl WebRtcControllerBackend for GStreamerWebRtcController {
             }
             if let Some(entry) = self.transceivers.lock().unwrap().by_id.get_mut(&id) {
                 entry.outgoing_msid = Some(OutgoingMsid {
-                    stream_ids: track.stream_ids,
-                    track_id: track.track_id,
+                    stream_ids: track.stream_ids.clone(),
+                    track_id: track.track_id.clone(),
                 });
             }
         }
@@ -415,6 +421,138 @@ impl WebRtcControllerBackend for GStreamerWebRtcController {
             .native
             .set_direction(native_direction(direction));
         Ok(())
+    }
+
+    fn replace_track(&mut self, id: TransceiverId, track: Option<OutgoingTrack>) -> WebRtcResult {
+        // 方式の選択理由: encoder の手前に置いた input-selector の active-pad
+        // を切り替える（A）。valve 手前の src 付け替えや encoder 枝の作り直し
+        // （B系）も試したが、PLAYING 中の生パッド付け替え・枝の脱着は caps 再交渉
+        // や取り外した要素への dangling link と競合し、無音のまま止まることが
+        // あって安定しなかった。selector なら下流（valve/encoder/payloader/sink
+        // pad/SSRC/payload/msid）は一切触らず、新しい入力の sink pad を追加して
+        // active-pad を替えるだけなので再ネゴシも m-line 増加も起きず、RTP の
+        // 連続性も保たれる。音声は selector 後段で 48kHz ステレオへ正規化する
+        // ため、異なる rate/channels のデバイス間でも下流の再交渉を抑える。
+        let (kind, payload, has_branch) = {
+            let transceivers = self.transceivers.lock().unwrap();
+            let entry = transceivers
+                .by_id
+                .get(&id)
+                .ok_or_else(|| WebRtcError::Backend("unknown transceiver ID".into()))?;
+            (
+                entry.kind,
+                entry.payload,
+                entry.outgoing_valve.is_some(),
+            )
+        };
+
+        let Some(track) = track else {
+            // 送信停止。枝が無ければ何もしない。valve を閉じて無音を維持し、
+            // sink pad や encoder には触らない。
+            let transceivers = self.transceivers.lock().unwrap();
+            let entry = transceivers
+                .by_id
+                .get(&id)
+                .ok_or_else(|| WebRtcError::Backend("unknown transceiver ID".into()))?;
+            if let Some(valve) = entry.outgoing_valve.as_ref() {
+                valve.set_property("drop", true);
+            }
+            return Ok(());
+        };
+
+        if track.audio_bitrate.is_some() && kind != TransceiverKind::Audio {
+            return Err(WebRtcError::Backend(
+                "audio bitrate is only supported for audio tracks".into(),
+            ));
+        }
+        if track
+            .audio_bitrate
+            .is_some_and(|bitrate| !(4_000..=650_000).contains(&bitrate))
+        {
+            return Err(WebRtcError::Backend(
+                "Opus bitrate must be between 4000 and 650000 bits per second".into(),
+            ));
+        }
+        // encoder は作り直さないため bitrate の再設定はしない。DOM は None を
+        // 送るので、ここでは範囲検証だけ行う。枝に付け替えるのは入力だけで、
+        // encoder 以降や webrtc sink pad には触らない。
+
+        let Some(payload) = payload else {
+            return Err(WebRtcError::Backend(
+                "transceiver has no RTP payload, cannot attach an outgoing track".into(),
+            ));
+        };
+
+        // 種別の不一致は新しい入力を pipeline に繋げる前に拒否し、
+        // 失敗時に旧枝を壊さないようにする。
+        {
+            let source = get_stream(&track.source_stream).ok_or_else(|| {
+                WebRtcError::Backend("outgoing media stream does not exist".into())
+            })?;
+            let mut source = source.lock().unwrap();
+            let source = source
+                .as_mut_any()
+                .downcast_mut::<GStreamerMediaStream>()
+                .ok_or_else(|| {
+                    WebRtcError::Backend("outgoing media stream is not backed by GStreamer".into())
+                })?;
+            if !source
+                .caps()
+                .can_intersect(&codec_caps(kind, payload))
+            {
+                return Err(WebRtcError::Backend(
+                    "outgoing media stream kind does not match the transceiver".into(),
+                ));
+            }
+        }
+
+        if !has_branch {
+            // 送信なしで作られた transceiver に初めて入力を繋げる。
+            // 維持すべき旧 msid が無いので、新しい track の msid を採用する。
+            let native = {
+                self.transceivers
+                    .lock()
+                    .unwrap()
+                    .by_id
+                    .get(&id)
+                    .map(|entry| entry.native.clone())
+                    .ok_or_else(|| WebRtcError::Backend("unknown transceiver ID".into()))?
+            };
+            self.link_track_to_transceiver(id, &native, &track)?;
+            if let Some(entry) = self.transceivers.lock().unwrap().by_id.get_mut(&id) {
+                entry.outgoing_msid = Some(OutgoingMsid {
+                    stream_ids: track.stream_ids.clone(),
+                    track_id: track.track_id.clone(),
+                });
+                // 既にネゴシ済み（m-line 割当済み）なら valve を開ける。
+                // 未ネゴシなら answer 時の apply_remote_answer_payloads が開ける。
+                if mline_index_for_transceiver(&entry.native).is_some() {
+                    if let Some(valve) = entry.outgoing_valve.as_ref() {
+                        valve.set_property("drop", false);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // 送信枝あり。selector の active-pad を新しい入力へ切り替える。
+        // 下流（encoder/payloader/sink pad/SSRC/msid）は維持する。
+        let pipeline = self.pipeline.clone();
+        let (new_stream_id, is_internal_branch) =
+            stream_for_pipeline(&track.source_stream, &pipeline)?;
+        let result = self.switch_outgoing_selector(id, &new_stream_id);
+        if result.is_err() && is_internal_branch {
+            if let Err(error) = stop_stream(&new_stream_id) {
+                warn!("Could not stop an unused WebRTC media branch: {error}");
+            }
+            unregister_stream(&new_stream_id);
+        } else if result.is_ok() {
+            self.streams.push(new_stream_id);
+            if is_internal_branch {
+                self.internal_streams.push(new_stream_id);
+            }
+        }
+        result
     }
 
     fn get_transceivers(&mut self) -> Vec<TransceiverState> {
@@ -970,7 +1108,7 @@ impl GStreamerWebRtcController {
             // Build the encoder branch before starting it. Publishing may happen
             // after the initial negotiation, when the pipeline is already playing.
             let outgoing_ssrc = self.allocate_outgoing_ssrc();
-            let (element, payloader, valve, branch) = encoded_track_branch(
+            let (element, payloader, valve, selector, branch) = encoded_track_branch(
                 source,
                 expected_kind,
                 payload,
@@ -1014,6 +1152,7 @@ impl GStreamerWebRtcController {
                 entry.outgoing_payloader = Some(payloader);
                 entry.outgoing_valve = Some(valve);
                 entry.outgoing_capsfilter = Some(element);
+                entry.outgoing_selector = Some(selector);
             }
             self.request_pad_counter = self
                 .request_pad_counter
@@ -1032,6 +1171,158 @@ impl GStreamerWebRtcController {
             unregister_stream(&stream_id);
         }
         result
+    }
+
+    /// selector の active-pad を新しい入力へ切り替える。
+    ///
+    /// 下流（valve/encoder/payloader/queue/capsfilter と webrtc sink pad、
+    /// SSRC/payload/msid）は一切触らないため、再ネゴシエーションや m-line
+    /// 増加は起きず、RTP の連続性も保たれる。旧入力が停止済みでも切り替えは
+    /// できる。切り替え後は旧 sink pad を切り離すため、停止済みトラックの EOS が
+    /// 遅れて下流へ流れて encoder 以降を止めるのを防ぐ。
+    /// 新しい入力のリンクや送出開始に失敗した場合は旧 pad を維持したままエラーを返す。
+    fn switch_outgoing_selector(
+        &mut self,
+        transceiver_id: TransceiverId,
+        new_stream_id: &MediaStreamId,
+    ) -> WebRtcResult {
+        let (selector, valve, negotiated) = {
+            let transceivers = self.transceivers.lock().unwrap();
+            let entry = transceivers
+                .by_id
+                .get(&transceiver_id)
+                .ok_or_else(|| WebRtcError::Backend("unknown transceiver ID".into()))?;
+            let selector = entry.outgoing_selector.clone().ok_or_else(|| {
+                WebRtcError::Backend("transceiver has no outgoing selector".into())
+            })?;
+            let valve = entry.outgoing_valve.clone();
+            let negotiated = mline_index_for_transceiver(&entry.native).is_some();
+            (selector, valve, negotiated)
+        };
+        let new_src = {
+            let stream = get_stream(new_stream_id).ok_or_else(|| {
+                WebRtcError::Backend("outgoing media stream does not exist".into())
+            })?;
+            let stream = stream.lock().unwrap();
+            let source = stream
+                .as_any()
+                .downcast_ref::<GStreamerMediaStream>()
+                .ok_or_else(|| {
+                    WebRtcError::Backend("outgoing media stream is not backed by GStreamer".into())
+                })?;
+            // 新しい入力の枝全体を親（PLAYING）と同期してから繋ぐ。
+            // 末尾 queue 単体ではなく枝全体を揃えることで、送出中のタスクを壊さない。
+            source
+                .sync_branch_with_parent()
+                .map_err(WebRtcError::Backend)?;
+            source.src_element()
+        };
+        let new_src_pad = new_src
+            .static_pad("src")
+            .ok_or_else(|| WebRtcError::Backend("encoded media source has no src pad".into()))?;
+        // 既に selector へ繋がっている入力（ミュート解除など）は繋ぎ替えず、
+        // その pad を active にして開けるだけにする。
+        if new_src_pad.is_linked() {
+            if let Some(peer) = new_src_pad.peer() {
+                let is_ours = peer.parent_element().as_ref().map(|parent| parent.as_ptr())
+                    == Some(selector.as_ptr());
+                if is_ours {
+                    selector.set_property("active-pad", &peer);
+                    if let Some(valve) = valve.as_ref() {
+                        valve.set_property("drop", !negotiated);
+                    }
+                    return Ok(());
+                }
+            }
+            return Err(WebRtcError::Backend(
+                "outgoing media source is already linked to another branch".into(),
+            ));
+        }
+        // 新しい入力の sink pad を追加して繋ぎ、active-pad を切り替える。
+        // 下流は繋ぎ替えないため、失敗しても旧入力は無傷。
+        let selector_sink = selector
+            .request_pad_simple("sink_%u")
+            .ok_or_else(|| WebRtcError::Backend("input selector has no sink pad".into()))?;
+        if let Err(error) = new_src_pad.link(&selector_sink) {
+            selector.release_request_pad(&selector_sink);
+            return Err(WebRtcError::Backend(error.to_string()));
+        }
+        // active-pad を替える前に、新しい pad へ実際にバッファが届くのを待つ。
+        // 送出を確認してから切り替えることで、下流が無音のまま止まるのを防ぐ。
+        // probe は到着の合図だけに使い、重い処理はしない。
+        // 届かなければ枝全体を起こし直して再待機し、それでも届かなければ旧 pad を
+        // 維持したままエラーを返す。
+        const FIRST_FLOW_TIMEOUT: Duration = Duration::from_millis(500);
+        const FLOW_TIMEOUT: Duration = Duration::from_secs(2);
+        const FLOW_RETRIES: u32 = 2;
+        let mut restarted = 0;
+        loop {
+            let timeout = if restarted == 0 {
+                FIRST_FLOW_TIMEOUT
+            } else {
+                FLOW_TIMEOUT
+            };
+            if wait_for_selector_input(&selector_sink, timeout) {
+                break;
+            }
+            if restarted >= FLOW_RETRIES {
+                let _ = new_src_pad.unlink(&selector_sink);
+                selector.release_request_pad(&selector_sink);
+                return Err(WebRtcError::Backend(
+                    "new outgoing media source did not flow".into(),
+                ));
+            }
+            restarted += 1;
+            let restarted_branch = (|| {
+                let stream = get_stream(new_stream_id).ok_or_else(|| {
+                    WebRtcError::Backend("outgoing media stream does not exist".into())
+                })?;
+                let stream = stream.lock().unwrap();
+                let source = stream
+                    .as_any()
+                    .downcast_ref::<GStreamerMediaStream>()
+                    .ok_or_else(|| {
+                        WebRtcError::Backend(
+                            "outgoing media stream is not backed by GStreamer".into(),
+                        )
+                    })?;
+                source.restart_branch_flow().map_err(WebRtcError::Backend)
+            })();
+            if let Err(error) = restarted_branch {
+                let _ = new_src_pad.unlink(&selector_sink);
+                selector.release_request_pad(&selector_sink);
+                return Err(error);
+            }
+        }
+        // active-pad を替えるだけにし、要素の state は触らない。
+        // 起こし直しが必要な場合は到着ゲート内の再待機で行う。
+        let old_active: Option<gstreamer::Pad> = selector.property("active-pad");
+        selector.set_property("active-pad", &selector_sink);
+        // 古い入力の sink pad は selector から切り離す。停止済みトラックの EOS が
+        // 遅れて下流へ流れると encoder 以降が止まったままになり、新しい入力へ替えても
+        // 復旧しない。新 pad が active のため送出は継続する。旧枝の再利用時には
+        // link し直す（末尾 queue の送出タスクは到着ゲートの起こし直しで復旧する）。
+        if let Some(old_pad) = old_active {
+            if old_pad != selector_sink {
+                let belongs_to_selector = old_pad
+                    .parent_element()
+                    .as_ref()
+                    .map(|parent| parent.as_ptr())
+                    == Some(selector.as_ptr());
+                if belongs_to_selector {
+                    if let Some(peer) = old_pad.peer() {
+                        let _ = peer.unlink(&old_pad);
+                    }
+                    selector.release_request_pad(&old_pad);
+                }
+            }
+        }
+        // ネゴシ済みなら送出を再開し、未ネゴシなら閉じたまま answer を待つ。
+        // ミュート解除（replaceTrack(track)）もここで再開する。
+        if let Some(valve) = valve.as_ref() {
+            valve.set_property("drop", !negotiated);
+        }
+        Ok(())
     }
 
     fn apply_remote_answer_payloads(&mut self) -> WebRtcResult {
@@ -1439,6 +1730,7 @@ fn encoded_track_branch(
         gstreamer::Element,
         gstreamer::Element,
         gstreamer::Element,
+        gstreamer::Element,
         Vec<gstreamer::Element>,
     ),
     WebRtcError,
@@ -1492,6 +1784,36 @@ fn encoded_track_branch(
         .build()
         .map_err(|error| WebRtcError::Backend(error.to_string()))?;
     valve.set_property_from_str("drop-mode", "forward-sticky-events");
+    // 入力切替器。replaceTrack では sink pad を追加して active-pad を
+    // 切り替えるだけにし、下流（encoder 以降）は繋ぎ替えない。
+    let selector = gstreamer::ElementFactory::make("input-selector")
+        .build()
+        .map_err(|error| WebRtcError::Backend(error.to_string()))?;
+    // 新しい入力へ切り替えた直後から送出する。既定の sync-streams=true では
+    // 非活性 pad のバッファ時刻を旧ストリームへ合わせようとし、切替直後の到着が
+    // 遅れることがある。両入力は同一 pipeline の clock を共有するライブ入力のため
+    // 時刻合わせは不要で、即時切替の方が止まりにくい。NULL/READY 時のみ変更可のため生成時に設定する。
+    if selector.find_property("sync-streams").is_some() {
+        selector.set_property("sync-streams", false);
+    }
+    // 音声は下流の caps 交渉を固定するため 48kHz ステレオへ正規化する。
+    // 異なる rate/channels のデバイスへ替えても encoder 以降の再交渉が起きない。
+    let normalizer: Vec<gstreamer::Element> = match kind {
+        TransceiverKind::Audio => {
+            let convert = gstreamer::ElementFactory::make("audioconvert")
+                .build()
+                .map_err(|error| WebRtcError::Backend(error.to_string()))?;
+            let resample = gstreamer::ElementFactory::make("audioresample")
+                .build()
+                .map_err(|error| WebRtcError::Backend(error.to_string()))?;
+            let rawcaps = gstreamer::ElementFactory::make("capsfilter")
+                .property("caps", &*OUTGOING_RAW_AUDIO_CAPS)
+                .build()
+                .map_err(|error| WebRtcError::Backend(error.to_string()))?;
+            vec![convert, resample, rawcaps]
+        },
+        TransceiverKind::Video => Vec::new(),
+    };
     let queue = gstreamer::ElementFactory::make("queue")
         .build()
         .map_err(|error| WebRtcError::Backend(error.to_string()))?;
@@ -1500,17 +1822,96 @@ fn encoded_track_branch(
         .build()
         .map_err(|error| WebRtcError::Backend(error.to_string()))?;
 
+    let mut to_add: Vec<&gstreamer::Element> = vec![&selector, &valve];
+    to_add.extend(normalizer.iter());
+    to_add.extend([&encoder, &payloader, &queue, &capsfilter]);
     pipeline
-        .add_many([&valve, &encoder, &payloader, &queue, &capsfilter])
+        .add_many(&to_add)
         .map_err(|error| WebRtcError::Backend(error.to_string()))?;
-    gstreamer::Element::link_many([&src, &valve, &encoder, &payloader, &queue, &capsfilter])
+    // src と selector の接続は request pad のため手で繋ぐ。
+    // link_many は request pad を解決しない。
+    let selector_sink = selector
+        .request_pad_simple("sink_%u")
+        .ok_or_else(|| WebRtcError::Backend("input selector has no sink pad".into()))?;
+    let src_pad = src
+        .static_pad("src")
+        .ok_or_else(|| WebRtcError::Backend("encoded media source has no src pad".into()))?;
+    src_pad
+        .link(&selector_sink)
         .map_err(|error| WebRtcError::Backend(error.to_string()))?;
-    Ok((
-        capsfilter.clone(),
+    gstreamer::Element::link_many([&selector, &valve])
+        .map_err(|error| WebRtcError::Backend(error.to_string()))?;
+    match kind {
+        TransceiverKind::Audio => {
+            let [convert, resample, rawcaps] = normalizer.as_slice() else {
+                return Err(WebRtcError::Backend(
+                    "outgoing audio normalizer is missing".into(),
+                ));
+            };
+            gstreamer::Element::link_many([&valve, convert, resample, rawcaps, &encoder])
+                .map_err(|error| WebRtcError::Backend(error.to_string()))?;
+        },
+        TransceiverKind::Video => {
+            gstreamer::Element::link_many([&valve, &encoder])
+                .map_err(|error| WebRtcError::Backend(error.to_string()))?;
+        },
+    }
+    gstreamer::Element::link_many([&encoder, &payloader, &queue, &capsfilter])
+        .map_err(|error| WebRtcError::Backend(error.to_string()))?;
+    selector.set_property("active-pad", &selector_sink);
+    let mut branch = vec![selector.clone(), valve.clone()];
+    branch.extend(normalizer);
+    branch.extend([
+        encoder.clone(),
         payloader.clone(),
-        valve.clone(),
-        vec![valve, encoder, payloader, queue, capsfilter],
-    ))
+        queue.clone(),
+        capsfilter.clone(),
+    ]);
+    Ok((capsfilter, payloader, valve, selector, branch))
+}
+
+/// 送出 encoder の直前で入力を正規化する生音声 caps。
+///
+/// replaceTrack で異なる rate/channels のデバイスへ替えても、下流
+/// （encoder 以降）の caps 交渉が起きないよう 48kHz ステレオに固定する。
+static OUTGOING_RAW_AUDIO_CAPS: LazyLock<gstreamer::Caps> = LazyLock::new(|| {
+    gstreamer::Caps::builder("audio/x-raw")
+        .field("format", "S16LE")
+        .field("layout", "interleaved")
+        .field("rate", 48_000i32)
+        .field("channels", 2i32)
+        .build()
+});
+
+/// selector の新しい sink pad へ最初のバッファが届くのを待つ。
+///
+/// 到着したら真を返す。期限を過ぎたら偽を返す。probe は到着の合図だけに使い、
+/// 同期的な重い処理はしない。到着済みなら probe は自動で外れる。期限切れの場合は
+/// 呼び出し側が probe を外す。旧 active-pad には触らない。
+fn wait_for_selector_input(sink: &gstreamer::Pad, timeout: Duration) -> bool {
+    let arrived = Arc::new(AtomicBool::new(false));
+    let arrived_probe = arrived.clone();
+    let probe_id = sink.add_probe(
+        gstreamer::PadProbeType::BUFFER,
+        move |_, _| {
+            arrived_probe.store(true, Ordering::SeqCst);
+            gstreamer::PadProbeReturn::Remove
+        },
+    );
+    let start = Instant::now();
+    while !arrived.load(Ordering::SeqCst) {
+        if start.elapsed() >= timeout {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let arrived = arrived.load(Ordering::SeqCst);
+    if !arrived {
+        if let Some(probe_id) = probe_id {
+            sink.remove_probe(probe_id);
+        }
+    }
+    arrived
 }
 
 fn mline_index_for_transceiver(

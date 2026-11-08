@@ -359,6 +359,12 @@ impl RTCPeerConnection {
             None => MediaStreamTrack::new(cx, &self.global(), id, ty),
         };
         let receiver = RTCRtpReceiver::new(cx, &self.global(), &track);
+        // remote sender 用の種別と Stream ID。streams の構築で
+        // metadata.stream_ids を move する前に複製する。
+        let (kind, sender_stream_ids) = match ty {
+            MediaStreamType::Audio => (TransceiverKind::Audio, metadata.stream_ids.clone()),
+            MediaStreamType::Video => (TransceiverKind::Video, metadata.stream_ids.clone()),
+        };
         let streams = metadata
             .stream_ids
             .into_iter()
@@ -387,6 +393,8 @@ impl RTCPeerConnection {
                 metadata.mid.map(Into::into),
                 controller,
                 metadata.transceiver_id,
+                kind,
+                sender_stream_ids,
             );
             self.senders
                 .borrow_mut()
@@ -979,7 +987,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
             MediaStreamType::Video => TransceiverKind::Video,
         };
         let id = controller
-            .add_transceiver(kind, TransceiverDirection::SendRecv, Some(source))
+            .add_transceiver(kind, TransceiverDirection::SendRecv, Some(source.clone()))
             .map_err(|error| Error::Operation(Some(format!("{error:?}").into())))?;
         let transceiver = RTCRtpTransceiver::new(
             cx,
@@ -988,6 +996,8 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
             Some(track),
             controller,
             id,
+            kind,
+            source.stream_ids,
         );
         let sender = transceiver.Sender();
         self.senders.borrow_mut().push(Dom::from_ref(&*sender));
@@ -1031,6 +1041,11 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
 
         // Step 5 handled by backend
         self.controller.borrow_mut().as_ref().unwrap().quit();
+
+        // 以降の replaceTrack を InvalidState で拒否する。
+        for sender in self.senders.borrow().iter() {
+            sender.close();
+        }
 
         // Step 6
         for val in self.data_channels.borrow().values() {
@@ -1122,8 +1137,9 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         });
         let controller = self.controller.borrow().as_ref().unwrap().clone();
         let id = controller
-            .add_transceiver(kind, backend_direction(init.direction)?, source)
+            .add_transceiver(kind, backend_direction(init.direction)?, source.clone())
             .map_err(|error| Error::Operation(Some(format!("{error:?}").into())))?;
+        let stream_ids = source.map(|source| source.stream_ids).unwrap_or_default();
         let transceiver = RTCRtpTransceiver::new(
             cx,
             &self.global(),
@@ -1131,6 +1147,8 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
             track.as_deref(),
             controller,
             id,
+            kind,
+            stream_ids,
         );
         let sender = transceiver.Sender();
         self.senders.borrow_mut().push(Dom::from_ref(&*sender));

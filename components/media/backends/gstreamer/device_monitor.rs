@@ -2,21 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::RefCell;
-
 use gstreamer::DeviceMonitor as GstDeviceMonitor;
 use gstreamer::prelude::*;
 use servo_media_streams::device_monitor::{MediaDeviceInfo, MediaDeviceKind, MediaDeviceMonitor};
 
-pub struct GStreamerDeviceMonitor {
-    devices: RefCell<Option<Vec<MediaDeviceInfo>>>,
-}
+use super::device_id::public_device_id_for;
+
+pub struct GStreamerDeviceMonitor;
 
 impl GStreamerDeviceMonitor {
     pub fn new() -> Self {
-        Self {
-            devices: RefCell::new(None),
-        }
+        Self
     }
 
     fn get_devices(&self) -> Result<Vec<MediaDeviceInfo>, ()> {
@@ -35,7 +31,7 @@ impl GStreamerDeviceMonitor {
             .filter_map(|device| {
                 let display_name = device.display_name().as_str().to_owned();
                 Some(MediaDeviceInfo {
-                    device_id: display_name.clone(),
+                    device_id: public_device_id_for(device),
                     kind: match device.device_class().as_str() {
                         AUDIO_SOURCE => MediaDeviceKind::AudioInput,
                         AUDIO_SINK => MediaDeviceKind::AudioOutput,
@@ -52,13 +48,8 @@ impl GStreamerDeviceMonitor {
 
 impl MediaDeviceMonitor for GStreamerDeviceMonitor {
     fn enumerate_devices(&self) -> Option<Vec<MediaDeviceInfo>> {
-        {
-            if let Some(ref devices) = *self.devices.borrow() {
-                return Some(devices.clone());
-            }
-        }
-        let devices = self.get_devices().ok()?;
-        *self.devices.borrow_mut() = Some(devices.clone());
-        Some(devices)
+        // USB 抜き差し後に古い一覧を返さないよう、毎回取得し直す。
+        // devicechange イベントは未実装。
+        self.get_devices().ok()
     }
 }

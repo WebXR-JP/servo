@@ -19,7 +19,7 @@ use player::context::PlayerGLContext;
 use player::video::VideoFrameRenderer;
 use player::{Player, PlayerEvent, StreamType};
 use servo_base::generic_channel::GenericCallback;
-use streams::capture::MediaTrackConstraintSet;
+use streams::capture::{MediaStreamError, MediaTrackConstraintSet};
 use streams::device_monitor::MediaDeviceMonitor;
 use streams::registry::MediaStreamId;
 use streams::{MediaOutput, MediaSocket, MediaStreamType};
@@ -55,8 +55,14 @@ pub trait Backend: Send + Sync {
         &self,
         ty: MediaStreamType,
     ) -> (Box<dyn MediaSocket>, MediaStreamId);
-    fn create_audioinput_stream(&self, set: MediaTrackConstraintSet) -> Option<MediaStreamId>;
-    fn create_videoinput_stream(&self, set: MediaTrackConstraintSet) -> Option<MediaStreamId>;
+    fn create_audioinput_stream(
+        &self,
+        set: MediaTrackConstraintSet,
+    ) -> Result<MediaStreamId, MediaStreamError>;
+    fn create_videoinput_stream(
+        &self,
+        set: MediaTrackConstraintSet,
+    ) -> Result<MediaStreamId, MediaStreamError>;
     fn create_audio_context(
         &self,
         id: &ClientContextId,

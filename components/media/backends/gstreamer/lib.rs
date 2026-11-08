@@ -6,6 +6,7 @@ pub mod audio_decoder;
 pub mod audio_sink;
 pub mod audio_stream_reader;
 mod datachannel;
+mod device_id;
 mod device_monitor;
 pub mod media_capture;
 pub mod media_stream;
@@ -40,7 +41,7 @@ use servo_media_player::audio::AudioRenderer;
 use servo_media_player::context::PlayerGLContext;
 use servo_media_player::video::VideoFrameRenderer;
 use servo_media_player::{Player, PlayerEvent, StreamType};
-use servo_media_streams::capture::MediaTrackConstraintSet;
+use servo_media_streams::capture::{MediaStreamError, MediaTrackConstraintSet};
 use servo_media_streams::device_monitor::MediaDeviceMonitor;
 use servo_media_streams::registry::MediaStreamId;
 use servo_media_streams::{MediaOutput, MediaSocket, MediaStreamType};
@@ -267,7 +268,10 @@ impl Backend for GStreamerBackend {
         (Box::new(socket), id)
     }
 
-    fn create_audioinput_stream(&self, set: MediaTrackConstraintSet) -> Option<MediaStreamId> {
+    fn create_audioinput_stream(
+        &self,
+        set: MediaTrackConstraintSet,
+    ) -> Result<MediaStreamId, MediaStreamError> {
         if self.capture_mocking.load(Ordering::Acquire) {
             // 合成入力は capture 制約を適用しないため、制約付き要求を成功させない。
             if set.sample_rate.is_some()
@@ -275,25 +279,30 @@ impl Backend for GStreamerBackend {
                 || set.height.is_some()
                 || set.aspect.is_some()
                 || set.frame_rate.is_some()
+                || set.device_id.is_some()
             {
-                return None;
+                return Err(MediaStreamError::NotFound);
             }
-            return GStreamerMediaStream::try_create_audio().ok();
+            return GStreamerMediaStream::try_create_audio().map_err(MediaStreamError::NotReadable);
         }
         media_capture::create_audioinput_stream(set)
     }
 
-    fn create_videoinput_stream(&self, set: MediaTrackConstraintSet) -> Option<MediaStreamId> {
+    fn create_videoinput_stream(
+        &self,
+        set: MediaTrackConstraintSet,
+    ) -> Result<MediaStreamId, MediaStreamError> {
         if self.capture_mocking.load(Ordering::Acquire) {
             if set.sample_rate.is_some()
                 || set.width.is_some()
                 || set.height.is_some()
                 || set.aspect.is_some()
                 || set.frame_rate.is_some()
+                || set.device_id.is_some()
             {
-                return None;
+                return Err(MediaStreamError::NotFound);
             }
-            return GStreamerMediaStream::try_create_video().ok();
+            return GStreamerMediaStream::try_create_video().map_err(MediaStreamError::NotReadable);
         }
         media_capture::create_videoinput_stream(set)
     }

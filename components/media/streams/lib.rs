@@ -35,13 +35,15 @@ pub trait MediaStream: Any + Send {
 }
 
 /// メディア入力の確定済み設定。未知または未確定の値は `None` とする。
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MediaStreamSettings {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub aspect_ratio: Option<f64>,
     pub frame_rate: Option<f64>,
     pub sample_rate: Option<u32>,
+    /// 選択したデバイスの公開 ID（opaque・安定）。未確定の場合は `None`。
+    pub device_id: Option<String>,
 }
 
 /// A MediaSocket is a way for a backend to represent a

@@ -24,7 +24,7 @@ use servo_media_audio::sink::{AudioSink, AudioSinkError};
 use servo_media_audio::{AudioBackend, AudioStreamReader};
 use servo_media_player::context::PlayerGLContext;
 use servo_media_player::{Player, PlayerError, PlayerEvent, StreamType, audio, video};
-use servo_media_streams::capture::MediaTrackConstraintSet;
+use servo_media_streams::capture::{MediaStreamError, MediaTrackConstraintSet};
 use servo_media_streams::device_monitor::{MediaDeviceInfo, MediaDeviceMonitor};
 use servo_media_streams::registry::{MediaStreamId, register_stream, unregister_stream};
 use servo_media_streams::{MediaOutput, MediaSocket, MediaStream, MediaStreamType};
@@ -60,8 +60,11 @@ impl Backend for DummyBackend {
         Box::new(DummyMediaOutput)
     }
 
-    fn create_audioinput_stream(&self, _: MediaTrackConstraintSet) -> Option<MediaStreamId> {
-        Some(register_stream(Arc::new(Mutex::new(DummyMediaStream {
+    fn create_audioinput_stream(
+        &self,
+        _: MediaTrackConstraintSet,
+    ) -> Result<MediaStreamId, MediaStreamError> {
+        Ok(register_stream(Arc::new(Mutex::new(DummyMediaStream {
             id: MediaStreamId::new(),
         }))))
     }
@@ -76,8 +79,11 @@ impl Backend for DummyBackend {
         (Box::new(DummySocket), id)
     }
 
-    fn create_videoinput_stream(&self, _: MediaTrackConstraintSet) -> Option<MediaStreamId> {
-        Some(register_stream(Arc::new(Mutex::new(DummyMediaStream {
+    fn create_videoinput_stream(
+        &self,
+        _: MediaTrackConstraintSet,
+    ) -> Result<MediaStreamId, MediaStreamError> {
+        Ok(register_stream(Arc::new(Mutex::new(DummyMediaStream {
             id: MediaStreamId::new(),
         }))))
     }

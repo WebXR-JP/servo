@@ -116,6 +116,19 @@ impl WebRtcController {
             .recv()
             .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?
     }
+    pub fn replace_track(
+        &self,
+        id: TransceiverId,
+        track: Option<OutgoingTrack>,
+    ) -> Result<(), WebRtcError> {
+        let (reply, receiver) = channel();
+        self.sender
+            .send(RtcThreadEvent::ReplaceTrack(id, track, reply))
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?;
+        receiver
+            .recv()
+            .map_err(|_| WebRtcError::Backend("WebRTC event thread has stopped".into()))?
+    }
     pub fn get_transceivers(&self) -> Result<Vec<TransceiverState>, WebRtcError> {
         let (reply, receiver) = channel();
         self.sender
@@ -169,6 +182,11 @@ pub enum RtcThreadEvent {
     SetTransceiverDirection(
         TransceiverId,
         TransceiverDirection,
+        Sender<Result<(), WebRtcError>>,
+    ),
+    ReplaceTrack(
+        TransceiverId,
+        Option<OutgoingTrack>,
         Sender<Result<(), WebRtcError>>,
     ),
     GetTransceivers(Sender<Vec<TransceiverState>>),
@@ -227,6 +245,11 @@ pub fn handle_rtc_event(
         },
         RtcThreadEvent::SetTransceiverDirection(id, direction, sender) => {
             let result = controller.set_transceiver_direction(id, direction);
+            let _ = sender.send(result.clone());
+            result
+        },
+        RtcThreadEvent::ReplaceTrack(id, track, sender) => {
+            let result = controller.replace_track(id, track);
             let _ = sender.send(result.clone());
             result
         },

@@ -41,7 +41,7 @@ interface RTCRtpSender {
   //static RTCRtpCapabilities? getCapabilities(DOMString kind);
   Promise<undefined> setParameters(RTCRtpSendParameters parameters);
   RTCRtpSendParameters getParameters();
-  //Promise<void> replaceTrack(MediaStreamTrack? withTrack);
+  Promise<undefined> replaceTrack(MediaStreamTrack? withTrack);
   //void setStreams(MediaStream... streams);
   //Promise<RTCStatsReport> getStats();
 };

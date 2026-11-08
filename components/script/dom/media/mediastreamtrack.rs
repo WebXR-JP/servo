@@ -13,15 +13,16 @@ use servo_media::streams::registry::{
 use servo_media::streams::MediaStreamType;
 
 use crate::dom::bindings::codegen::Bindings::MediaDevicesBinding::{
-    ConstrainDoubleRange, ConstrainULongRange, DoubleRange, MediaTrackConstraintSet,
-    MediaTrackConstraints, ULongRange,
+    ConstrainDOMStringParameters, ConstrainDoubleRange, ConstrainULongRange, DoubleRange,
+    MediaTrackConstraintSet, MediaTrackConstraints, ULongRange,
 };
 use crate::dom::bindings::codegen::Bindings::MediaStreamTrackBinding::{
     MediaStreamTrackMethods, MediaStreamTrackState, MediaTrackSettings,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
     ClampedUnsignedLongOrConstrainULongRange as ConstrainULong,
-    DoubleOrConstrainDoubleRange as ConstrainDouble,
+    DoubleOrConstrainDoubleRange as ConstrainDouble, StringOrStringSequence,
+    StringOrStringSequenceOrConstrainDOMStringParameters as ConstrainDOMString,
 };
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
@@ -232,6 +233,7 @@ impl MediaStreamTrackMethods<crate::DomTypeHolder> for MediaStreamTrack {
             aspectRatio: settings.aspect_ratio.and_then(Finite::new),
             frameRate: settings.frame_rate.and_then(Finite::new),
             sampleRate: settings.sample_rate,
+            deviceId: settings.device_id.map(|id| id.into()),
         }
     }
 
@@ -270,6 +272,38 @@ fn copy_constraint_set(constraints: &MediaTrackConstraintSet) -> MediaTrackConst
             .as_ref()
             .and_then(copy_ulong_constraint),
         width: constraints.width.as_ref().and_then(copy_ulong_constraint),
+        deviceId: constraints
+            .deviceId
+            .as_ref()
+            .and_then(copy_device_id_constraint),
+    }
+}
+
+/// deviceId は exact と ideal の両方を保持する。
+/// backend の選択でも ideal を使うため、ulong/double と違って ideal を落とさない。
+fn copy_device_id_constraint(value: &ConstrainDOMString) -> Option<ConstrainDOMString> {
+    match value {
+        ConstrainDOMString::String(value) => Some(ConstrainDOMString::String(value.clone())),
+        ConstrainDOMString::StringSequence(values) => Some(ConstrainDOMString::StringSequence(
+            values.clone(),
+        )),
+        ConstrainDOMString::ConstrainDOMStringParameters(params) => {
+            Some(ConstrainDOMString::ConstrainDOMStringParameters(
+                ConstrainDOMStringParameters {
+                    exact: params.exact.as_ref().map(copy_string_or_sequence),
+                    ideal: params.ideal.as_ref().map(copy_string_or_sequence),
+                },
+            ))
+        },
+    }
+}
+
+fn copy_string_or_sequence(value: &StringOrStringSequence) -> StringOrStringSequence {
+    match value {
+        StringOrStringSequence::String(value) => StringOrStringSequence::String(value.clone()),
+        StringOrStringSequence::StringSequence(values) => {
+            StringOrStringSequence::StringSequence(values.clone())
+        },
     }
 }
 

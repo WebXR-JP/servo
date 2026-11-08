@@ -151,6 +151,18 @@ pub trait WebRtcControllerBackend: Send {
         ))
     }
 
+    /// 送信中のトラックを差し替える。再ネゴシエーションは行わない。
+    ///
+    /// `track` が `None` の場合は送信を止め（無音を送るか送らないかは
+    /// backend が決める）、`Some` の場合は同じ SSRC/payload/sink pad を
+    /// 維持したまま新しい入力へ切り替える。`outgoing_msid` は変えない。
+    /// 既定では未対応で `NotSupported` 相当のエラーを返す。
+    fn replace_track(&mut self, _: TransceiverId, _: Option<OutgoingTrack>) -> WebRtcResult {
+        Err(WebRtcError::Backend(
+            "The WebRTC backend does not support replaceTrack".into(),
+        ))
+    }
+
     fn get_transceivers(&mut self) -> Vec<TransceiverState> {
         Vec::new()
     }
