@@ -1375,6 +1375,22 @@ impl GStreamerWebRtcController {
         };
 
         let sdp = gstreamer_sdp::SDPMessage::parse_buffer(desc.sdp.as_bytes()).unwrap();
+        // 診断用: 受信側でネゴシエートされた音声コーデック（RED/DTX/stereo など）を記録する。
+        if description_type == DescriptionType::Remote && std::env::var_os("XRIFT_DUMP_SDP").is_some()
+        {
+            for line in desc.sdp.lines() {
+                if line.starts_with("m=audio")
+                    || line.starts_with("a=rtpmap")
+                    || line.starts_with("a=fmtp")
+                    || line.starts_with("a=rtcp-fb")
+                    || line.starts_with("a=ssrc")
+                    || line.starts_with("a=msid")
+                    || line.starts_with("a=mid")
+                {
+                    log::info!("SDP {} {}", kind, line);
+                }
+            }
+        }
         if description_type == DescriptionType::Remote {
             self.remote_description_generation += 1;
             self.store_remote_mline_info(&sdp);
