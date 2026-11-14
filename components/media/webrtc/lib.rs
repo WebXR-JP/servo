@@ -72,6 +72,9 @@ pub struct OutgoingTrack {
     pub track_id: String,
     /// Optional Opus encoder target bitrate in bits per second.
     pub audio_bitrate: Option<u32>,
+    /// 映像の maxBitrate を単一レイヤの target として近似する（bits/sec）。
+    /// `Some(0)` は auto（未指定）として扱う。
+    pub video_bitrate: Option<u32>,
 }
 
 /// A snapshot of the native transceiver state.

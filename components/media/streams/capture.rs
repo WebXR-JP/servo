@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Debug)]
 pub struct ConstrainRange<T> {
     pub min: Option<T>,
@@ -30,12 +32,27 @@ pub struct DeviceIdConstraint {
 }
 
 /// getUserMedia 系の取得失敗理由。Overconstrained の内側は制約名（今回は "deviceId"）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `GenericCallback` の応答型に載せるため serde を実装する。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaStreamError {
     NotFound,
     NotAllowed,
     NotReadable(String),
     Overconstrained(String),
+    /// このバックエンドでは画面共有を提供しない（Linux の U1 stub など）。
+    NotSupported,
+}
+
+/// getDisplayMedia のバックエンド引数。音声制約は読み捨て、`audio` フラグだけを渡す。
+/// serde は不要（同一プロセス内の呼び出しのみ）。
+#[derive(Clone, Debug, Default)]
+pub struct DisplayCaptureConstraints {
+    pub video: MediaTrackConstraintSet,
+    /// false = 音声トラックを返してはならない。
+    /// true = 音声を要求するが、バックエンドが音声を提供できない場合は映像のみ
+    /// 返してよい（XRift はこの契約で動く）。現状の U2 Linux 実装は映像のみを返す。
+    pub audio: bool,
 }
 
 #[derive(Clone, Debug, Default)]

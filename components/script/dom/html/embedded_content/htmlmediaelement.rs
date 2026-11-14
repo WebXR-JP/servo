@@ -2534,6 +2534,7 @@ impl HTMLMediaElement {
             audio_renderer,
             Box::new(window.get_player_context()),
         );
+        info!("media player を生成した");
 
         let player_id = {
             let player_guard = player.lock().unwrap();
@@ -2585,6 +2586,8 @@ impl HTMLMediaElement {
         if self.player.borrow().is_none() {
             return;
         }
+
+        info!("media player を破棄する");
 
         if let Some(ref player) = *self.player.borrow() &&
             let Err(error) = player.lock().unwrap().stop()

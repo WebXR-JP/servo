@@ -338,19 +338,7 @@ impl WebRtcControllerBackend for GStreamerWebRtcController {
         track: Option<OutgoingTrack>,
     ) -> Result<TransceiverId, WebRtcError> {
         if let Some(track) = &track {
-            if track.audio_bitrate.is_some() && kind != TransceiverKind::Audio {
-                return Err(WebRtcError::Backend(
-                    "audio bitrate is only supported for audio tracks".into(),
-                ));
-            }
-            if track
-                .audio_bitrate
-                .is_some_and(|bitrate| !(4_000..=650_000).contains(&bitrate))
-            {
-                return Err(WebRtcError::Backend(
-                    "Opus bitrate must be between 4000 and 650000 bits per second".into(),
-                ));
-            }
+            validate_outgoing_bitrates(kind, track)?;
             let source = get_stream(&track.source_stream).ok_or_else(|| {
                 WebRtcError::Backend("outgoing media stream does not exist".into())
             })?;
@@ -460,19 +448,7 @@ impl WebRtcControllerBackend for GStreamerWebRtcController {
             return Ok(());
         };
 
-        if track.audio_bitrate.is_some() && kind != TransceiverKind::Audio {
-            return Err(WebRtcError::Backend(
-                "audio bitrate is only supported for audio tracks".into(),
-            ));
-        }
-        if track
-            .audio_bitrate
-            .is_some_and(|bitrate| !(4_000..=650_000).contains(&bitrate))
-        {
-            return Err(WebRtcError::Backend(
-                "Opus bitrate must be between 4000 and 650000 bits per second".into(),
-            ));
-        }
+        validate_outgoing_bitrates(kind, &track)?;
         // encoder は作り直さないため bitrate の再設定はしない。DOM は None を
         // 送るので、ここでは範囲検証だけ行う。枝に付け替えるのは入力だけで、
         // encoder 以降や webrtc sink pad には触らない。
@@ -1114,6 +1090,7 @@ impl GStreamerWebRtcController {
                 payload,
                 outgoing_ssrc,
                 track.audio_bitrate,
+                track.video_bitrate,
             )?;
             let mut caps = source.caps_with_payload(payload);
             let msid = track
@@ -1735,12 +1712,44 @@ fn connection_state(
     })
 }
 
+/// 送信トラックのビットレート指定を検証する。
+/// `video_bitrate == Some(0)` は auto（未指定）として扱う。
+fn validate_outgoing_bitrates(kind: TransceiverKind, track: &OutgoingTrack) -> WebRtcResult {
+    if track.audio_bitrate.is_some() && kind != TransceiverKind::Audio {
+        return Err(WebRtcError::Backend(
+            "audio bitrate is only supported for audio tracks".into(),
+        ));
+    }
+    if track
+        .audio_bitrate
+        .is_some_and(|bitrate| !(4_000..=650_000).contains(&bitrate))
+    {
+        return Err(WebRtcError::Backend(
+            "Opus bitrate must be between 4000 and 650000 bits per second".into(),
+        ));
+    }
+
+    let video_bitrate = track.video_bitrate.filter(|bitrate| *bitrate != 0);
+    if video_bitrate.is_some() && kind != TransceiverKind::Video {
+        return Err(WebRtcError::Backend(
+            "video bitrate is only supported for video tracks".into(),
+        ));
+    }
+    if video_bitrate.is_some_and(|bitrate| bitrate > 20_000_000) {
+        return Err(WebRtcError::Backend(
+            "VP8 bitrate must be at most 20000000 bits per second".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn encoded_track_branch(
     stream: &mut GStreamerMediaStream,
     kind: TransceiverKind,
     payload: i32,
     ssrc: u32,
     audio_bitrate: Option<u32>,
+    video_bitrate: Option<u32>,
 ) -> Result<
     (
         gstreamer::Element,
@@ -1778,11 +1787,16 @@ fn encoded_track_branch(
                     "audio bitrate is only supported for audio tracks".into(),
                 ));
             }
-            let encoder = gstreamer::ElementFactory::make("vp8enc")
+            let mut builder = gstreamer::ElementFactory::make("vp8enc")
                 .property("deadline", 1i64)
                 .property_from_str("error-resilient", "default")
                 .property("cpu-used", -16i32)
-                .property("lag-in-frames", 0i32)
+                .property("lag-in-frames", 0i32);
+            // vp8enc の target-bitrate は bits/sec。0 は auto として未設定にする。
+            if let Some(bitrate) = video_bitrate.filter(|bitrate| *bitrate != 0) {
+                builder = builder.property("target-bitrate", bitrate as i32);
+            }
+            let encoder = builder
                 .build()
                 .map_err(|error| WebRtcError::Backend(error.to_string()))?;
             let payloader = gstreamer::ElementFactory::make("rtpvp8pay")

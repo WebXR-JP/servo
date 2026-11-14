@@ -19,8 +19,15 @@ partial interface Navigator {
 partial interface MediaDevices {
     // MediaTrackSupportedConstraints getSupportedConstraints();
     Promise<MediaStream> getUserMedia(optional MediaStreamConstraints constraints = {});
+    // https://w3c.github.io/screen-capture/#dom-mediadevices-getdisplaymedia
+    Promise<MediaStream> getDisplayMedia(optional DisplayMediaStreamOptions options = {});
 };
 
+// https://w3c.github.io/screen-capture/#dom-displaymediastreamoptions
+dictionary DisplayMediaStreamOptions {
+        (boolean or MediaTrackConstraints) video = true;
+        (boolean or MediaTrackConstraints) audio = false;
+};
 
 dictionary MediaStreamConstraints {
         (boolean or MediaTrackConstraints) video = false;

@@ -150,7 +150,8 @@ partial interface RTCPeerConnection {
     sequence<RTCRtpTransceiver> getTransceivers();
     [Pref="dom_webrtc_transceiver_enabled", Throws]
     RTCRtpSender addTrack(MediaStreamTrack track, MediaStream... streams);
-    // void                        removeTrack(RTCRtpSender sender);
+    [Pref="dom_webrtc_transceiver_enabled", Throws]
+    undefined removeTrack(RTCRtpSender sender);
     [Pref="dom_webrtc_transceiver_enabled", Throws]
     RTCRtpTransceiver addTransceiver((MediaStreamTrack or DOMString) trackOrKind,
                                      optional RTCRtpTransceiverInit init = {});

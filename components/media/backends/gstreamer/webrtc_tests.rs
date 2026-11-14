@@ -781,6 +781,7 @@ fn transceiver_api_sends_dom_msid_maps_tracks_and_delivers_incoming_pcm() {
                 stream_ids: vec!["dom-stream-123".into(), "dom-stream-789".into()],
                 track_id: "dom-track-456".into(),
                 audio_bitrate: Some(32_000),
+                video_bitrate: None,
             }),
         )
         .expect("webrtcbin should add and connect a sendonly audio transceiver");
@@ -802,6 +803,7 @@ fn transceiver_api_sends_dom_msid_maps_tracks_and_delivers_incoming_pcm() {
                 stream_ids: vec![],
                 track_id: "dom-track-streamless".into(),
                 audio_bitrate: None,
+                video_bitrate: None,
             }),
         )
         .expect("webrtcbin should add a streamless sendonly audio transceiver");
@@ -983,6 +985,7 @@ fn replace_track_switches_loopback_audio_without_renegotiation() {
                 stream_ids: vec!["replace-stream".into()],
                 track_id: "replace-track".into(),
                 audio_bitrate: None,
+                video_bitrate: None,
             }),
         )
         .expect("webrtcbin should add and connect an audio transceiver");
@@ -1028,6 +1031,7 @@ fn replace_track_switches_loopback_audio_without_renegotiation() {
                 stream_ids: vec!["replace-stream-new".into()],
                 track_id: "replace-track-new".into(),
                 audio_bitrate: None,
+                video_bitrate: None,
             }),
         )
         .expect("replaceTrack should switch the outgoing audio source");
@@ -1064,6 +1068,7 @@ fn replace_track_switches_loopback_audio_without_renegotiation() {
                 stream_ids: vec!["replace-stream".into()],
                 track_id: "replace-track".into(),
                 audio_bitrate: None,
+                video_bitrate: None,
             }),
         )
         .expect("replaceTrack should resume the previous outgoing audio source");
@@ -1083,6 +1088,7 @@ fn replace_track_switches_loopback_audio_without_renegotiation() {
                 stream_ids: vec!["replace-stream".into()],
                 track_id: "replace-track".into(),
                 audio_bitrate: None,
+                video_bitrate: None,
             }),
         )
         .expect("replaceTrack should work after the previous track stopped");
@@ -1126,6 +1132,7 @@ fn replace_track_switches_loopback_audio_without_renegotiation() {
                     stream_ids: vec!["replace-stream".into()],
                     track_id: "replace-track".into(),
                     audio_bitrate: None,
+                    video_bitrate: None,
                 }),
             )
             .is_err(),
@@ -1141,6 +1148,7 @@ fn replace_track_switches_loopback_audio_without_renegotiation() {
                     stream_ids: vec!["replace-stream".into()],
                     track_id: "replace-track".into(),
                     audio_bitrate: None,
+                    video_bitrate: None,
                 }),
             )
             .is_err(),
@@ -1186,4 +1194,83 @@ fn ice_configuration_accepts_initial_turn_and_rejects_removal() {    gstreamer::
             .is_err()
     );
     controller.quit();
+}
+
+fn video_outgoing_track(video_bitrate: Option<u32>) -> OutgoingTrack {
+    OutgoingTrack {
+        source_stream: MediaStreamId::new(),
+        stream_ids: Vec::new(),
+        track_id: "video-bitrate-track".into(),
+        audio_bitrate: None,
+        video_bitrate,
+    }
+}
+
+fn vp8_target_bitrate(video_bitrate: Option<u32>) -> i32 {
+    gstreamer::init().expect("GStreamer must initialize for VP8 bitrate tests");
+    let stream_id = GStreamerMediaStream::create_video();
+    let bitrate = {
+        let stream = get_stream(&stream_id).expect("the video track should be registered");
+        let mut stream = stream.lock().unwrap();
+        let stream = stream
+            .as_mut_any()
+            .downcast_mut::<GStreamerMediaStream>()
+            .expect("the video track should use the GStreamer backend");
+        let (_capsfilter, _payloader, _valve, _selector, branch) = super::encoded_track_branch(
+            stream,
+            TransceiverKind::Video,
+            96,
+            0x1234_5678,
+            None,
+            video_bitrate,
+        )
+        .expect("the video encoder branch should be created");
+        let encoder = branch
+            .iter()
+            .find(|element| {
+                element
+                    .factory()
+                    .is_some_and(|factory| factory.name() == "vp8enc")
+            })
+            .expect("the encoded branch should contain vp8enc");
+        encoder.property::<i32>("target-bitrate")
+    };
+    let _ = stop_stream(&stream_id);
+    bitrate
+}
+
+#[test]
+fn video_bitrate_sets_vp8_target() {
+    assert_eq!(vp8_target_bitrate(Some(600_000)), 600_000);
+}
+
+#[test]
+fn video_bitrate_none_keeps_default() {
+    assert_eq!(vp8_target_bitrate(None), 256_000);
+}
+
+#[test]
+fn video_bitrate_zero_is_auto() {
+    assert_eq!(vp8_target_bitrate(Some(0)), 256_000);
+}
+
+#[test]
+fn video_bitrate_rejected_for_audio() {
+    let track = video_outgoing_track(Some(600_000));
+    assert!(
+        super::validate_outgoing_bitrates(TransceiverKind::Audio, &track).is_err(),
+        "video_bitrate on an audio transceiver must be rejected"
+    );
+}
+
+#[test]
+fn audio_bitrate_rejected_for_video() {
+    let track = OutgoingTrack {
+        audio_bitrate: Some(32_000),
+        ..video_outgoing_track(None)
+    };
+    assert!(
+        super::validate_outgoing_bitrates(TransceiverKind::Video, &track).is_err(),
+        "audio_bitrate on a video transceiver must be rejected"
+    );
 }

@@ -16,6 +16,7 @@ use gstreamer;
 use gstreamer_app;
 use gstreamer_play;
 use gstreamer_play::prelude::*;
+use log::warn;
 use servo_base::generic_channel::{self, GenericCallback, GenericReceiver};
 use servo_media::MediaInstanceError;
 use servo_media_player::audio::AudioRenderer;
@@ -361,12 +362,23 @@ impl PlayerInner {
     fn set_stream(&mut self, stream: &MediaStreamId, only_stream: bool) -> Result<(), PlayerError> {
         debug_assert!(self.stream_type == StreamType::Stream);
         let Some(PlayerSource::Stream(ref source)) = self.source else {
+            warn!("GStreamerPlayer::set_stream: player source is not PlayerSource::Stream");
             return Err(PlayerError::SetStreamFailed);
         };
 
-        let stream = get_stream(stream).expect("Media streams registry does not contain such ID");
+        let stream = match get_stream(stream) {
+            Some(stream) => stream,
+            None => {
+                warn!(
+                    "GStreamerPlayer::set_stream: media stream id={} is not registered",
+                    stream.id()
+                );
+                return Err(PlayerError::SetStreamFailed);
+            },
+        };
         let mut stream = stream.lock().unwrap();
         let Some(stream) = stream.as_mut_any().downcast_mut::<GStreamerMediaStream>() else {
+            warn!("GStreamerPlayer::set_stream: stream is not backed by GStreamerMediaStream");
             return Err(PlayerError::SetStreamFailed);
         };
 
@@ -379,9 +391,10 @@ impl PlayerInner {
         playbin.set_base_time(*BACKEND_BASE_TIME);
         playbin.set_start_time(gstreamer::ClockTime::NONE);
         playbin.use_clock(Some(&clock));
-        source
-            .set_stream(stream, only_stream)
-            .map_err(|_| PlayerError::SetStreamFailed)
+        source.set_stream(stream, only_stream).map_err(|error| {
+            warn!("GStreamerPlayer::set_stream: ServoMediaStreamSrc::set_stream failed: {error:?}");
+            PlayerError::SetStreamFailed
+        })
     }
 
     fn set_audio_track(&mut self, stream_index: i32, enabled: bool) -> Result<(), PlayerError> {

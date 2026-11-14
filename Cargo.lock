@@ -8986,6 +8986,7 @@ dependencies = [
  "gstreamer-webrtc",
  "log",
  "rand 0.10.3",
+ "serde",
  "servo-base",
  "servo-media",
  "servo-media-audio",
@@ -8997,6 +8998,7 @@ dependencies = [
  "servo-media-traits",
  "servo-media-webrtc",
  "url",
+ "zbus",
 ]
 
 [[package]]
@@ -9074,6 +9076,7 @@ name = "servo-media-streams"
 version = "0.7.0"
 dependencies = [
  "malloc_size_of_derive",
+ "serde",
  "servo-malloc-size-of",
  "uuid",
 ]

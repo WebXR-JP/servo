@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
+use std::ffi::CStr;
 
 use dom_struct::dom_struct;
 use embedder_traits::{AllowOrDeny, EmbedderMsg};
@@ -13,16 +14,17 @@ use script_bindings::reflector::reflect_dom_object_with_cx;
 use servo_media::ServoMedia;
 use servo_media::streams::MediaStreamType;
 use servo_media::streams::capture::{
-    Constrain, ConstrainRange, DeviceIdConstraint, MediaStreamError, MediaTrackConstraintSet,
+    Constrain, ConstrainRange, DeviceIdConstraint, DisplayCaptureConstraints, MediaStreamError,
+    MediaTrackConstraintSet,
 };
 use servo_media::streams::device_monitor::MediaDeviceKind as ServoMediaDeviceKind;
-use servo_media::streams::registry::stop_stream;
+use servo_media::streams::registry::{MediaStreamId, stop_stream};
 
 use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::MediaDevicesBinding::{
-    ConstrainDOMStringParameters, ConstrainDoubleRange, ConstrainULongRange, DoubleRange,
-    MediaDevicesMethods, MediaStreamConstraints, MediaTrackConstraints,
-    MediaTrackConstraintSet as JsConstraintSet, ULongRange,
+    ConstrainDOMStringParameters, ConstrainDoubleRange, ConstrainULongRange,
+    DisplayMediaStreamOptions, DoubleRange, MediaDevicesMethods, MediaStreamConstraints,
+    MediaTrackConstraints, MediaTrackConstraintSet as JsConstraintSet, ULongRange,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
     BooleanOrMediaTrackConstraints, ClampedUnsignedLongOrConstrainULongRange as ConstrainULong,
@@ -253,6 +255,41 @@ impl RoutedPromiseListener<crate::DomTypeHolder, AllowOrDeny> for MediaDevices {
     }
 }
 
+impl RoutedPromiseListener<crate::DomTypeHolder, Result<MediaStreamId, MediaStreamError>>
+    for MediaDevices
+{
+    fn handle_response(
+        &self,
+        cx: &mut JSContext,
+        response: Result<MediaStreamId, MediaStreamError>,
+        promise: &RootedPromise,
+    ) {
+        match response {
+            Err(error) => promise.reject_error(cx, convert_stream_error(&error)),
+            Ok(stream_id) => {
+                let global = self.global();
+                let document = global.as_window().Document();
+                if !document.is_fully_active() {
+                    // 応答が届く前に document が非アクティブになった。キャプチャを
+                    // 開いたままにせず停止し、要求元だけを拒否する。
+                    let _ = stop_stream(&stream_id);
+                    promise.reject_error(
+                        cx,
+                        Error::InvalidState(Some(
+                            "The requesting document is not fully active.".to_owned(),
+                        )),
+                    );
+                    return;
+                }
+                let track = MediaStreamTrack::new(cx, &global, stream_id, MediaStreamType::Video);
+                let stream = MediaStream::new(cx, &global);
+                stream.add_track(&track);
+                promise.resolve_native(cx, &stream);
+            },
+        }
+    }
+}
+
 impl MediaDevicesMethods<crate::DomTypeHolder> for MediaDevices {
     /// <https://w3c.github.io/mediacapture-main/#dom-mediadevices-getusermedia>
     fn GetUserMedia(
@@ -337,6 +374,74 @@ impl MediaDevicesMethods<crate::DomTypeHolder> for MediaDevices {
                 p
             },
         }
+    }
+
+    /// <https://w3c.github.io/screen-capture/#dom-mediadevices-getdisplaymedia>
+    fn GetDisplayMedia(
+        &self,
+        cx: &mut CurrentRealm,
+        options: &DisplayMediaStreamOptions,
+    ) -> RootedPromise {
+        let p = Promise::new_in_realm(cx);
+
+        // video が明示的に false なら TypeError。既定は true。
+        if matches!(
+            options.video,
+            BooleanOrMediaTrackConstraints::Boolean(false)
+        ) {
+            p.reject_error(
+                cx,
+                Error::Type(c"getDisplayMedia: video must not be false".to_owned()),
+            );
+            return p;
+        }
+
+        // display 用の early error。表示ソースの選択を狭める制約は backend を
+        // 呼ぶ前に同期 reject する（Screen Capture）。
+        if let Some(message) = display_video_constraint_error(&options.video) {
+            p.reject_error(cx, Error::Type(message.to_owned()));
+            return p;
+        }
+
+        let global = self.global();
+        let document = global.as_window().Document();
+        if !document.is_fully_active() {
+            p.reject_error(
+                cx,
+                Error::InvalidState(Some(
+                    "The requesting document is not fully active.".to_owned(),
+                )),
+            );
+            return p;
+        }
+
+        let window = global.as_window();
+        if !window.has_transient_activation() {
+            p.reject_error(
+                cx,
+                Error::InvalidState(Some(
+                    "getDisplayMedia requires transient activation.".to_owned(),
+                )),
+            );
+            return p;
+        }
+        window.consume_user_activation();
+
+        // video 制約は getUserMedia と同じ変換に合わせる。audio 制約は U1 では
+        // 読み捨て、音声の要求有無だけをバックエンドへ渡す。
+        let video = convert_constraints(&options.video).unwrap_or_default();
+        let audio = !matches!(
+            options.audio,
+            BooleanOrMediaTrackConstraints::Boolean(false)
+        );
+
+        let task_manager = global.task_manager();
+        let task_source = task_manager.dom_manipulation_task_source();
+        let callback = callback_promise(&p, self, task_source);
+        ServoMedia::get()
+            .create_display_stream(DisplayCaptureConstraints { video, audio }, callback);
+
+        p
     }
 
     /// <https://w3c.github.io/mediacapture-main/#dom-mediadevices-enumeratedevices>
@@ -505,6 +610,59 @@ fn string_or_sequence(ids: &[String]) -> StringOrStringSequence {
     }
 }
 
+/// Screen Capture の early error。display 用の video 制約は表示ソースの選択を
+/// 狭める min/exact/advanced を許さない。max/ideal/素の値は best-effort として許可する。
+fn display_video_constraint_error(
+    video: &BooleanOrMediaTrackConstraints,
+) -> Option<&'static CStr> {
+    let BooleanOrMediaTrackConstraints::MediaTrackConstraints(constraints) = video else {
+        return None;
+    };
+    if constraints.advanced.is_some() {
+        return Some(c"getDisplayMedia: advanced constraints are not allowed");
+    }
+    let set = &constraints.parent;
+    if set.width.as_ref().is_some_and(has_min_or_exact_ulong) ||
+        set.height.as_ref().is_some_and(has_min_or_exact_ulong)
+    {
+        return Some(c"getDisplayMedia: width/height must not use min or exact");
+    }
+    if set.aspectRatio.as_ref().is_some_and(has_min_or_exact_double) ||
+        set.frameRate.as_ref().is_some_and(has_min_or_exact_double)
+    {
+        return Some(c"getDisplayMedia: aspectRatio/frameRate must not use min or exact");
+    }
+    if set.deviceId.as_ref().is_some_and(has_exact_domstring) {
+        return Some(c"getDisplayMedia: deviceId must not use exact");
+    }
+    None
+}
+
+fn has_min_or_exact_ulong(constraint: &ConstrainULong) -> bool {
+    match constraint {
+        ConstrainULong::ConstrainULongRange(range) => {
+            range.exact.is_some() || range.parent.min.is_some()
+        },
+        ConstrainULong::ClampedUnsignedLong(_) => false,
+    }
+}
+
+fn has_min_or_exact_double(constraint: &ConstrainDouble) -> bool {
+    match constraint {
+        ConstrainDouble::ConstrainDoubleRange(range) => {
+            range.exact.is_some() || range.parent.min.is_some()
+        },
+        ConstrainDouble::Double(_) => false,
+    }
+}
+
+fn has_exact_domstring(constraint: &ConstrainDOMString) -> bool {
+    match constraint {
+        ConstrainDOMString::ConstrainDOMStringParameters(params) => params.exact.is_some(),
+        ConstrainDOMString::String(_) | ConstrainDOMString::StringSequence(_) => false,
+    }
+}
+
 fn convert_constraints(js: &BooleanOrMediaTrackConstraints) -> Option<MediaTrackConstraintSet> {
     match js {
         BooleanOrMediaTrackConstraints::Boolean(false) => None,
@@ -531,6 +689,7 @@ fn convert_stream_error(error: &MediaStreamError) -> Error {
         MediaStreamError::Overconstrained(name) => {
             Error::NotFound(Some(format!("overconstrained: {name}")))
         },
+        MediaStreamError::NotSupported => Error::NotSupported(None),
     }
 }
 

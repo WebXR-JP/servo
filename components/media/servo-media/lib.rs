@@ -19,7 +19,7 @@ use player::context::PlayerGLContext;
 use player::video::VideoFrameRenderer;
 use player::{Player, PlayerEvent, StreamType};
 use servo_base::generic_channel::GenericCallback;
-use streams::capture::{MediaStreamError, MediaTrackConstraintSet};
+use streams::capture::{DisplayCaptureConstraints, MediaStreamError, MediaTrackConstraintSet};
 use streams::device_monitor::MediaDeviceMonitor;
 use streams::registry::MediaStreamId;
 use streams::{MediaOutput, MediaSocket, MediaStreamType};
@@ -63,6 +63,25 @@ pub trait Backend: Send + Sync {
         &self,
         set: MediaTrackConstraintSet,
     ) -> Result<MediaStreamId, MediaStreamError>;
+    /// 画面共有ストリームの生成を要求する。
+    ///
+    /// 同意 UI やキャプチャはバックエンド固有の非同期処理になるため、
+    /// 結果は `callback` で返す。既定実装は未対応を返す。
+    ///
+    /// 契約:
+    /// - `Ok(id)` のストリームは呼び出し側（DOM）が所有し、document が
+    ///   非アクティブ時は DOM が `stop_stream(&id)` で停止する。
+    /// - `Err` を返すとき、バックエンドは登録済みストリームやキャプチャ資源を
+    ///   残してはならない。
+    /// - 現状は音声トラックを返さない。`DisplayCaptureConstraints::audio` が
+    ///   true でも映像トラック1本のみを返す（U2 の Linux 実装は映像のみ）。
+    fn create_display_stream(
+        &self,
+        _constraints: DisplayCaptureConstraints,
+        callback: GenericCallback<Result<MediaStreamId, MediaStreamError>>,
+    ) {
+        let _ = callback.send(Err(MediaStreamError::NotSupported));
+    }
     fn create_audio_context(
         &self,
         id: &ClientContextId,

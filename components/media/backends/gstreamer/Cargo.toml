@@ -42,12 +42,16 @@ servo-media-player = { workspace = true }
 servo-media-streams = { workspace = true }
 servo-media-traits = { workspace = true }
 servo-media-webrtc = { workspace = true }
+serde = { workspace = true }
 url = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 servo-media-gstreamer-render-unix = { workspace = true, features = [
     "gl-egl",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
 
 [target.'cfg(target_os = "android")'.dependencies]
 servo-media-gstreamer-render-android = { workspace = true }

@@ -8,8 +8,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use glib::BoolError;
 use gstreamer;
 use gstreamer::prelude::*;
+use log::{info, warn};
 use servo_media_streams::registry::{
-    MediaStreamId, get_stream, register_stream, unregister_stream,
+    MediaStreamId, get_stream, register_stream, stop_stream, unregister_stream,
 };
 use servo_media_streams::{
     MediaOutput, MediaSocket, MediaStream, MediaStreamSettings, MediaStreamType,
@@ -37,6 +38,10 @@ pub struct GStreamerMediaStream {
     elements: Vec<gstreamer::Element>,
     pipeline: Option<gstreamer::Pipeline>,
     branch: Option<CaptureBranch>,
+    /// 再生用に共有する encoder 出力の tee と、player 専用 branch の ID。
+    /// 元 branch が WebRTC 送出などで既に link 済みの場合は clone を使う。
+    playback_output: Option<(gstreamer::Element, gstreamer::Pipeline)>,
+    playback_clone: Option<MediaStreamId>,
 }
 
 /// 1つの入力を複数のトラック枝へ分ける。入力は最後の枝が停止するまで動かす。
@@ -47,6 +52,9 @@ struct SharedSource {
     closed: bool,
     /// 選択したデバイスの公開 ID。合成入力では `None`。
     device_id: Option<String>,
+    /// 最後の枝が止まったとき、または共有入力の破棄時に一度だけ実行する後始末。
+    /// 画面共有では portal の `Session.Close` を入れる。
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 struct CaptureBranch {
@@ -98,6 +106,23 @@ fn set_track_controls_enabled(controls: &mut TrackControls, enabled: bool) {
     });
 }
 
+/// pipeline の状態遷移失敗時に、bus に届いている Error メッセージを短時間だけ拾う。
+/// 失敗理由を `NotReadable` の文字列へ含めるために使う。
+fn take_bus_error(pipeline: &gstreamer::Pipeline) -> Option<String> {
+    let bus = pipeline.bus()?;
+    let message = bus.timed_pop_filtered(
+        gstreamer::ClockTime::from_mseconds(200),
+        &[gstreamer::MessageType::Error],
+    )?;
+    match message.view() {
+        gstreamer::MessageView::Error(error) => Some(match error.debug() {
+            Some(debug) => format!("{} (debug: {debug})", error.error()),
+            None => error.error().to_string(),
+        }),
+        _ => None,
+    }
+}
+
 fn remove_unregistered_branch(
     source: &mut SharedSource,
     queue: &gstreamer::Element,
@@ -136,6 +161,8 @@ impl CaptureBranch {
         if self.stopped {
             return Ok(());
         }
+        // 途中の停止エラーでも二重実行しないよう、先に確定する。
+        self.stopped = true;
 
         if self.controls_owner {
             let mut controls = self.controls.lock().unwrap();
@@ -145,57 +172,81 @@ impl CaptureBranch {
             set_gate_enabled(&self.gate, false);
         }
 
+        // 途中で早期 return せず、すべての後始末を試す。最後の枝なら
+        // pipeline の停止成否に関わらず cleanup（portal の Session.Close）へ進む。
+        let mut errors: Vec<String> = Vec::new();
         let mut source = self.source.lock().unwrap();
         if self.linked {
-            let queue_pad = self
-                .queue
-                .static_pad("sink")
-                .ok_or_else(|| String::from("queue の入力 pad が無い"))?;
-            self.tee_pad
-                .unlink(&queue_pad)
-                .map_err(|error| error.to_string())?;
+            match self.queue.static_pad("sink") {
+                Some(queue_pad) => {
+                    if let Err(error) = self.tee_pad.unlink(&queue_pad) {
+                        errors.push(error.to_string());
+                    }
+                },
+                None => errors.push(String::from("queue の入力 pad が無い")),
+            }
             self.linked = false;
         }
         if !self.tee_pad_released {
             source.tee.release_request_pad(&self.tee_pad);
             self.tee_pad_released = true;
         }
-        self.queue
-            .set_state(gstreamer::State::Null)
-            .map_err(|error| error.to_string())?;
-        self.sink
-            .set_state(gstreamer::State::Null)
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.queue.set_state(gstreamer::State::Null) {
+            errors.push(error.to_string());
+        }
+        if let Err(error) = self.sink.set_state(gstreamer::State::Null) {
+            errors.push(error.to_string());
+        }
         if self.queue_added {
-            source
-                .pipeline
-                .remove(&self.queue)
-                .map_err(|error| error.to_string())?;
+            if let Err(error) = source.pipeline.remove(&self.queue) {
+                errors.push(error.to_string());
+            }
             self.queue_added = false;
         }
         if self.sink_added {
-            source
-                .pipeline
-                .remove(&self.sink)
-                .map_err(|error| error.to_string())?;
+            if let Err(error) = source.pipeline.remove(&self.sink) {
+                errors.push(error.to_string());
+            }
             self.sink_added = false;
         }
         if self.counted {
-            source.branches = source
-                .branches
-                .checked_sub(1)
-                .ok_or_else(|| String::from("共有メディア入力の枝数が不正"))?;
+            match source.branches.checked_sub(1) {
+                Some(branches) => source.branches = branches,
+                None => errors.push(String::from("共有メディア入力の枝数が不正")),
+            }
             self.counted = false;
         }
         if source.branches == 0 {
             source.closed = true;
-            source
-                .pipeline
-                .set_state(gstreamer::State::Null)
-                .map_err(|error| error.to_string())?;
+            if let Err(error) = source.pipeline.set_state(gstreamer::State::Null) {
+                errors.push(error.to_string());
+            }
+            let cleanup = source.cleanup.take();
+            drop(source);
+            // ロックを離してから実行する。portal の Close は別スレッドへ投げる契約。
+            if let Some(cleanup) = cleanup {
+                cleanup();
+            }
+        } else {
+            drop(source);
         }
-        self.stopped = true;
-        Ok(())
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
+impl Drop for SharedSource {
+    fn drop(&mut self) {
+        // 最後の枝の停止経路を通らずに破棄された場合も、pipeline を止めてから
+        // cleanup を一度だけ実行する。
+        let _ = self.pipeline.set_state(gstreamer::State::Null);
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
     }
 }
 
@@ -243,11 +294,20 @@ impl MediaStream for GStreamerMediaStream {
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        let branch = self
-            .branch
-            .as_mut()
-            .ok_or_else(|| String::from("独立したトラック枝ではない"))?;
-        branch.stop()
+        // 停止順は元 branch → player 用 clone。最後の branch 停止で portal
+        // cleanup が走る。
+        let result = match self.branch.as_mut() {
+            Some(branch) => branch.stop(),
+            None => Err(String::from("独立したトラック枝ではない")),
+        };
+        if let Some(clone) = self.playback_clone.take() {
+            if let Err(error) = stop_stream(&clone) {
+                warn!("再生用 branch clone を止められない: {error}");
+            }
+            unregister_stream(&clone);
+            self.playback_output = None;
+        }
+        result
     }
 
     fn settings(&self) -> MediaStreamSettings {
@@ -303,6 +363,12 @@ impl MediaStream for GStreamerMediaStream {
 }
 
 impl GStreamerMediaStream {
+    /// Registry ID assigned by `register_stream`. Used to make player stream
+    /// attachment idempotent.
+    pub(crate) fn id(&self) -> Option<MediaStreamId> {
+        self.id
+    }
+
     pub fn new(type_: MediaStreamType, elements: Vec<gstreamer::Element>) -> Self {
         Self {
             id: None,
@@ -310,6 +376,8 @@ impl GStreamerMediaStream {
             elements,
             pipeline: None,
             branch: None,
+            playback_output: None,
+            playback_clone: None,
         }
     }
 
@@ -415,6 +483,14 @@ impl GStreamerMediaStream {
         source: gstreamer::Element,
         device_id: Option<String>,
     ) -> Result<Arc<Mutex<SharedSource>>, String> {
+        Self::create_shared_with_device_and_cleanup(source, device_id, None)
+    }
+
+    fn create_shared_with_device_and_cleanup(
+        source: gstreamer::Element,
+        device_id: Option<String>,
+        cleanup: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<Arc<Mutex<SharedSource>>, String> {
         let pipeline = gstreamer::Pipeline::with_name("gstreamer media track source");
         pipeline.set_start_time(gstreamer::ClockTime::NONE);
         pipeline.set_base_time(*BACKEND_BASE_TIME);
@@ -424,18 +500,38 @@ impl GStreamerMediaStream {
             .property("allow-not-linked", true)
             .build()
             .map_err(|error| error.to_string())?;
+        if source
+            .factory()
+            .is_some_and(|factory| factory.name() == "pipewiresrc")
+        {
+            let target_object = source.property::<Option<String>>("target-object");
+            let path = source.property::<Option<String>>("path");
+            info!(
+                "create_shared_with_device: source={} target-object={target_object:?} \
+                 path={path:?}",
+                source.name()
+            );
+        }
         let setup_result = (|| -> Result<(), String> {
             pipeline
                 .add_many([&source, &tee])
                 .map_err(|error| error.to_string())?;
             source.link(&tee).map_err(|error| error.to_string())?;
-            pipeline
-                .set_state(gstreamer::State::Playing)
-                .map_err(|error| error.to_string())?;
+            if let Err(error) = pipeline.set_state(gstreamer::State::Playing) {
+                return Err(match take_bus_error(&pipeline) {
+                    Some(detail) => format!("{error}; GStreamer: {detail}"),
+                    None => error.to_string(),
+                });
+            }
             Ok(())
         })();
         if let Err(error) = setup_result {
-            return Err(match pipeline.set_state(gstreamer::State::Null) {
+            // pipeline を止めてから cleanup する。portal のセッションを残さない。
+            let null_result = pipeline.set_state(gstreamer::State::Null);
+            if let Some(cleanup) = cleanup {
+                cleanup();
+            }
+            return Err(match null_result {
                 Ok(_) => error,
                 Err(cleanup_error) => {
                     format!("{error}; 入力パイプラインの停止にも失敗: {cleanup_error}")
@@ -448,6 +544,7 @@ impl GStreamerMediaStream {
             branches: 0,
             closed: false,
             device_id,
+            cleanup,
         })))
     }
 
@@ -565,13 +662,30 @@ impl GStreamerMediaStream {
         type_: MediaStreamType,
         device_id: Option<String>,
     ) -> Result<MediaStreamId, String> {
-        let shared = Self::create_shared_with_device(source, device_id)?;
+        Self::create_shared_from_with_cleanup(source, type_, device_id, None)
+    }
+
+    fn create_shared_from_with_cleanup(
+        source: gstreamer::Element,
+        type_: MediaStreamType,
+        device_id: Option<String>,
+        cleanup: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<MediaStreamId, String> {
+        let shared = Self::create_shared_with_device_and_cleanup(source, device_id, cleanup)?;
         match Self::create_branch(shared.clone(), type_) {
             Ok(id) => Ok(id),
             Err(error) => {
                 let mut source = shared.lock().unwrap();
                 source.closed = true;
-                Err(match source.pipeline.set_state(gstreamer::State::Null) {
+                let pipeline_result = source.pipeline.set_state(gstreamer::State::Null);
+                let cleanup = source.cleanup.take();
+                drop(source);
+                // 枝の生成に失敗した時点でストリームは登録されない。portal の
+                // セッションをここで確実に閉じる。
+                if let Some(cleanup) = cleanup {
+                    cleanup();
+                }
+                Err(match pipeline_result {
                     Ok(_) => error,
                     Err(cleanup_error) => {
                         format!("{error}; 入力パイプラインの停止にも失敗: {cleanup_error}")
@@ -768,8 +882,91 @@ impl GStreamerMediaStream {
         }
     }
 
+    /// 再生用の共有 encoder 出力と pipeline を返す。ストリームごとに1本だけ作り、
+    /// 2人目以降の player は同じ tee から proxysink を生やす。元 branch が
+    /// WebRTC 送出などで既に encoder に link 済みなら、player 専用 branch を clone する。
+    pub fn encoded_for_playback(
+        &mut self,
+    ) -> Result<(gstreamer::Element, gstreamer::Pipeline), String> {
+        if let Some((tee, pipeline)) = self.playback_output.as_ref() {
+            info!(
+                "encoded_for_playback: 既存の共有出力を再利用する (tee={}, pipeline={})",
+                tee.name(),
+                pipeline.name()
+            );
+            return Ok((tee.clone(), pipeline.clone()));
+        }
+
+        let source_is_linked = self
+            .src_element()
+            .static_pad("src")
+            .map(|pad| pad.is_linked())
+            .unwrap_or(false);
+        let (pipeline, capsfilter) = if source_is_linked {
+            let clone_id = self.try_clone_branch()?;
+            let clone = get_stream(&clone_id).ok_or_else(|| {
+                String::from("再生用 branch clone が registry に無い")
+            })?;
+            let mut clone = clone.lock().unwrap();
+            let clone = clone
+                .as_mut_any()
+                .downcast_mut::<GStreamerMediaStream>()
+                .ok_or_else(|| String::from("再生用 branch clone が GStreamer 実装でない"))?;
+            let pipeline = clone.pipeline_or_new();
+            let capsfilter = clone.encoded().map_err(|error| error.to_string())?;
+            info!(
+                "encoded_for_playback: player 用 branch clone を作成した (id={})",
+                clone_id.id()
+            );
+            self.playback_clone = Some(clone_id);
+            (pipeline, capsfilter)
+        } else {
+            let pipeline = self.pipeline_or_new();
+            let capsfilter = self.encoded().map_err(|error| error.to_string())?;
+            (pipeline, capsfilter)
+        };
+        info!(
+            "encoded_for_playback: encoded() output={} caps={:?}",
+            capsfilter.name(),
+            capsfilter
+                .static_pad("src")
+                .and_then(|pad| pad.current_caps())
+        );
+
+        let tee = gstreamer::ElementFactory::make("tee")
+            .property("allow-not-linked", true)
+            .build()
+            .map_err(|error| error.to_string())?;
+        pipeline.add(&tee).map_err(|error| error.to_string())?;
+        gstreamer::Element::link_many([&capsfilter, &tee])
+            .map_err(|error| error.to_string())?;
+        tee.sync_state_with_parent()
+            .map_err(|error| error.to_string())?;
+        info!(
+            "encoded_for_playback: 共有出力を作成した (tee={}, pipeline={})",
+            tee.name(),
+            pipeline.name()
+        );
+        self.playback_output = Some((tee.clone(), pipeline.clone()));
+        Ok((tee, pipeline))
+    }
+
     pub fn try_create_video_from(source: gstreamer::Element) -> Result<MediaStreamId, String> {
         Self::create_shared_from(source, MediaStreamType::Video)
+    }
+
+    /// 画面共有など、ストリーム終了時に外部資源を片付ける必要がある入力向け。
+    /// `cleanup` は最後の枝の停止時または共有入力の破棄時に一度だけ呼ばれる。
+    pub fn try_create_video_from_with_cleanup(
+        source: gstreamer::Element,
+        cleanup: Box<dyn FnOnce() + Send>,
+    ) -> Result<MediaStreamId, String> {
+        Self::create_shared_from_with_cleanup(
+            source,
+            MediaStreamType::Video,
+            None,
+            Some(cleanup),
+        )
     }
 
     pub fn try_create_video_from_device(
@@ -829,6 +1026,13 @@ impl GStreamerMediaStream {
 
 impl Drop for GStreamerMediaStream {
     fn drop(&mut self) {
+        if let Some(clone) = self.playback_clone.take() {
+            if let Err(error) = stop_stream(&clone) {
+                warn!("再生用 branch clone を止められない: {error}");
+            }
+            unregister_stream(&clone);
+            self.playback_output = None;
+        }
         if let Some(ref id) = self.id {
             unregister_stream(id);
         }

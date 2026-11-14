@@ -9,7 +9,9 @@ use glib::subclass::prelude::*;
 use gstreamer::prelude::*;
 use gstreamer::subclass::prelude::*;
 use gstreamer_base::UniqueFlowCombiner;
+use log::{info, warn};
 use servo_media_player::PlayerError;
+use servo_media_streams::registry::MediaStreamId;
 use servo_media_streams::{MediaStream, MediaStreamType};
 use url::Url;
 
@@ -49,6 +51,12 @@ mod imp {
         flow_combiner: Arc<Mutex<UniqueFlowCombiner>>,
         has_audio_stream: Arc<AtomicBool>,
         has_video_stream: Arc<AtomicBool>,
+        /// 現在この src に設定済みの音声ストリーム。同じストリームの
+        /// 再設定を no-op にする。
+        audio_stream: Arc<Mutex<Option<MediaStreamId>>>,
+        /// 現在この src に設定済みの映像ストリーム。同じストリームの
+        /// 再設定を no-op にする。
+        video_stream: Arc<Mutex<Option<MediaStreamId>>>,
     }
 
     impl ServoMediaStreamSrc {
@@ -66,27 +74,106 @@ mod imp {
 
             gstreamer::log!(self.cat, "Setting stream");
 
+            let stream_id = stream.id();
+            let (current, src_pad) = match stream.ty() {
+                MediaStreamType::Audio => {
+                    (*self.audio_stream.lock().unwrap(), &self.audio_srcpad)
+                },
+                MediaStreamType::Video => {
+                    (*self.video_stream.lock().unwrap(), &self.video_srcpad)
+                },
+            };
+            info!(
+                "ServoMediaStreamSrc::set_stream: src_ptr={:p} type={:?} only_stream={} \
+                 caps={:?} src_element={} stream_id={:?} current={:?}",
+                self as *const Self,
+                stream.ty(),
+                only_stream,
+                stream.caps(),
+                stream.src_element().name(),
+                stream_id.map(|id| id.id().to_string()),
+                current.map(|id| id.id().to_string())
+            );
+
+            // 同じストリームが同じ src に二度設定された場合は、encoded() で
+            // encoder 枝を二重に作らず no-op にする。media element の srcObject
+            // 再設定などで同じ track が再度渡される経路がある。
+            if let Some(stream_id) = stream_id
+                && current == Some(stream_id)
+                && src_pad.parent().is_some()
+            {
+                info!(
+                    "ServoMediaStreamSrc::set_stream: stream id={} is already \
+                     configured on {}; skipping encoded()",
+                    stream_id.id(),
+                    src_pad.name()
+                );
+                return Ok(());
+            }
+
             // Append a proxysink to the media stream pipeline.
-            let pipeline = stream.pipeline_or_new();
-            let last_element = stream.encoded().map_err(|_| PlayerError::SetStreamFailed)?;
+            let (last_element, playback_pipeline) =
+                stream.encoded_for_playback().map_err(|error| {
+                    warn!(
+                        "ServoMediaStreamSrc::set_stream: encoded_for_playback() failed: {error}"
+                    );
+                    PlayerError::SetStreamFailed
+                })?;
+            let encoded_caps = last_element
+                .static_pad("src")
+                .and_then(|pad| pad.current_caps());
+            info!(
+                "ServoMediaStreamSrc::set_stream: playback output (tee)={} pipeline={} caps={:?}",
+                last_element.name(),
+                playback_pipeline.name(),
+                encoded_caps
+            );
             let sink = gstreamer::ElementFactory::make("proxysink")
                 .build()
-                .map_err(|_| PlayerError::SetStreamFailed)?;
-            pipeline
-                .add(&sink)
-                .map_err(|_| PlayerError::SetStreamFailed)?;
-            gstreamer::Element::link_many(&[&last_element, &sink][..])
-                .map_err(|_| PlayerError::SetStreamFailed)?;
+                .map_err(|error| {
+                    warn!(
+                        "ServoMediaStreamSrc::set_stream: proxysink creation failed: {error}"
+                    );
+                    PlayerError::SetStreamFailed
+                })?;
+            playback_pipeline.add(&sink).map_err(|error| {
+                warn!("ServoMediaStreamSrc::set_stream: pipeline.add(proxysink) failed: {error}");
+                PlayerError::SetStreamFailed
+            })?;
+            gstreamer::Element::link_many(&[&last_element, &sink][..]).map_err(|error| {
+                warn!("ServoMediaStreamSrc::set_stream: link_many(last_element, proxysink) failed: {error}");
+                PlayerError::SetStreamFailed
+            })?;
 
             // Create the appropriate proxysrc depending on the stream type
             // and connect the media stream proxysink to it.
-            self.setup_proxy_src(stream.ty(), &sink, src, only_stream);
+            self.setup_proxy_src(stream.ty(), &sink, src, only_stream)?;
 
-            sink.sync_state_with_parent()
-                .map_err(|_| PlayerError::SetStreamFailed)?;
-            pipeline
+            sink.sync_state_with_parent().map_err(|error| {
+                warn!(
+                    "ServoMediaStreamSrc::set_stream: proxysink sync_state_with_parent failed: {error}"
+                );
+                PlayerError::SetStreamFailed
+            })?;
+            playback_pipeline
                 .set_state(gstreamer::State::Playing)
-                .map_err(|_| PlayerError::SetStreamFailed)?;
+                .map_err(|error| {
+                    warn!(
+                        "ServoMediaStreamSrc::set_stream: pipeline.set_state(Playing) failed: {error}"
+                    );
+                    PlayerError::SetStreamFailed
+                })?;
+
+            if let Some(stream_id) = stream.id() {
+                match stream.ty() {
+                    MediaStreamType::Audio => {
+                        *self.audio_stream.lock().unwrap() = Some(stream_id);
+                    },
+                    MediaStreamType::Video => {
+                        *self.video_stream.lock().unwrap() = Some(stream_id);
+                    },
+                }
+            }
 
             Ok(())
         }
@@ -97,7 +184,7 @@ mod imp {
             sink: &gstreamer::Element,
             src: &gstreamer::Element,
             only_stream: bool,
-        ) {
+        ) -> Result<(), PlayerError> {
             let (proxysrc, src_pad, no_more_pads) = match stream_type {
                 MediaStreamType::Audio => {
                     self.has_audio_stream.store(true, Ordering::Relaxed);
@@ -119,30 +206,81 @@ mod imp {
             proxysrc.set_property("proxysink", sink);
 
             // Add proxysrc to bin
-            let bin = src.downcast_ref::<gstreamer::Bin>().unwrap();
-            bin.add(proxysrc)
-                .expect("Could not add proxysrc element to bin");
+            let Some(bin) = src.downcast_ref::<gstreamer::Bin>() else {
+                warn!("ServoMediaStreamSrc::setup_proxy_src: src is not a Bin");
+                return Err(PlayerError::SetStreamFailed);
+            };
+            info!(
+                "ServoMediaStreamSrc::setup_proxy_src: src_ptr={:p} type={:?} \
+                 only_stream={} proxysrc={} src_pad={} parent={:?} is_linked={}",
+                self as *const Self,
+                stream_type,
+                only_stream,
+                proxysrc.name(),
+                src_pad.name(),
+                src_pad.parent().map(|parent| parent.name().to_string()),
+                src_pad.is_linked()
+            );
+            if let Err(error) = bin.add(proxysrc) {
+                let already_in_bin =
+                    proxysrc.parent().as_ref() == Some(bin.upcast_ref::<gstreamer::Object>());
+                if already_in_bin {
+                    info!(
+                        "ServoMediaStreamSrc::setup_proxy_src: proxysrc is already in this bin"
+                    );
+                } else {
+                    warn!(
+                        "ServoMediaStreamSrc::setup_proxy_src: bin.add(proxysrc) failed: {error}"
+                    );
+                    return Err(PlayerError::SetStreamFailed);
+                }
+            }
 
-            let target_pad = proxysrc
-                .static_pad("src")
-                .expect("Could not get proxysrc's static src pad");
-            src_pad
-                .set_target(Some(&target_pad))
-                .expect("Could not set target pad");
+            let target_pad = match proxysrc.static_pad("src") {
+                Some(pad) => pad,
+                None => {
+                    warn!(
+                        "ServoMediaStreamSrc::setup_proxy_src: proxysrc has no static src pad"
+                    );
+                    return Err(PlayerError::SetStreamFailed);
+                },
+            };
+            if let Err(error) = src_pad.set_target(Some(&target_pad)) {
+                warn!("ServoMediaStreamSrc::setup_proxy_src: set_target failed: {error}");
+                return Err(PlayerError::SetStreamFailed);
+            }
 
-            src.add_pad(src_pad)
-                .expect("Could not add source pad to media stream src");
+            if let Err(error) = src.add_pad(src_pad) {
+                // 以降の状態同期は試す（正常経路の挙動を変えない）。
+                warn!("ServoMediaStreamSrc::setup_proxy_src: add_pad failed: {error}");
+            }
             src.set_element_flags(gstreamer::ElementFlags::SOURCE);
 
-            let proxy_pad = src_pad.internal().unwrap();
-            src_pad.set_active(true).expect("Could not active pad");
-            self.flow_combiner.lock().unwrap().add_pad(&proxy_pad);
+            match src_pad.internal() {
+                Some(proxy_pad) => self
+                    .flow_combiner
+                    .lock()
+                    .unwrap()
+                    .add_pad(&proxy_pad),
+                None => {
+                    warn!("ServoMediaStreamSrc::setup_proxy_src: src_pad.internal() is None")
+                },
+            }
+            if let Err(error) = src_pad.set_active(true) {
+                warn!("ServoMediaStreamSrc::setup_proxy_src: set_active failed: {error}");
+            }
 
-            src.sync_state_with_parent().unwrap();
+            if let Err(error) = src.sync_state_with_parent() {
+                warn!(
+                    "ServoMediaStreamSrc::setup_proxy_src: sync_state_with_parent failed: {error}"
+                );
+            }
 
             if no_more_pads || only_stream {
                 src.no_more_pads();
             }
+
+            Ok(())
         }
     }
 
@@ -214,6 +352,8 @@ mod imp {
                 flow_combiner,
                 has_video_stream: Arc::new(AtomicBool::new(false)),
                 has_audio_stream: Arc::new(AtomicBool::new(false)),
+                audio_stream: Arc::new(Mutex::new(None)),
+                video_stream: Arc::new(Mutex::new(None)),
             }
         }
     }

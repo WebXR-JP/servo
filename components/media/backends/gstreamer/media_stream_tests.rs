@@ -422,3 +422,122 @@ fn attached_audio_track_can_be_published_from_a_fresh_shared_branch() {
     );
     drop(destination_input);
 }
+
+#[test]
+fn encoded_for_playback_reuses_one_tee_for_multiple_consumers() {
+    gstreamer::init().expect("GStreamer must initialize for playback output tests");
+    let stream_id = GStreamerMediaStream::create_video();
+    {
+        let stream = get_stream(&stream_id).expect("the video track should be registered");
+        let mut stream = stream.lock().unwrap();
+        let stream = stream
+            .as_mut_any()
+            .downcast_mut::<GStreamerMediaStream>()
+            .expect("the video track should use the GStreamer backend");
+        let (tee1, pipeline1) = stream
+            .encoded_for_playback()
+            .expect("the first playback output should be created");
+        let (tee2, pipeline2) = stream
+            .encoded_for_playback()
+            .expect("the second playback output should reuse the tee");
+        assert!(
+            tee1 == tee2,
+            "encoded_for_playback must reuse the same tee for the same stream"
+        );
+        assert_eq!(
+            pipeline1.name(),
+            pipeline2.name(),
+            "the second playback output must reuse the same pipeline"
+        );
+        assert!(
+            stream.playback_clone.is_none(),
+            "an unlinked source branch must not be cloned for playback"
+        );
+
+        let pipeline = pipeline1;
+        let sink1 = gstreamer::ElementFactory::make("proxysink")
+            .build()
+            .expect("the first proxysink should be available");
+        let sink2 = gstreamer::ElementFactory::make("proxysink")
+            .build()
+            .expect("the second proxysink should be available");
+        pipeline
+            .add_many([&sink1, &sink2])
+            .expect("proxysinks should be added to the pipeline");
+        tee1
+            .link(&sink1)
+            .expect("the shared tee should link the first proxysink");
+        tee1
+            .link(&sink2)
+            .expect("the shared tee should link the second proxysink");
+    }
+    let _ = stop_stream(&stream_id);
+}
+
+#[test]
+fn encoded_for_playback_clones_branch_when_source_is_linked() {
+    gstreamer::init().expect("GStreamer must initialize for playback output tests");
+    let stream_id = GStreamerMediaStream::create_video();
+    let (tee, pipeline, clone_id, shared) = {
+        let stream = get_stream(&stream_id).expect("the video track should be registered");
+        let mut stream = stream.lock().unwrap();
+        let stream = stream
+            .as_mut_any()
+            .downcast_mut::<GStreamerMediaStream>()
+            .expect("the video track should use the GStreamer backend");
+        stream.pipeline_or_new();
+        stream
+            .encoded()
+            .expect("the original encoder branch should be created");
+        let (tee, pipeline) = stream
+            .encoded_for_playback()
+            .expect("the playback output should be created");
+        let clone_id = stream
+            .playback_clone
+            .expect("a linked source must use a playback clone");
+        let shared = stream
+            .branch
+            .as_ref()
+            .expect("the track should have a branch")
+            .source
+            .clone();
+        (tee, pipeline, clone_id, shared)
+    };
+    assert!(
+        get_stream(&clone_id).is_some(),
+        "the playback clone should remain registered while in use"
+    );
+
+    {
+        let stream = get_stream(&stream_id).expect("the video track should be registered");
+        let mut stream = stream.lock().unwrap();
+        let stream = stream
+            .as_mut_any()
+            .downcast_mut::<GStreamerMediaStream>()
+            .expect("the video track should use the GStreamer backend");
+        let (tee2, pipeline2) = stream
+            .encoded_for_playback()
+            .expect("the playback output should be reused");
+        assert!(tee == tee2, "the clone playback tee must be reused");
+        assert_eq!(
+            pipeline.name(),
+            pipeline2.name(),
+            "the clone playback pipeline must be reused"
+        );
+        assert!(
+            stream.playback_clone == Some(clone_id),
+            "only one playback clone should be created"
+        );
+    }
+
+    let _ = stop_stream(&stream_id);
+    assert!(
+        get_stream(&clone_id).is_none(),
+        "stopping the original stream must unregister the playback clone"
+    );
+    assert_eq!(
+        shared.lock().unwrap().branches,
+        0,
+        "stopping the original and its playback clone must finish the shared source"
+    );
+}

@@ -14,6 +14,8 @@ mod media_stream_source;
 pub mod player;
 mod registry_scanner;
 mod render;
+#[cfg(target_os = "linux")]
+mod screen_capture;
 mod source;
 pub mod webrtc;
 
@@ -41,7 +43,9 @@ use servo_media_player::audio::AudioRenderer;
 use servo_media_player::context::PlayerGLContext;
 use servo_media_player::video::VideoFrameRenderer;
 use servo_media_player::{Player, PlayerEvent, StreamType};
-use servo_media_streams::capture::{MediaStreamError, MediaTrackConstraintSet};
+use servo_media_streams::capture::{
+    DisplayCaptureConstraints, MediaStreamError, MediaTrackConstraintSet,
+};
 use servo_media_streams::device_monitor::MediaDeviceMonitor;
 use servo_media_streams::registry::MediaStreamId;
 use servo_media_streams::{MediaOutput, MediaSocket, MediaStreamType};
@@ -305,6 +309,15 @@ impl Backend for GStreamerBackend {
             return GStreamerMediaStream::try_create_video().map_err(MediaStreamError::NotReadable);
         }
         media_capture::create_videoinput_stream(set)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_display_stream(
+        &self,
+        constraints: DisplayCaptureConstraints,
+        callback: GenericCallback<Result<MediaStreamId, MediaStreamError>>,
+    ) {
+        screen_capture::start(constraints, callback);
     }
 
     fn can_play_type(&self, media_type: &str) -> SupportsMediaType {

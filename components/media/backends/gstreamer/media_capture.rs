@@ -5,6 +5,7 @@
 use gstreamer;
 use gstreamer::caps::NoFeature;
 use gstreamer::prelude::*;
+use log::info;
 use servo_media_streams::MediaStreamType;
 use servo_media_streams::capture::*;
 use servo_media_streams::registry::MediaStreamId;
@@ -195,11 +196,135 @@ impl GstMediaDevices {
         let element = selected
             .create_element(None)
             .map_err(|error| MediaStreamError::NotReadable(error.to_string()))?;
+        configure_pipewire_target(&element, &selected)?;
+        let element = wrap_pipewire_source(element, video)?;
         Ok(GstMediaTrack {
             element,
             device_id: Some(public_device_id_for(&selected)),
         })
     }
+}
+
+/// pipewiresrc を tee へ直結すると、下流の caps が決まる前に接続して
+/// "target not found" になる。audioconvert/videoconvert を挟んで
+/// raw caps を確定させてから返す。
+fn wrap_pipewire_source(
+    element: gstreamer::Element,
+    video: bool,
+) -> Result<gstreamer::Element, MediaStreamError> {
+    if !is_pipewiresrc(&element) {
+        return Ok(element);
+    }
+    let bin = gstreamer::Bin::new();
+    let convert = gstreamer::ElementFactory::make(if video {
+        "videoconvert"
+    } else {
+        "audioconvert"
+    })
+    .build()
+    .map_err(|error| MediaStreamError::NotReadable(error.to_string()))?;
+    bin.add_many([&element, &convert])
+        .map_err(|error| MediaStreamError::NotReadable(error.to_string()))?;
+    gstreamer::Element::link_many([&element, &convert])
+        .map_err(|error| MediaStreamError::NotReadable(error.to_string()))?;
+    let src_pad = convert.static_pad("src").ok_or_else(|| {
+        MediaStreamError::NotReadable("pipewire 入力の変換器に出力 pad が無い".to_owned())
+    })?;
+    let ghost = gstreamer::GhostPad::with_target(&src_pad)
+        .map_err(|error| MediaStreamError::NotReadable(error.to_string()))?;
+    bin.add_pad(&ghost)
+        .map_err(|error| MediaStreamError::NotReadable(error.to_string()))?;
+    info!(
+        "get_track: pipewiresrc を {} で wrap した",
+        if video { "videoconvert" } else { "audioconvert" }
+    );
+    Ok(bin.upcast())
+}
+
+fn is_pipewiresrc(element: &gstreamer::Element) -> bool {
+    element
+        .factory()
+        .is_some_and(|factory| factory.name() == "pipewiresrc")
+}
+
+/// GStreamer の pipewire プロバイダが返す Audio/Source は `pipewiresrc` で、
+/// 接続先（`target-object` か `path`）を設定しないと PAUSED への遷移で
+/// "target not found" になる。デバイスの `object.serial` / `object.id` から設定する。
+fn configure_pipewire_target(
+    element: &gstreamer::Element,
+    device: &gstreamer::Device,
+) -> Result<(), MediaStreamError> {
+    if !is_pipewiresrc(element) {
+        return Ok(());
+    }
+
+    let properties = device.properties().ok_or_else(|| {
+        MediaStreamError::NotReadable("pipewire デバイスのプロパティが無い".to_owned())
+    })?;
+
+    if let Some(serial) = property_u64(&properties, "object.serial")
+        && element.find_property("target-object").is_some()
+    {
+        if element.find_property("path").is_some() {
+            element.set_property("path", None::<String>);
+        }
+        element.set_property("target-object", serial.to_string());
+        info!(
+            "get_track: pipewiresrc に target-object={serial} を設定した (device={}, \
+             readback={:?}, element={})",
+            device.display_name(),
+            element.property::<String>("target-object"),
+            element.name()
+        );
+        return Ok(());
+    }
+
+    if let Some(node_id) = property_u64(&properties, "object.id")
+        && element.find_property("path").is_some()
+    {
+        // GstDevice::create_element が target-object を既定で入れるため、
+        // path と併用しないよう明示的に外す。
+        if element.find_property("target-object").is_some() {
+            element.set_property("target-object", None::<String>);
+        }
+        element.set_property("path", node_id.to_string());
+        info!(
+            "get_track: pipewiresrc に path={node_id} を設定した (device={}, \
+             readback={:?}, element={})",
+            device.display_name(),
+            element.property::<String>("path"),
+            element.name()
+        );
+        return Ok(());
+    }
+    Err(MediaStreamError::NotReadable(
+        "pipewiresrc の target (object.serial / object.id) を設定できない".to_owned(),
+    ))
+}
+
+fn property_u64(properties: &gstreamer::Structure, name: &str) -> Option<u64> {
+    properties
+        .get::<u64>(name)
+        .ok()
+        .or_else(|| {
+            properties
+                .get::<i64>(name)
+                .ok()
+                .and_then(|value| u64::try_from(value).ok())
+        })
+        .or_else(|| properties.get::<u32>(name).ok().map(u64::from))
+        .or_else(|| {
+            properties
+                .get::<i32>(name)
+                .ok()
+                .and_then(|value| u64::try_from(value).ok())
+        })
+        .or_else(|| {
+            properties
+                .get::<String>(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
 }
 
 fn default_device(devices: &glib::List<gstreamer::Device>) -> gstreamer::Device {

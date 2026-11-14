@@ -981,6 +981,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
                 .collect(),
             track_id: track.Id().to_string(),
             audio_bitrate: None,
+            video_bitrate: None,
         };
         let kind = match track.ty() {
             MediaStreamType::Audio => TransceiverKind::Audio,
@@ -1005,6 +1006,42 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
             .borrow_mut()
             .push(Dom::from_ref(&*transceiver));
         Ok(sender)
+    }
+
+    /// <https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-removetrack>
+    fn RemoveTrack(&self, sender: &RTCRtpSender) -> Fallible<()> {
+        if self.closed.get() {
+            return Err(Error::InvalidState(None));
+        }
+
+        let transceiver = self
+            .transceivers
+            .borrow()
+            .iter()
+            .find(|transceiver| {
+                let transceiver_sender = transceiver.Sender();
+                std::ptr::eq(&*transceiver_sender, sender)
+            })
+            .cloned();
+        let Some(transceiver) = transceiver else {
+            return Err(Error::InvalidAccess(Some(
+                "sender is not associated with this connection".into(),
+            )));
+        };
+
+        match transceiver.Direction() {
+            RTCRtpTransceiverDirection::Sendrecv => {
+                transceiver.SetDirection(RTCRtpTransceiverDirection::Recvonly)?;
+            },
+            RTCRtpTransceiverDirection::Sendonly => {
+                transceiver.SetDirection(RTCRtpTransceiverDirection::Inactive)?;
+            },
+            _ => {},
+        }
+        sender
+            .detach_track()
+            .map_err(|error| Error::Operation(Some(error.into())))?;
+        Ok(())
     }
 
     /// <https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-icegatheringstate>
@@ -1116,15 +1153,15 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
                 "unsupported RTP encoding options".into(),
             )));
         }
-        let audio_bitrate = init
+        let requested = init
             .sendEncodings
             .first()
             .and_then(|encoding| encoding.maxBitrate);
-        if kind == TransceiverKind::Video && audio_bitrate.is_some() {
-            return Err(Error::NotSupported(Some(
-                "video bitrate control is not supported".into(),
-            )));
-        }
+        let (audio_bitrate, video_bitrate) = match kind {
+            TransceiverKind::Audio => (requested, None),
+            // maxBitrate=0 は auto（未指定）として扱う。
+            TransceiverKind::Video => (None, requested.filter(|bitrate| *bitrate != 0)),
+        };
         let source = track.as_ref().map(|track| OutgoingTrack {
             source_stream: track.id(),
             stream_ids: init
@@ -1134,6 +1171,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
                 .collect(),
             track_id: track.Id().to_string(),
             audio_bitrate,
+            video_bitrate,
         });
         let controller = self.controller.borrow().as_ref().unwrap().clone();
         let id = controller

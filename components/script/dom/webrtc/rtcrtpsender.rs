@@ -80,6 +80,14 @@ impl RTCRtpSender {
     pub(crate) fn close(&self) {
         self.closed.set(true);
     }
+
+    pub(crate) fn detach_track(&self) -> Result<(), String> {
+        self.controller
+            .replace_track(self.id, None)
+            .map_err(|error| format!("{error:?}"))?;
+        self.track.set(None);
+        Ok(())
+    }
 }
 
 impl RTCRtpSenderMethods<crate::DomTypeHolder> for RTCRtpSender {
@@ -144,6 +152,7 @@ impl RTCRtpSenderMethods<crate::DomTypeHolder> for RTCRtpSender {
                 stream_ids: self.stream_ids.borrow().clone(),
                 track_id: track.Id().to_string(),
                 audio_bitrate: None,
+                video_bitrate: None,
             };
             if let Err(error) = self.controller.replace_track(self.id, Some(track)) {
                 let promise = Promise::new(cx, &self.global());
