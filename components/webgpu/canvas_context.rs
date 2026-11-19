@@ -16,7 +16,7 @@ use paint_api::{
 use pixels::{SharedSnapshot, Snapshot, SnapshotAlphaMode, SnapshotPixelFormat};
 use rustc_hash::FxHashMap;
 use servo_base::Epoch;
-use servo_base::generic_channel::GenericSender;
+use servo_base::generic_channel::{GenericSender, GenericSharedMemory};
 use webgpu_traits::id::{
     self, BufferId, CommandBufferId, CommandEncoderId, DeviceId, QueueId, TextureId,
 };
@@ -27,23 +27,65 @@ use webgpu_traits::{
     WebGPUContextId, WebGPUMsg,
 };
 use webrender_api::units::DeviceIntSize;
-use webrender_api::{
-    ExternalImageData, ExternalImageId, ExternalImageType, ImageDescriptor, ImageDescriptorFlags,
-    ImageFormat, ImageKey,
-};
+use webrender_api::{ImageDescriptor, ImageDescriptorFlags, ImageFormat, ImageKey};
 use wgpu_core::global::Global;
 use wgpu_core::resource::{BufferAccessError, BufferMapOperation, CreateBufferError};
 use wgpu_types::COPY_BYTES_PER_ROW_ALIGNMENT;
 
 pub type WebGpuExternalImageMap = Arc<Mutex<FxHashMap<WebGPUContextId, ContextData>>>;
 
-const fn image_data(context_id: WebGPUContextId) -> ExternalImageData {
-    ExternalImageData {
-        id: ExternalImageId(context_id.0),
-        channel_index: 0,
-        image_type: ExternalImageType::Buffer,
-        normalized_uvs: false,
+/// Builds the [`ImageDescriptor`] and [`SerializableImageData`] pair for a
+/// mapped presentation buffer, so the descriptor and the pixel bytes travel to
+/// WebRender in a single atomic `add_image`/`update_image` transaction.
+fn mapped_descriptor_and_data(mapped: &MappedBuffer) -> (ImageDescriptor, SerializableImageData) {
+    let descriptor = ImageDescriptor {
+        format: mapped.image_format,
+        size: mapped.image_size.cast().cast_unit(),
+        stride: Some(mapped.stride() as i32),
+        offset: 0,
+        flags: if mapped.is_opaque {
+            ImageDescriptorFlags::IS_OPAQUE
+        } else {
+            ImageDescriptorFlags::empty()
+        },
+    };
+    let data = SerializableImageData::Raw(GenericSharedMemory::from_bytes(mapped.slice()));
+    (descriptor, data)
+}
+
+/// Builds a zero-filled [`ImageDescriptor`] and [`SerializableImageData`] pair
+/// for the given canvas size.
+///
+/// WebRender rejects empty image sizes with an assert, so the size is clamped
+/// to at least 1x1 (same convention as `MIN_WR_IMAGE_SIZE` in `canvas_data.rs`).
+fn cleared_descriptor_and_data(size: DeviceIntSize) -> (ImageDescriptor, SerializableImageData) {
+    let size = DeviceIntSize::new(size.width.max(1), size.height.max(1));
+    let descriptor = ImageDescriptor {
+        format: ImageFormat::BGRA8,
+        size,
+        stride: None,
+        offset: 0,
+        flags: ImageDescriptorFlags::empty(),
+    };
+    let data = SerializableImageData::Raw(GenericSharedMemory::from_byte(
+        0,
+        size.width as usize * size.height as usize * 4,
+    ));
+    (descriptor, data)
+}
+
+/// Returns the [`ImageDescriptor`] and [`SerializableImageData`] pair
+/// describing the currently adopted presentation, or a cleared image of the
+/// current canvas size when there is no (mapped) presentation.
+fn current_descriptor_and_data(
+    context_data: &ContextData,
+) -> (ImageDescriptor, SerializableImageData) {
+    if let Some(presentation) = context_data.presentation.as_ref() {
+        if let StagingBufferState::Mapped(mapped) = &presentation.staging_buffer.state {
+            return mapped_descriptor_and_data(mapped);
+        }
     }
+    cleared_descriptor_and_data(context_data.size)
 }
 
 /// Allocated buffer on GPU device
@@ -144,13 +186,20 @@ impl StagingBuffer {
 
     /// Make buffer available by unmapping / destroying it and then recreating it if needed.
     fn ensure_available(&mut self, config: &ContextConfiguration) -> Result<(), CreateBufferError> {
-        let recreate = match &self.state {
-            StagingBufferState::Unassigned => true,
+        let current = match &self.state {
+            StagingBufferState::Unassigned => None,
             StagingBufferState::Available(buffer) |
             StagingBufferState::Mapping(buffer) |
-            StagingBufferState::Mapped(MappedBuffer { buffer, .. }) => {
+            StagingBufferState::Mapped(MappedBuffer { buffer, .. }) => Some(*buffer),
+        };
+        let recreate = match current {
+            None => true,
+            Some(buffer) => {
                 if buffer.has_compatible_config(config) {
+                    // Cancel an in-flight map or release an existing mapping so the
+                    // buffer can be reused; it is available afterwards.
                     let _ = self.global.buffer_unmap(self.buffer_id);
+                    self.state = StagingBufferState::Available(buffer);
                     false
                 } else {
                     self.global.buffer_drop(self.buffer_id);
@@ -323,15 +372,39 @@ impl WebGpuExternalImages {
 impl WebRenderExternalImageApi for WebGpuExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
         let id = WebGPUContextId(id);
-        let presentation = {
-            let mut webgpu_contexts = self.image_map.lock().unwrap();
-            webgpu_contexts
-                .get_mut(&id)
-                .and_then(|context_data| context_data.presentation.clone())
+        let (presentation, descriptor_size) = {
+            let webgpu_contexts = self.image_map.lock().unwrap();
+            let Some(context_data) = webgpu_contexts.get(&id) else {
+                return (ExternalImageSource::Invalid, Size2D::zero());
+            };
+            (
+                context_data.presentation.clone(),
+                context_data.descriptor_size,
+            )
         };
         let Some(presentation) = presentation else {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
+        let StagingBufferState::Mapped(mapped_buffer) = &presentation.staging_buffer.state else {
+            unreachable!("Presentation staging buffer should be mapped")
+        };
+        // Descriptor and pixel bytes now travel to WebRender atomically as
+        // `SerializableImageData::Raw`, so they cannot skew inside WebRender's
+        // queue. Still, guard against a presentation whose size no longer
+        // matches the last descriptor sent (e.g. after a resize): WebRender
+        // uploads using the descriptor size and ignores the size returned here,
+        // which would trip its upload size assert and abort the process.
+        // Report the image as invalid instead; WebRender fills it with
+        // a dummy value and we lose at most one frame.
+        if mapped_buffer.image_size.cast().cast_unit() != descriptor_size {
+            warn!(
+                "WebGPU canvas descriptor/presentation size mismatch \
+                (descriptor: {descriptor_size:?}, presentation: {:?}); \
+                dropping frame to avoid texture upload abort",
+                mapped_buffer.image_size,
+            );
+            return (ExternalImageSource::Invalid, Size2D::zero());
+        }
         self.locked_ids.insert(id, presentation);
         let presentation = self.locked_ids.get(&id).unwrap();
         let StagingBufferState::Mapped(mapped_buffer) = &presentation.staging_buffer.state else {
@@ -394,6 +467,13 @@ pub struct ContextData {
     image_key: Option<ImageKey>,
     /// The current size of this context.
     size: DeviceIntSize,
+    /// Size of the image descriptor most recently sent to WebRender for this
+    /// context via `add_image`/`update_image`.
+    ///
+    /// [`WebGpuExternalImages::lock`] compares the presentation against this value
+    /// and reports the image as invalid instead of handing out a buffer whose
+    /// size no longer matches the descriptor, losing at most one frame.
+    descriptor_size: DeviceIntSize,
     /// Staging buffers that are not actively used.
     ///
     /// Staging buffer here are either [`StagingBufferState::Unassigned`] or [`StagingBufferState::Available`].
@@ -416,6 +496,7 @@ impl ContextData {
         Self {
             image_key: None,
             size,
+            descriptor_size: size,
             inactive_staging_buffers: buffer_ids
                 .iter()
                 .map(|buffer_id| StagingBuffer::new(global.clone(), *buffer_id))
@@ -492,14 +573,15 @@ impl ContextData {
     }
 
     /// If the given [`PresentationStagingBuffer`] is for a newer presentation, replace the existing
-    /// one. Deallocate the older one by calling [`Self::return_staging_buffer`] on it.
-    fn replace_presentation(&mut self, presentation: PresentationStagingBuffer) {
-        let stale_presentation = if presentation.epoch >=
+    /// one and return true. Deallocate the older one by calling [`Self::return_staging_buffer`] on it.
+    /// Returns false and deallocates the given buffer when it carries an older epoch.
+    fn replace_presentation(&mut self, presentation: PresentationStagingBuffer) -> bool {
+        let adopted = presentation.epoch >=
             self.presentation
                 .as_ref()
                 .map(|p| p.epoch)
-                .unwrap_or_default()
-        {
+                .unwrap_or_default();
+        let stale_presentation = if adopted {
             self.presentation.replace(presentation)
         } else {
             Some(presentation)
@@ -507,6 +589,7 @@ impl ContextData {
         if let Some(stale_presentation) = stale_presentation {
             stale_presentation.maybe_destroy(self);
         }
+        adopted
     }
 
     fn clear_presentation(&mut self) {
@@ -546,18 +629,12 @@ impl crate::WGPU {
             self.paint_api.delete_image(old_image_key);
         }
 
-        self.paint_api.add_image(
-            image_key,
-            ImageDescriptor {
-                format: ImageFormat::BGRA8,
-                size: context_data.size,
-                stride: None,
-                offset: 0,
-                flags: ImageDescriptorFlags::empty(),
-            },
-            SerializableImageData::External(image_data(context_id)),
-            false,
-        );
+        // Send the currently adopted presentation (or a cleared image) as raw
+        // bytes, so the descriptor and the pixels reach WebRender atomically.
+        let (descriptor, data) = current_descriptor_and_data(context_data);
+        context_data.descriptor_size = descriptor.size;
+        self.paint_api
+            .add_image(image_key, descriptor, data, false);
     }
 
     pub(crate) fn get_image(
@@ -586,6 +663,7 @@ impl crate::WGPU {
 
             let epoch = context_data.next_epoch();
             let wgpu_image_map = self.wgpu_image_map.clone();
+            let paint_api = self.paint_api.clone();
             let sender = sender;
             drop(webgpu_contexts);
             self.texture_download(
@@ -607,10 +685,30 @@ impl crate::WGPU {
                         )
                         .unwrap();
                     if staging_buffer.is_mapped() {
-                        context_data.replace_presentation(PresentationStagingBuffer::new(
-                            epoch,
-                            staging_buffer,
-                        ));
+                        let shared = {
+                            let StagingBufferState::Mapped(mapped) = &staging_buffer.state
+                            else {
+                                unreachable!("checked by `is_mapped`")
+                            };
+                            GenericSharedMemory::from_bytes(mapped.slice())
+                        };
+                        let adopted = context_data.replace_presentation(
+                            PresentationStagingBuffer::new(epoch, staging_buffer),
+                        );
+                        // Keep WebRender's copy in sync with the newly adopted
+                        // presentation; `present` may never run for this frame.
+                        if adopted {
+                            if let Some(image_key) = context_data.image_key {
+                                let descriptor: ImageDescriptor = configuration.into();
+                                context_data.descriptor_size = descriptor.size;
+                                paint_api.update_image(
+                                    image_key,
+                                    descriptor,
+                                    SerializableImageData::Raw(shared),
+                                    None,
+                                );
+                            }
+                        }
                     } else {
                         // failure
                         context_data.return_staging_buffer(staging_buffer);
@@ -649,6 +747,10 @@ impl crate::WGPU {
             return;
         };
 
+        // Keep the recorded canvas size current; `set_image_key` may have
+        // stored an older size.
+        context_data.size = size.cast_unit().cast();
+
         let Some(PendingTexture {
             texture_id,
             encoder_id,
@@ -657,16 +759,12 @@ impl crate::WGPU {
         }) = pending_texture
         else {
             context_data.clear_presentation();
+            let (descriptor, data) = cleared_descriptor_and_data(context_data.size);
+            context_data.descriptor_size = descriptor.size;
             self.paint_api.update_image(
                 image_key,
-                ImageDescriptor {
-                    format: ImageFormat::BGRA8,
-                    size: size.cast_unit().cast(),
-                    stride: None,
-                    offset: 0,
-                    flags: ImageDescriptorFlags::empty(),
-                },
-                SerializableImageData::External(image_data(context_id)),
+                descriptor,
+                data,
                 Some(canvas_epoch),
             );
             return;
@@ -674,10 +772,13 @@ impl crate::WGPU {
         let Some(staging_buffer) = context_data.get_or_make_available_buffer(&configuration) else {
             warn!("Failure obtaining available staging buffer");
             context_data.clear_presentation();
+            let (descriptor, data) =
+                cleared_descriptor_and_data(configuration.size.cast().cast_unit());
+            context_data.descriptor_size = descriptor.size;
             self.paint_api.update_image(
                 image_key,
-                configuration.into(),
-                SerializableImageData::External(image_data(context_id)),
+                descriptor,
+                data,
                 Some(canvas_epoch),
             );
             return;
@@ -696,21 +797,74 @@ impl crate::WGPU {
                 let mut webgpu_contexts = wgpu_image_map.lock().unwrap();
                 let context_data = webgpu_contexts.get_mut(&context_id).unwrap();
                 if staging_buffer.is_mapped() {
-                    context_data.replace_presentation(PresentationStagingBuffer::new(
-                        epoch,
-                        staging_buffer,
-                    ));
+                    // Copy the pixels out before the staging buffer moves into
+                    // the presentation slot.
+                    let shared = {
+                        let StagingBufferState::Mapped(mapped) = &staging_buffer.state
+                        else {
+                            unreachable!("checked by `is_mapped`")
+                        };
+                        GenericSharedMemory::from_bytes(mapped.slice())
+                    };
+                    let adopted = context_data.replace_presentation(
+                        PresentationStagingBuffer::new(epoch, staging_buffer),
+                    );
+                    if adopted {
+                        // Fresh frame: descriptor and pixels travel atomically.
+                        let descriptor: ImageDescriptor = configuration.into();
+                        context_data.descriptor_size = descriptor.size;
+                        paint_api.update_image(
+                            image_key,
+                            descriptor,
+                            SerializableImageData::Raw(shared),
+                            Some(canvas_epoch),
+                        );
+                    } else {
+                        // Stale frame: never overwrite WebRender with the old
+                        // size; resend the currently adopted presentation (or a
+                        // cleared image) so the FrameDelayer still observes
+                        // this epoch.
+                        let (descriptor, data) = current_descriptor_and_data(context_data);
+                        context_data.descriptor_size = descriptor.size;
+                        paint_api.update_image(
+                            image_key,
+                            descriptor,
+                            data,
+                            Some(canvas_epoch),
+                        );
+                    }
                 } else {
                     context_data.return_staging_buffer(staging_buffer);
-                    context_data.clear_presentation();
+                    let current_epoch = context_data
+                        .presentation
+                        .as_ref()
+                        .map(|presentation| presentation.epoch)
+                        .unwrap_or_default();
+                    if epoch >= current_epoch {
+                        context_data.clear_presentation();
+                        let (descriptor, data) =
+                            cleared_descriptor_and_data(context_data.size);
+                        context_data.descriptor_size = descriptor.size;
+                        paint_api.update_image(
+                            image_key,
+                            descriptor,
+                            data,
+                            Some(canvas_epoch),
+                        );
+                    } else {
+                        // Stale failure: keep the adopted presentation, but the
+                        // FrameDelayer still needs an `update_image` carrying
+                        // this epoch.
+                        let (descriptor, data) = current_descriptor_and_data(context_data);
+                        context_data.descriptor_size = descriptor.size;
+                        paint_api.update_image(
+                            image_key,
+                            descriptor,
+                            data,
+                            Some(canvas_epoch),
+                        );
+                    }
                 }
-                // update image in WR
-                paint_api.update_image(
-                    image_key,
-                    configuration.into(),
-                    SerializableImageData::External(image_data(context_id)),
-                    Some(canvas_epoch),
-                );
             },
         );
     }

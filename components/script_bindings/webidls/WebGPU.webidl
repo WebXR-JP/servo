@@ -951,10 +951,14 @@ interface GPUCommandEncoder {
 
     undefined copyBufferToBuffer(
         GPUBuffer source,
+        GPUBuffer destination,
+        optional GPUSize64 size);
+    undefined copyBufferToBuffer(
+        GPUBuffer source,
         GPUSize64 sourceOffset,
         GPUBuffer destination,
         GPUSize64 destinationOffset,
-        GPUSize64 size);
+        optional GPUSize64 size);
 
     [Throws]
     undefined copyBufferToTexture(
@@ -980,6 +984,11 @@ interface GPUCommandEncoder {
         GPUTexelCopyTextureInfo destination,
         GPUExtent3D copySize);
     */
+
+    undefined clearBuffer(
+        GPUBuffer buffer,
+        optional GPUSize64 offset = 0,
+        optional GPUSize64 size);
 
     undefined resolveQuerySet(
         GPUQuerySet querySet,
