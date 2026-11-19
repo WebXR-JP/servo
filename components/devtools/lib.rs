@@ -39,6 +39,7 @@ use serde_json::{Map, Number, Value};
 use servo_base::generic_channel::{self, GenericSender};
 use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
 use servo_config::pref;
+use uuid::Uuid;
 
 use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
 use crate::actors::browsing_context::BrowsingContextActor;
@@ -49,7 +50,7 @@ use crate::actors::framerate::FramerateActor;
 use crate::actors::inspector::InspectorActor;
 use crate::actors::inspector::walker::WalkerActor;
 use crate::actors::network_event::NetworkEventActor;
-use crate::actors::object::ObjectActor;
+use crate::actors::object::{ObjectActor, ObjectPropertyDescriptor};
 use crate::actors::pause::PauseActor;
 use crate::actors::root::RootActor;
 use crate::actors::source::SourceActor;
@@ -165,7 +166,7 @@ struct DevtoolsInstance {
     receiver: Receiver<DevtoolsControlMsg>,
     pipelines: FxHashMap<PipelineId, BrowsingContextId>,
     actor_workers: FxHashMap<WorkerId, String>,
-    actor_requests: HashMap<String, String>,
+    actor_requests: HashMap<Uuid, String>,
     /// A map of active TCP connections to devtools clients.
     ///
     /// Client threads remove their connection from here once they exit.
@@ -450,10 +451,9 @@ impl DevtoolsInstance {
         let Some(browsing_context_name) = self.browsing_contexts.get(&browsing_context_id) else {
             return;
         };
-        let browsing_context_name = browsing_context_name.clone();
         let browsing_context_actor = self
             .registry
-            .find::<BrowsingContextActor>(&browsing_context_name);
+            .find::<BrowsingContextActor>(browsing_context_name);
         let watcher_actor = self
             .registry
             .find::<WatcherActor>(&browsing_context_actor.watcher_name);
@@ -683,7 +683,7 @@ impl DevtoolsInstance {
     fn handle_network_event(
         &mut self,
         connections: Vec<DevtoolsConnection>,
-        request_id: String,
+        request_id: Uuid,
         network_event: NetworkEvent,
     ) {
         let browsing_context_id = match &network_event {
@@ -713,7 +713,7 @@ impl DevtoolsInstance {
     /// Create a new NetworkEventActor for a given request ID and browsing context name.
     fn create_network_event_actor(
         &mut self,
-        request_id: String,
+        request_id: Uuid,
         browsing_context_name: String,
     ) -> String {
         let resource_id = self.next_resource_id;
@@ -790,8 +790,9 @@ impl DevtoolsInstance {
                 .registry
                 .find::<BrowsingContextActor>(browsing_context_name);
 
-            let thread_actor_name = browsing_context_actor.thread_name.clone();
-            let thread_actor = self.registry.find::<ThreadActor>(&thread_actor_name);
+            let thread_actor = self
+                .registry
+                .find::<ThreadActor>(&browsing_context_actor.thread_name);
             thread_actor.source_manager.add_source(source_actor.name());
 
             for stream in self.connections.lock().unwrap().values_mut() {
@@ -904,6 +905,7 @@ impl DevtoolsInstance {
             class,
             own_property_length,
             preview,
+            prototype,
         } = value
         else {
             return;
@@ -915,6 +917,7 @@ impl DevtoolsInstance {
             class,
             own_property_length,
             preview.map(|preview| *preview),
+            prototype.map(|prototype| *prototype),
         );
         let _ = result_sender.send(object_actor);
     }
@@ -1048,6 +1051,7 @@ pub(crate) fn debugger_value_to_json(registry: &ActorRegistry, value: DebuggerVa
             class,
             own_property_length,
             preview,
+            prototype,
         } => {
             let object_name = ObjectActor::register(
                 registry,
@@ -1055,10 +1059,111 @@ pub(crate) fn debugger_value_to_json(registry: &ActorRegistry, value: DebuggerVa
                 class,
                 own_property_length,
                 preview.map(|preview| *preview),
+                prototype.map(|prototype| *prototype),
             );
             let object_msg = registry.encode::<ObjectActor, _>(&object_name);
             let value = serde_json::to_value(object_msg).unwrap_or_default();
             Value::Object(value.as_object().cloned().unwrap_or_default())
         },
     }
+}
+
+/// Port of Firefox's `getConsoleTableMessageItems`.
+fn console_table_items(
+    registry: &ActorRegistry,
+    value: &DebuggerValue,
+    load_sub_properties: bool,
+) -> Option<Map<String, Value>> {
+    let DebuggerValue::ObjectValue {
+        preview: Some(preview),
+        ..
+    } = value
+    else {
+        return None;
+    };
+
+    let mut items = Map::new();
+    if let Some(array_items) = &preview.items {
+        // isArray(grip) -> ignoreNonIndexedProperties: only indices, no `length`.
+        for (index, item) in array_items.iter().enumerate() {
+            items.insert(
+                index.to_string(),
+                table_descriptor(registry, item, load_sub_properties, true, true, true),
+            );
+        }
+    } else if let Some(entries) = &preview.entries {
+        // Map -> enumEntries()
+        for (index, (key, value)) in entries.iter().enumerate() {
+            let mut entry_preview = Map::new();
+            entry_preview.insert(
+                "key".to_owned(),
+                debugger_value_to_json(registry, key.clone()),
+            );
+            entry_preview.insert(
+                "value".to_owned(),
+                debugger_value_to_json(registry, value.clone()),
+            );
+
+            let mut entry = Map::new();
+            entry.insert("type".to_owned(), Value::String("mapEntry".to_owned()));
+            entry.insert("preview".to_owned(), Value::Object(entry_preview));
+
+            items.insert(
+                index.to_string(),
+                serde_json::to_value(ObjectPropertyDescriptor {
+                    value: Value::Object(entry),
+                    configurable: Some(false),
+                    enumerable: true,
+                    writable: Some(false),
+                    is_accessor: None,
+                })
+                .unwrap(),
+            );
+        }
+    } else if let Some(properties) = &preview.own_properties {
+        for property in properties {
+            items.insert(
+                property.name.clone(),
+                table_descriptor(
+                    registry,
+                    &property.value,
+                    load_sub_properties,
+                    property.configurable,
+                    property.enumerable,
+                    property.writable,
+                ),
+            );
+        }
+    }
+
+    Some(items)
+}
+
+fn table_descriptor(
+    registry: &ActorRegistry,
+    value: &DebuggerValue,
+    load_sub_properties: bool,
+    configurable: bool,
+    enumerable: bool,
+    writable: bool,
+) -> Value {
+    let mut grip = debugger_value_to_json(registry, value.clone());
+
+    // "We need to load sub-properties as well to render the table in a nice way."
+    // Firefox only goes one level deep.
+    if load_sub_properties &&
+        let Some(sub_properties) = console_table_items(registry, value, false) &&
+        let Some(grip_object) = grip.as_object_mut()
+    {
+        grip_object.insert("ownProperties".to_owned(), Value::Object(sub_properties));
+    }
+
+    serde_json::to_value(ObjectPropertyDescriptor {
+        value: grip,
+        configurable: Some(configurable),
+        enumerable,
+        writable: Some(writable),
+        is_accessor: None,
+    })
+    .unwrap()
 }

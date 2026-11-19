@@ -15,8 +15,6 @@ android {
 
     defaultConfig { minSdk = libs.versions.android.sdk.min.get().toInt() }
 
-    lint { targetSdk = 33 }
-
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
@@ -49,14 +47,14 @@ android {
 
     sourceSets {
         named("main") {}
-        named("armv7Debug") { jniLibs.srcDirs(getJniLibsPath(true, "armv7")) }
-        named("armv7Release") { jniLibs.srcDirs(getJniLibsPath(false, "armv7")) }
-        named("arm64Debug") { jniLibs.srcDirs(getJniLibsPath(true, "arm64")) }
-        named("arm64Release") { jniLibs.srcDirs(getJniLibsPath(false, "arm64")) }
-        named("x86Debug") { jniLibs.srcDirs(getJniLibsPath(true, "x86")) }
-        named("x86Release") { jniLibs.srcDirs(getJniLibsPath(false, "x86")) }
-        named("x64Debug") { jniLibs.srcDirs(getJniLibsPath(true, "x64")) }
-        named("x64Release") { jniLibs.srcDirs(getJniLibsPath(false, "x64")) }
+        named("armv7Debug") { jniLibs.directories += getJniLibsPath(true, "armv7") }
+        named("armv7Release") { jniLibs.directories += getJniLibsPath(false, "armv7") }
+        named("arm64Debug") { jniLibs.directories += getJniLibsPath(true, "arm64") }
+        named("arm64Release") { jniLibs.directories += getJniLibsPath(false, "arm64") }
+        named("x86Debug") { jniLibs.directories += getJniLibsPath(true, "x86") }
+        named("x86Release") { jniLibs.directories += getJniLibsPath(false, "x86") }
+        named("x64Debug") { jniLibs.directories += getJniLibsPath(true, "x64") }
+        named("x64Release") { jniLibs.directories += getJniLibsPath(false, "x64") }
     }
 }
 
@@ -140,4 +138,7 @@ project.afterEvaluate {
     }
 }
 
-dependencies { implementation(libs.androidx.compose.foundation) }
+dependencies {
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.compose.foundation)
+}

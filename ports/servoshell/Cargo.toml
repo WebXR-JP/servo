@@ -23,13 +23,6 @@ bench = false
 [lints]
 workspace = true
 
-# Some of these dependencies are only needed for a specific target OS, but
-# since build-scripts can't detect the Cargo target OS at build-time, we
-# must unconditionally add these dependencies. See https://github.com/rust-lang/cargo/issues/4932
-[build-dependencies]
-# macOS only
-cc = { workspace = true }
-
 [target.'cfg(windows)'.build-dependencies]
 winresource = { workspace = true }
 
@@ -40,14 +33,25 @@ OriginalFilename = "servoshell.exe"
 ProductName = "ServoShell"
 
 [features]
-# Don't add new features to `default` directly. Add to `default_without_allocator` instead.
-default = ["default_without_allocator", "servo-allocator/use-jemalloc"]
+# Don't add new features to `default` directly. Add to `default_base` instead.
+default = ["default_base", "media-gstreamer"]
 # Feature groups:
-# default features, without a custom allocator.
-default_without_allocator = ["bundled", "default_web_features", "max_log_level", "multiprocess", "js_jit"]
+# Base default features, without GStreamer media support.
+default_base = [
+    "bundled",
+    "default_web_features",
+    "default_tooling",
+    "jemalloc",
+    "max_log_level",
+    "multiprocess",
+    "js_jit",
+]
+# Enable jemalloc on platforms that support it (not OHOS and not Windows).
+jemalloc = ["servo-allocator/use-jemalloc"]
 # Default web features should be kept in sync with the list in servo/Cargo.toml.
 # We also need to enable our own features, since we also have `cfg` gated code here.
 default_web_features = ["servo/default_web_features", "gamepad", "webgpu", "webgl", "webxr"]
+default_tooling = ["servo/default_tooling", "devtools"]
 # Bundle required resources in the binary.
 bundled = ["servo/bundled"]
 
@@ -56,6 +60,7 @@ baked-in-resources = ["servo/baked-in-resources"]
 bundled_freetype = ["servo/bundled_freetype"]
 crown = ["servo/crown"]
 debugmozjs = ["servo/debugmozjs"]
+devtools = ["servo/devtools"]
 gamepad = ["servo/gamepad"]
 jitspew = ["servo/jitspew"]
 js_backtrace = ["servo/js_backtrace"]
@@ -65,6 +70,7 @@ media-gstreamer = ["servo/media-gstreamer"]
 multiprocess = ["servo/multiprocess"]
 native-bluetooth = ["servo/native-bluetooth"]
 profilemozjs = ["servo/profilemozjs"]
+subtlecrypto = ["servo/subtlecrypto"]
 tracing = ["dep:tracing", "dep:tracing-subscriber", "servo/tracing"]
 tracing-hitrace = ["tracing", "dep:hitrace"]
 tracing-perfetto = ["tracing", "dep:tracing-perfetto"]
@@ -137,12 +143,13 @@ surfman = { workspace = true, features = ["sm-angle-default"] }
 [target.'cfg(not(any(target_os = "android", target_env = "ohos")))'.dependencies]
 dirs = { workspace = true }
 egui = { workspace = true }
-egui-file-dialog = { workspace = true }
 egui-winit = { workspace = true, features = ["accesskit", "clipboard", "wayland"] }
 egui_glow = { workspace = true, features = ["winit"] }
 gilrs = { workspace = true }
 glow = { workspace = true }
 headers = { workspace = true }
+itertools = { workspace = true }
+rfd = { workspace = true }
 serde_json = { workspace = true }
 # For optional feature servo-allocator/use-jemalloc and servo-allocator/allocation-tracking
 servo-allocator = { workspace = true }
@@ -167,6 +174,7 @@ winapi = { workspace = true, optional = true, features = [
 wio = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+mach2 = { workspace = true }
 objc2-app-kit = { workspace = true, features = [
     "std",
     "NSColorSpace",

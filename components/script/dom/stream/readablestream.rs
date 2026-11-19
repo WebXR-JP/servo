@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use js::conversions::{FromJSValConvertible, ToJSValConvertible};
+use js::conversions::ToJSValConvertible;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::realm::CurrentRealm;
@@ -68,7 +68,7 @@ use crate::dom::messageport::MessagePort;
 use crate::realms::{enter_auto_realm};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::bindings::transferable::Transferable;
-use crate::dom::bindings::structuredclone::StructuredData;
+use script_bindings::structuredclone::StructuredData;
 
 use super::readablestreambyobreader::ReadIntoRequest;
 use crate::dom::bindings::buffer_source::{HeapBufferSource, create_buffer_source};

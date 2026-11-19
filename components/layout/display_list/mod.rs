@@ -10,11 +10,12 @@ use app_units::{AU_PER_PX, Au};
 use clip::Clip;
 pub(crate) use clip::ClipId;
 use euclid::{Box2D, Point2D, Rect, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
-use fonts::ShapedTextSlice;
+use fonts::{FontMetrics, ShapedTextSlice};
 use gradient::WebRenderGradient;
 use layout_api::ReflowStatistics;
 use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
 use servo_arc::Arc as ServoArc;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::{PipelineId, ScrollTreeNodeId};
 use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
 use servo_config::{pref, prefs};
@@ -25,9 +26,7 @@ use style::computed_values::background_blend_mode::SingleComputedValue as Backgr
 use style::computed_values::border_image_outset::T as BorderImageOutset;
 use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
 use style::computed_values::overflow_x::T as ComputedOverflow;
-use style::computed_values::text_decoration_style::{
-    T as ComputedTextDecorationStyle, T as TextDecorationStyle,
-};
+use style::computed_values::text_decoration_style::T as ComputedTextDecorationStyle;
 use style::computed_values::text_decoration_thickness::T as TextDecorationThickness;
 use style::dom::OpaqueNode;
 use style::properties::ComputedValues;
@@ -61,9 +60,9 @@ use crate::display_list::conversions::FilterToWebRender;
 pub(crate) use crate::display_list::conversions::ToWebRender;
 use crate::display_list::paint_traversal::{PaintTraversal, PaintTraversalHandler, TraversalState};
 use crate::fragment_tree::{
-    BackgroundMode, BaseFragment, BoxFragment, BoxFragmentWithStyle, ContainingBlockCalculation,
-    Fragment, FragmentFlags, FragmentStatus, FragmentTree, IFrameFragment, ImageFragment,
-    PositioningFragment, SpecificLayoutInfo, Tag, TextFragment,
+    BackgroundMode, BaseFragment, BoxFragment, BoxFragmentWithStyle,
+    CumulativeContentRectCalculation, Fragment, FragmentFlags, FragmentStatus, FragmentTree,
+    IFrameFragment, ImageFragment, PositioningFragment, SpecificLayoutInfo, Tag, TextFragment,
 };
 use crate::geom::{
     LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize,
@@ -78,10 +77,13 @@ mod gradient;
 mod hit_test;
 mod paint_timing_handler;
 mod paint_traversal;
+mod painted_region;
 mod stacking_context;
 
 pub(crate) use hit_test::{ClosestFragmentSearch, HitTest};
-pub(crate) use paint_timing_handler::PaintTimingHandler;
+pub(crate) use paint_timing_handler::{
+    ContainerTimingRootChain, ContainerTimingRoots, PaintTimingHandler,
+};
 pub(crate) use stacking_context::*;
 
 const INSERTION_POINT_LOGICAL_WIDTH: Au = Au(AU_PER_PX);
@@ -139,12 +141,19 @@ pub(crate) struct DisplayListBuilder<'a> {
     /// Whether the `largest_contentul_paint_enabled` preference is enabled.
     largest_contentful_paint_enabled: bool,
 
+    /// Whether the `container_timing_enabled` preference is enabled.
+    container_timing_enabled: bool,
+
     /// The background color used for the shell.
     shell_background_color: AbsoluteColor,
 
     /// Whether or not the `WebView` this display list is being rendered for has system focus
     /// and is the focused frame in the frame tree.
     frame_focused: bool,
+
+    /// Glyphs of the text fragment being built, reused across fragments to avoid
+    /// an allocation per fragment.
+    glyph_buffer: Vec<GlyphInstance>,
 }
 
 struct InspectorHighlight {
@@ -239,8 +248,10 @@ impl DisplayListBuilder<'_> {
             paint_timing_handler,
             reflow_statistics,
             largest_contentful_paint_enabled: pref!(largest_contentful_paint_enabled),
+            container_timing_enabled: pref!(container_timing_enabled),
             shell_background_color,
             frame_focused,
+            glyph_buffer: Vec::new(),
         };
 
         // Clear any caret color from previous display list constructions.
@@ -426,6 +437,51 @@ impl DisplayListBuilder<'_> {
         }))
     }
 
+    fn push_webrender_stacking_context_for_transform_if_necessary(
+        &mut self,
+        stacking_context: &StackingContext,
+    ) -> bool {
+        let StackingContextFragments::Fragment(fragment) = &stacking_context.fragment else {
+            return false;
+        };
+
+        let style = fragment.style();
+        let transform_style = style
+            .used_transform_style(fragment.base.flags)
+            .to_webrender();
+
+        if !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
+            (transform_style == TransformStyle::Flat &&
+                !stacking_context.participates_in_a_3d_rendering_context)
+        {
+            return false;
+        }
+
+        // WebRender has two different ways of expressing "no clip." ClipChainId::INVALID
+        // should be used for primitives, but `None` is used for stacking contexts and
+        // clip chains. We convert to the `Option<ClipChainId>` representation here. Just
+        // passing Some(ClipChainId::INVALID) causes a panic.
+        let clip_chain_id = match stacking_context.clip_id {
+            ClipId::INVALID => None,
+            clip_id => Some(self.clip_chain_id(clip_id)),
+        };
+        let spatial_id = self.spatial_id(stacking_context.scroll_tree_node_id);
+
+        self.wr().push_stacking_context(
+            spatial_id,
+            style.webrender_primitive_flags(),
+            clip_chain_id,
+            transform_style,
+            MixBlendMode::Normal,
+            &[], // filters
+            &[], // filter_datas
+            wr::RasterSpace::Screen,
+            StackingContextFlags::empty(),
+            None, // snapshot
+        );
+        true
+    }
+
     fn push_webrender_stacking_context_if_necessary(
         &mut self,
         stacking_context: &StackingContext,
@@ -436,12 +492,10 @@ impl DisplayListBuilder<'_> {
 
         let mut is_blend_container = stacking_context.children.iter().any(|child| {
             child.fragment().is_some_and(|fragment| {
-                fragment.style().clone_mix_blend_mode() != ComputedMixBlendMode::Normal
+                fragment.style().get_mix_blend_mode() != &ComputedMixBlendMode::Normal
             })
         });
 
-        let primitive_flags;
-        let transform_style;
         let mix_blend_mode;
         let mut filters: Vec<_>;
         let mut stacking_context_flags = StackingContextFlags::empty();
@@ -450,11 +504,7 @@ impl DisplayListBuilder<'_> {
                 let style = fragment.style();
                 let effects = style.get_effects();
 
-                transform_style = style
-                    .used_transform_style(fragment.base.flags)
-                    .to_webrender();
                 mix_blend_mode = effects.mix_blend_mode.to_webrender();
-                primitive_flags = style.get_webrender_primitive_flags();
 
                 // Do not create another blend container stacking context started by the root
                 // element, because the root background is painted above of it (at the root
@@ -468,11 +518,10 @@ impl DisplayListBuilder<'_> {
                 // actually need to create a stacking context, just avoid creating one.
                 if !is_blend_container &&
                     effects.filter.0.is_empty() &&
+                    effects.backdrop_filter.0.is_empty() &&
                     effects.opacity == 1.0 &&
                     effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
-                    !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
-                    style.get_svg().clip_path == ComputedClipPath::None &&
-                    transform_style == TransformStyle::Flat
+                    style.get_svg().clip_path == ComputedClipPath::None
                 {
                     return false;
                 }
@@ -495,8 +544,6 @@ impl DisplayListBuilder<'_> {
             // WebRender only needs a stacking context at the root when the root stacking
             // context itself is a blend container.
             StackingContextFragments::Root if is_blend_container => {
-                transform_style = TransformStyle::Flat;
-                primitive_flags = PrimitiveFlags::empty();
                 mix_blend_mode = MixBlendMode::Normal;
                 filters = Vec::new();
             },
@@ -519,9 +566,9 @@ impl DisplayListBuilder<'_> {
 
         self.wr().push_stacking_context(
             spatial_id,
-            primitive_flags,
+            PrimitiveFlags::default(),
             clip_chain_id,
-            transform_style,
+            TransformStyle::Flat,
             mix_blend_mode,
             &filters,
             &[], // filter_datas
@@ -546,7 +593,7 @@ impl DisplayListBuilder<'_> {
             clip_rect,
             spatial_id: self.spatial_id(state.spatial_id),
             clip_chain_id: self.clip_chain_id(state.clip_id),
-            flags: style.get_webrender_primitive_flags(),
+            flags: style.webrender_primitive_flags(),
         }
     }
 
@@ -611,9 +658,9 @@ impl DisplayListBuilder<'_> {
                     }
 
                     let bounds = box_fragment
-                        .offset_by_containing_block(
+                        .offset_by_cumulative_content_offset(
                             &fragment_relative_bounds,
-                            ContainingBlockCalculation::AlreadyDoneWithStackingContextTree,
+                            CumulativeContentRectCalculation::AlreadyDoneWithStackingContextTree,
                         )
                         .to_webrender();
 
@@ -669,6 +716,7 @@ impl DisplayListBuilder<'_> {
         url: Option<ServoUrl>,
         natural_width: Option<Au>,
         natural_height: Option<Au>,
+        load_time: Option<CrossProcessInstant>,
     ) {
         if !self.largest_contentful_paint_enabled {
             return;
@@ -685,6 +733,48 @@ impl DisplayListBuilder<'_> {
             clip_rect,
             transform,
             url,
+            natural_width,
+            natural_height,
+            load_time,
+        );
+    }
+
+    /// Accumulate a fragment painted by the element with the given `tag` into the
+    /// Container Timing state of each of the enclosing `container_timing_roots`.
+    #[expect(clippy::too_many_arguments)]
+    fn collect_container_timing_record(
+        &mut self,
+        state: &TraversalState,
+        container_timing_roots: &ContainerTimingRoots,
+        tag: Option<Tag>,
+        bounds: LayoutRect,
+        clip_rect: LayoutRect,
+        natural_width: Option<Au>,
+        natural_height: Option<Au>,
+    ) {
+        if !self.container_timing_enabled {
+            return;
+        }
+        let Some(container_timing_roots) = container_timing_roots else {
+            return;
+        };
+
+        // Like LCP collection, we skip if there's no containing element tag.
+        let Some(tag) = tag else {
+            return;
+        };
+
+        let transform = self
+            .paint_info
+            .scroll_tree
+            .cumulative_node_to_root_transform(state.spatial_id);
+
+        self.paint_timing_handler.update_container_timing(
+            container_timing_roots,
+            tag.node,
+            bounds,
+            clip_rect,
+            transform,
             natural_width,
             natural_height,
         );
@@ -750,6 +840,9 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
     ) -> Self::StackingContextState {
         let (mut stacking_contexts_pushed, old_reference_frame) =
             self.visit_stacking_context_reference_frame_info(stacking_context);
+        if self.push_webrender_stacking_context_for_transform_if_necessary(stacking_context) {
+            stacking_contexts_pushed += 1;
+        }
         if self.push_webrender_stacking_context_if_necessary(stacking_context) {
             stacking_contexts_pushed += 1;
         }
@@ -809,11 +902,12 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
             true,
         );
         // From <https://www.w3.org/TR/paint-timing/#mark-paint-timing>:
-        // > A parent frame should not be aware of the paint events from its child iframes, and
-        // > vice versa. This means that a frame that contains just iframes will have first paint
-        // > (due to the enclosing boxes of the iframes) but no first contentful paint.
+        // > A parent frame should not be aware of the paint events from its
+        // > child iframes, and vice versa. This means that a frame that
+        // > contains just iframes will have first paint (due to the enclosing
+        // > boxes of the paintable iframes) but no first contentful paint.
         self.paint_timing_handler
-            .check_if_paintable(rect.to_webrender(), style.clone_opacity());
+            .check_if_paintable(rect.to_webrender(), state.accumulated_opacity);
     }
 
     fn visit_image(
@@ -851,28 +945,41 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
                 wr::ColorF::WHITE,
             );
 
-            self.paint_timing_handler
-                .check_if_paintable(rect, style.clone_opacity());
+            if self
+                .paint_timing_handler
+                .check_if_paintable(rect, state.accumulated_opacity)
+            {
+                // From <https://www.w3.org/TR/paint-timing/#contentful>:
+                // An element target is contentful when one or more of the following apply:
+                // > target is a replaced element representing an available image.
+                // From: <https://html.spec.whatwg.org/multipage/#img-available>
+                // When an image request's state is either partially available or completely available,
+                // the image request is said to be available.
+                // Hence, Skip Broken Images.
+                if !fragment.showing_broken_image_icon {
+                    self.mark_is_contentful();
 
-            // From <https://www.w3.org/TR/paint-timing/#contentful>:
-            // An element target is contentful when one or more of the following apply:
-            // > target is a replaced element representing an available image.
-            // From: <https://html.spec.whatwg.org/multipage/#img-available>
-            // When an image request's state is either partially available or completely available,
-            // the image request is said to be available.
-            // Hence, Skip Broken Images.
-            if !fragment.showing_broken_image_icon {
-                self.mark_is_contentful();
+                    self.collect_image_record(
+                        state,
+                        rect,
+                        common.clip_rect,
+                        fragment.base.tag,
+                        fragment.url.clone(),
+                        fragment.natural_width,
+                        fragment.natural_height,
+                        fragment.load_time,
+                    );
 
-                self.collect_image_record(
-                    state,
-                    rect,
-                    common.clip_rect,
-                    fragment.base.tag,
-                    fragment.url.clone(),
-                    fragment.natural_width,
-                    fragment.natural_height,
-                );
+                    self.collect_container_timing_record(
+                        state,
+                        &state.container_timing_roots,
+                        state.containing_element_tag,
+                        rect,
+                        common.clip_rect,
+                        fragment.natural_width,
+                        fragment.natural_height,
+                    );
+                }
             }
         }
 
@@ -1068,49 +1175,19 @@ impl Fragment {
         let mut baseline_origin = rect.origin;
         baseline_origin.y += fragment.font_metrics.ascent;
 
-        let include_whitespace = fragment.run_data.selection.borrow().is_some() ||
-            state
-                .text_decorations
-                .iter()
-                .any(|item| !item.line.is_empty());
-
-        let (glyphs, largest_advance) = glyphs(
+        let (largest_advance, entirely_white_space) = collect_glyphs(
+            &mut builder.glyph_buffer,
             &fragment.glyphs,
             baseline_origin,
             fragment.justification_adjustment,
-            include_whitespace,
         );
 
-        if glyphs.is_empty() && !fragment.is_empty_for_text_cursor {
+        if builder.glyph_buffer.is_empty() && !fragment.is_empty_for_text_cursor {
             return;
         }
 
         let parent_style = fragment.style();
-        let color = parent_style.clone_color();
-        let font_size = parent_style.clone_font_size();
-        let font_metrics = &fragment.font_metrics;
-        let dppx = builder.device_pixel_ratio.get();
-
-        let resolve_thickness = |thickness: &TextDecorationThickness| -> Au {
-            let resolved = match thickness {
-                TextDecorationThickness::LengthPercentage(length_percentage) => {
-                    length_percentage.resolve(font_size.computed_size.0).px()
-                },
-                TextDecorationThickness::Auto | TextDecorationThickness::FromFont => {
-                    font_metrics.underline_size.to_f32_px()
-                },
-            };
-
-            // If zero, return zero.
-            // Else round down to the nearest physical pixel; floor at 1 physical pixel.
-            // See: <https://drafts.csswg.org/css-values-4/#snap-as-a-line-width>
-            if resolved == 0.0 {
-                Au::zero()
-            } else {
-                Au::from_f32_px((resolved * dppx).floor().max(1.0) / dppx)
-            }
-        };
-
+        let color = parent_style.slow_clone_color();
         // Gecko gets the text bounding box based on the ink overflow bounds. Since
         // we don't need to calculate this yet (as we do not implement `contain:
         // paint`), we just need to make sure these boundaries are big enough to
@@ -1142,157 +1219,228 @@ impl Fragment {
 
         Self::build_display_list_for_text_selection(fragment, builder, state, line_box_rect);
 
-        for text_decoration in state.text_decorations.iter() {
-            if text_decoration.line.contains(TextDecorationLine::UNDERLINE) {
-                let mut rect = rect;
-                rect.origin.y += font_metrics.ascent - font_metrics.underline_offset;
-                rect.size.height = resolve_thickness(&text_decoration.thickness);
-                Self::build_display_list_for_text_decoration(
-                    state,
-                    &parent_style,
-                    builder,
-                    &rect,
-                    text_decoration,
-                    TextDecorationLine::UNDERLINE,
-                );
-            }
+        for decoration in [
+            TextDecorationLine::UNDERLINE,
+            TextDecorationLine::SPELLING_ERROR,
+            TextDecorationLine::GRAMMAR_ERROR,
+            TextDecorationLine::OVERLINE,
+        ] {
+            Self::build_display_list_for_text_decoration_line(
+                state,
+                &parent_style,
+                builder,
+                rect,
+                &fragment.font_metrics,
+                decoration,
+            );
         }
 
-        for text_decoration in state.text_decorations.iter() {
-            if text_decoration.line.contains(TextDecorationLine::OVERLINE) {
-                let mut rect = rect;
-                rect.size.height = resolve_thickness(&text_decoration.thickness);
-                Self::build_display_list_for_text_decoration(
-                    state,
-                    &parent_style,
-                    builder,
-                    &rect,
-                    text_decoration,
-                    TextDecorationLine::OVERLINE,
-                );
-            }
-        }
-
-        builder.wr().push_text(
+        builder.webrender_display_list_builder.push_text(
             &common,
             glyph_bounds,
-            &glyphs,
+            &builder.glyph_buffer,
             fragment.font_key,
             rgba(color),
             None,
         );
 
-        builder
+        if builder
             .paint_timing_handler
-            .check_if_paintable(glyph_bounds, parent_style.clone_opacity());
-
-        // From <https://www.w3.org/TR/paint-timing/#contentful>:
-        // An element target is contentful when one or more of the following apply:
-        // > target has a text node child, representing non-empty text, and the node’s used opacity is greater than zero.
-        builder.mark_is_contentful();
-
-        // Accumulate this text fragment for LCP by the containing element's tag
-        if let Some(tag) = state.containing_element_tag &&
-            builder.largest_contentful_paint_enabled
+            .check_if_paintable(glyph_bounds, state.accumulated_opacity)
         {
-            let transform = builder
-                .paint_info
-                .scroll_tree
-                .cumulative_node_to_root_transform(state.spatial_id);
-            builder.paint_timing_handler.accumulate_text_rect(
-                tag,
-                rect.to_webrender(),
-                transform,
-                &parent_style,
-            );
-        }
+            // From <https://www.w3.org/TR/paint-timing/#contentful>:
+            // An element target is contentful when one or more of the following apply:
+            // > target has a text node child, representing non-empty text, and the node’s
+            // > used opacity is greater than zero.
+            if !entirely_white_space && *parent_style.get_opacity() > 0. {
+                builder.mark_is_contentful();
 
-        for text_decoration in state.text_decorations.iter() {
-            if text_decoration
-                .line
-                .contains(TextDecorationLine::LINE_THROUGH)
-            {
-                let mut rect = rect;
-                rect.origin.y += font_metrics.ascent - font_metrics.strikeout_offset;
-                rect.size.height = resolve_thickness(&text_decoration.thickness);
-                Self::build_display_list_for_text_decoration(
+                builder.collect_container_timing_record(
                     state,
-                    &parent_style,
-                    builder,
-                    &rect,
-                    text_decoration,
-                    TextDecorationLine::LINE_THROUGH,
+                    &state.container_timing_roots,
+                    state.containing_element_tag,
+                    glyph_bounds,
+                    common.clip_rect,
+                    None,
+                    None,
                 );
+
+                // Accumulate this text fragment for LCP by the containing element's tag
+                if let Some(tag) = state.containing_element_tag &&
+                    builder.largest_contentful_paint_enabled
+                {
+                    let transform = builder
+                        .paint_info
+                        .scroll_tree
+                        .cumulative_node_to_root_transform(state.spatial_id);
+                    builder.paint_timing_handler.accumulate_text_rect(
+                        tag,
+                        rect.to_webrender(),
+                        transform,
+                        &parent_style,
+                    );
+                }
             }
         }
+
+        Self::build_display_list_for_text_decoration_line(
+            state,
+            &parent_style,
+            builder,
+            rect,
+            &fragment.font_metrics,
+            TextDecorationLine::LINE_THROUGH,
+        );
 
         if !shadows.0.is_empty() {
             builder.wr().pop_all_shadows();
         }
     }
 
-    fn build_display_list_for_text_decoration(
+    fn build_display_list_for_text_decoration_line(
         state: &TraversalState,
         parent_style: &ServoArc<ComputedValues>,
         builder: &mut DisplayListBuilder,
-        rect: &PhysicalRect<Au>,
-        text_decoration: &FragmentTextDecoration,
-        line: TextDecorationLine,
+        rect: PhysicalRect<Au>,
+        font_metrics: &FontMetrics,
+        text_decoration_line: TextDecorationLine,
     ) {
-        if text_decoration.style == ComputedTextDecorationStyle::MozNone {
+        if state.text_decorations.is_empty() {
             return;
         }
 
-        let mut rect = rect.to_webrender();
-        let wavy_line_thickness = rect.height().ceil();
-        if text_decoration.style == ComputedTextDecorationStyle::Wavy {
-            rect = rect.inflate(0.0, wavy_line_thickness);
-        }
+        let font_size = parent_style.get_font().font_size;
+        let dppx = builder.device_pixel_ratio.get();
+        let resolve_thickness = |thickness: &TextDecorationThickness| -> Au {
+            let resolved = match thickness {
+                TextDecorationThickness::LengthPercentage(length_percentage) => {
+                    length_percentage.resolve(font_size.computed_size.0).px()
+                },
+                TextDecorationThickness::Auto | TextDecorationThickness::FromFont => {
+                    font_metrics.underline_size.to_f32_px()
+                },
+            };
 
-        // In Servo, text decorations can span multiple text fragments. In order to have dots,
-        // dashes, and wavy line segments match up between multiple fragments, this code extends
-        // the painting rect for the decoration types for which this matters to the origin. As
-        // the rectangle starts at the origin, all painted decorations will be in phase. As the
-        // clipping rectangle is left unchanged, the actual painted region remains the size of
-        // the original rectangle.
-        let expand_rect_for_text_decoration = |mut rect: Box2D<f32, LayoutPixel>| {
+            // If zero, return zero.
+            // Else round down to the nearest physical pixel; floor at 1 physical pixel.
+            // See: <https://drafts.csswg.org/css-values-4/#snap-as-a-line-width>
+            if resolved == 0.0 {
+                Au::zero()
+            } else {
+                Au::from_f32_px((resolved * dppx).floor().max(1.0) / dppx)
+            }
+        };
+
+        for text_decoration in state.text_decorations.iter() {
+            if !text_decoration.line.contains(text_decoration_line) {
+                continue;
+            }
+
+            let (color, style, y_offset, height) = match text_decoration_line {
+                // <https://drafts.csswg.org/css-text-decor-4/#valdef-text-decoration-line-underline>
+                TextDecorationLine::UNDERLINE => (
+                    text_decoration.color,
+                    text_decoration.style,
+                    font_metrics.ascent - font_metrics.underline_offset,
+                    resolve_thickness(&text_decoration.thickness),
+                ),
+                // <https://drafts.csswg.org/css-text-decor-4/#valdef-text-decoration-line-spelling-error>
+                //
+                // From <https://drafts.csswg.org/css-text-decor-4/#text-decoration-line-property>
+                // > When spelling-error or grammar-error apply, the user agent must disregard the other
+                // > sub-properties of text-decoration, as well any other properties typically affecting
+                // > the appearance of line decorations (such as text-underline-position, color, stroke,
+                // > or fill) when rendering these decorations. However, the user agent may take into
+                // > account the accent-color property.
+                //
+                // This is why color and style are ignored here and for grammar errors.
+                TextDecorationLine::SPELLING_ERROR => (
+                    AbsoluteColor::srgb_legacy(255, 0, 0, 1.0),
+                    ComputedTextDecorationStyle::Wavy,
+                    font_metrics.ascent - font_metrics.underline_offset,
+                    resolve_thickness(&TextDecorationThickness::Auto),
+                ),
+                // <https://drafts.csswg.org/css-text-decor-4/#valdef-text-decoration-line-grammar-error>
+                TextDecorationLine::GRAMMAR_ERROR => (
+                    AbsoluteColor::srgb_legacy(0, 128, 0, 1.0),
+                    ComputedTextDecorationStyle::Wavy,
+                    font_metrics.ascent - font_metrics.underline_offset,
+                    resolve_thickness(&TextDecorationThickness::Auto),
+                ),
+                // <https://drafts.csswg.org/css-text-decor-4/#valdef-text-decoration-line-line-through>
+                TextDecorationLine::LINE_THROUGH => (
+                    text_decoration.color,
+                    text_decoration.style,
+                    font_metrics.ascent - font_metrics.strikeout_offset,
+                    resolve_thickness(&text_decoration.thickness),
+                ),
+                // <https://drafts.csswg.org/css-text-decor-4/#valdef-text-decoration-line-overline>
+                TextDecorationLine::OVERLINE => (
+                    text_decoration.color,
+                    text_decoration.style,
+                    Au::zero(),
+                    resolve_thickness(&text_decoration.thickness),
+                ),
+                _ => unreachable!("Got unexpected text decoration line"),
+            };
+
+            if style == ComputedTextDecorationStyle::None {
+                continue;
+            }
+
+            let mut rect = rect;
+            rect.origin.y += y_offset;
+            rect.size.height = height;
+
+            let mut rect = rect.to_webrender();
+            let wavy_line_thickness = rect.height().ceil();
+            if style == ComputedTextDecorationStyle::Wavy {
+                rect = rect.inflate(0.0, wavy_line_thickness);
+            }
+
+            let common_properties = builder.common_properties(state, rect, parent_style);
+
+            // In Servo, text decorations can span multiple text fragments. In order to have dots,
+            // dashes, and wavy line segments match up between multiple fragments, this code extends
+            // the painting rect for the decoration types for which this matters to the origin. As
+            // the rectangle starts at the origin, all painted decorations will be in phase. As the
+            // clipping rectangle is left unchanged, the actual painted region remains the size of
+            // the original rectangle.
             if matches!(
-                text_decoration.style,
+                style,
                 ComputedTextDecorationStyle::Dotted |
                     ComputedTextDecorationStyle::Dashed |
                     ComputedTextDecorationStyle::Wavy,
             ) {
                 rect.min.x = rect.min.x.min(0.0);
             }
-            rect
-        };
 
-        let common_properties = builder.common_properties(state, rect, parent_style);
-        builder.wr().push_line(
-            &common_properties,
-            &expand_rect_for_text_decoration(rect),
-            wavy_line_thickness,
-            wr::LineOrientation::Horizontal,
-            &rgba(text_decoration.color),
-            text_decoration.style.to_webrender(),
-        );
-
-        if text_decoration.style == TextDecorationStyle::Double {
-            let half_height = (rect.height() / 2.0).floor().max(1.0);
-            let y_offset = match line {
-                TextDecorationLine::OVERLINE => -rect.height() - half_height,
-                _ => rect.height() + half_height,
-            };
-            let rect = rect.translate(Vector2D::new(0.0, y_offset));
-            let common_properties = builder.common_properties(state, rect, parent_style);
             builder.wr().push_line(
                 &common_properties,
                 &rect,
                 wavy_line_thickness,
                 wr::LineOrientation::Horizontal,
-                &rgba(text_decoration.color),
-                text_decoration.style.to_webrender(),
+                &rgba(color),
+                style.to_webrender(),
             );
+
+            if style == ComputedTextDecorationStyle::Double {
+                let half_height = (rect.height() / 2.0).floor().max(1.0);
+                let y_offset = match text_decoration_line {
+                    TextDecorationLine::OVERLINE => -rect.height() - half_height,
+                    _ => rect.height() + half_height,
+                };
+                let rect = rect.translate(Vector2D::new(0.0, y_offset));
+                let common_properties = builder.common_properties(state, rect, parent_style);
+                builder.wr().push_line(
+                    &common_properties,
+                    &rect,
+                    wavy_line_thickness,
+                    wr::LineOrientation::Horizontal,
+                    &rgba(color),
+                    style.to_webrender(),
+                );
+            }
         }
     }
 
@@ -1409,9 +1557,12 @@ impl Fragment {
             .to_webrender();
 
             let unfocused_color = *UNFOCUSED_SELECTION_COLOR;
-            let style_color = fragment.selected_style().clone_background_color();
+            let selected_style = fragment.selected_style();
             let selection_color = if builder.frame_focused {
-                style_color.as_absolute().unwrap_or(&unfocused_color)
+                selected_style
+                    .get_background_color()
+                    .as_absolute()
+                    .unwrap_or(&unfocused_color)
             } else {
                 &unfocused_color
             };
@@ -1424,7 +1575,7 @@ impl Fragment {
             return;
         }
 
-        if !fragment.run_data.paint_caret {
+        if !fragment.run_data.paints_caret {
             return;
         }
 
@@ -1443,10 +1594,10 @@ impl Fragment {
         )
         .to_webrender();
 
-        let color = parent_style.clone_color();
-        let caret_color = match parent_style.clone_caret_color().0 {
-            ColorOrAuto::Color(caret_color) => caret_color.resolve_to_absolute(&color),
-            ColorOrAuto::Auto => color,
+        let color = parent_style.get_color();
+        let caret_color = match parent_style.get_caret_color().0 {
+            ColorOrAuto::Color(ref caret_color) => caret_color.resolve_to_absolute(color),
+            ColorOrAuto::Auto => *color,
         };
         let insertion_point_common =
             builder.common_properties(state, insertion_point_rect, &parent_style);
@@ -1607,6 +1758,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             return;
         }
 
+        self.build_backdrop_filter(builder, state);
         self.build_background(builder, state);
         self.build_box_shadow(builder, state);
         if !self.fragment.is_table_grid_with_collapsed_borders() {
@@ -1694,6 +1846,40 @@ impl<'a> BuilderForBoxFragment<'a> {
         self.build_background_image(builder, state, painter);
     }
 
+    fn build_backdrop_filter(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
+        // https://drafts.fxtf.org/filter-effects-2/#BackdropFilterProperty
+        // > ... unless the element it applies to is a document root element in
+        // > the current browsing context.
+        if self
+            .fragment
+            .base
+            .flags
+            .contains(FragmentFlags::IS_ROOT_ELEMENT)
+        {
+            return;
+        }
+
+        let style = self.fragment.style();
+        let effects = style.get_effects();
+        if effects.backdrop_filter.0.is_empty() {
+            return;
+        }
+
+        let current_color = style.get_color();
+        let filters: Vec<_> = effects
+            .backdrop_filter
+            .0
+            .iter()
+            .map(|filter| FilterToWebRender::to_webrender(filter, current_color))
+            .collect();
+
+        let mut common = builder.common_properties(state, self.border_rect, style);
+        if let Some(clip_chain_id) = self.border_edge_clip(builder, state, false) {
+            common.clip_chain_id = clip_chain_id;
+        }
+        builder.wr().push_backdrop_filter(&common, &filters, &[]);
+    }
+
     fn build_background(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
         let flags = self.fragment.base.flags;
 
@@ -1763,7 +1949,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             let spatial_id = builder.spatial_id(state.spatial_id);
             builder.wr().push_stacking_context(
                 spatial_id,
-                PrimitiveFlags::empty(),
+                PrimitiveFlags::default(),
                 None,
                 TransformStyle::Flat,
                 blend_mode.to_webrender(),
@@ -1849,9 +2035,9 @@ impl<'a> BuilderForBoxFragment<'a> {
 
                     builder
                         .paint_timing_handler
-                        .check_if_paintable(layer.bounds, style.clone_opacity());
+                        .check_if_paintable(layer.bounds, state.accumulated_opacity);
                 },
-                ResolvedImage::Image { image, size } => {
+                ResolvedImage::Image { image, size, url } => {
                     // FIXME: https://drafts.csswg.org/css-images-4/#the-image-resolution
                     let dppx = 1.0;
                     let intrinsic =
@@ -1890,7 +2076,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                                 layer.bounds,
                                 layer.tile_size,
                                 layer.tile_spacing,
-                                style.clone_image_rendering().to_webrender(),
+                                style.get_image_rendering().to_webrender(),
                                 wr::AlphaType::PremultipliedAlpha,
                                 image_key,
                                 wr::ColorF::WHITE,
@@ -1899,7 +2085,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                             builder.wr().push_image(
                                 &layer.common,
                                 layer.bounds,
-                                style.clone_image_rendering().to_webrender(),
+                                style.get_image_rendering().to_webrender(),
                                 wr::AlphaType::PremultipliedAlpha,
                                 image_key,
                                 wr::ColorF::WHITE,
@@ -1910,27 +2096,39 @@ impl<'a> BuilderForBoxFragment<'a> {
                             builder.wr().pop_stacking_context();
                         }
 
-                        builder
+                        if builder
                             .paint_timing_handler
-                            .check_if_paintable(layer.bounds, style.clone_opacity());
+                            .check_if_paintable(layer.bounds, state.accumulated_opacity)
+                        {
+                            // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
+                            // An element target is contentful when one or more of the following apply:
+                            // > target has a background-image which is a contentful image, and its used
+                            // > background-size has non-zero width and height values.
+                            builder.mark_is_contentful();
 
-                        // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
-                        // An element target is contentful when one or more of the following apply:
-                        // > target has a background-image which is a contentful image, and its used
-                        // > background-size has non-zero width and height values.
-                        builder.mark_is_contentful();
+                            let natural_width = Some(Au::from_f32_px(size.width / dppx));
+                            let natural_height = Some(Au::from_f32_px(size.height / dppx));
+                            builder.collect_image_record(
+                                state,
+                                layer.bounds,
+                                layer.common.clip_rect,
+                                self.fragment.base.tag,
+                                Some(url),
+                                natural_width,
+                                natural_height,
+                                image.load_time(),
+                            );
 
-                        let natural_width = Some(Au::from_f32_px(size.width / dppx));
-                        let natural_height = Some(Au::from_f32_px(size.height / dppx));
-                        builder.collect_image_record(
-                            state,
-                            layer.bounds,
-                            layer.common.clip_rect,
-                            self.fragment.base.tag,
-                            None,
-                            natural_width,
-                            natural_height,
-                        );
+                            builder.collect_container_timing_record(
+                                state,
+                                &state.container_timing_roots_including(self.fragment),
+                                self.fragment.base.tag.or(state.containing_element_tag),
+                                layer.bounds,
+                                layer.common.clip_rect,
+                                natural_width,
+                                natural_height,
+                            );
+                        }
                     }
                 },
             }
@@ -2057,8 +2255,8 @@ impl<'a> BuilderForBoxFragment<'a> {
             return;
         }
 
-        let current_color = style.get_inherited_text().clone_color();
-        let style_color = BorderStyleColor::from_border(border, &current_color);
+        let current_color = style.get_inherited_text().get_color();
+        let style_color = BorderStyleColor::from_border(border, current_color);
         let details = wr::BorderDetails::Normal(wr::NormalBorder {
             top: self.build_border_side(style_color.top),
             right: self.build_border_side(style_color.right),
@@ -2106,7 +2304,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             .resolve_image(node, &border.border_image_source)
         {
             Err(_) => return false,
-            Ok(ResolvedImage::Image { image, size }) => {
+            Ok(ResolvedImage::Image { image, size, .. }) => {
                 let scale = builder.device_pixel_ratio.get();
                 let raster_size = Size2D::new(size.width * scale, size.height * scale).to_i32();
                 let Some(key) =
@@ -2117,19 +2315,20 @@ impl<'a> BuilderForBoxFragment<'a> {
                     return false;
                 };
 
-                builder
-                    .paint_timing_handler
-                    .check_if_paintable(Box2D::from_size(size.cast_unit()), style.clone_opacity());
-
-                // From <https://www.w3.org/TR/paint-timing/#contentful>:
-                // An element target is contentful when one or more of the following apply:
-                // > target has a background-image which is a contentful image,
-                // > and its used background-size has non-zero width and height values.
-                builder.mark_is_contentful();
+                if builder.paint_timing_handler.check_if_paintable(
+                    Box2D::from_size(size.cast_unit()),
+                    state.accumulated_opacity,
+                ) {
+                    // From <https://www.w3.org/TR/paint-timing/#contentful>:
+                    // An element target is contentful when one or more of the following apply:
+                    // > target has a background-image which is a contentful image,
+                    // > and its used background-size has non-zero width and height values.
+                    builder.mark_is_contentful();
+                }
 
                 width = size.width;
                 height = size.height;
-                let image_rendering = style.clone_image_rendering().to_webrender();
+                let image_rendering = style.get_image_rendering().to_webrender();
                 NinePatchBorderSource::Image(key, image_rendering)
             },
             Ok(ResolvedImage::Gradient(gradient)) => {
@@ -2312,29 +2511,34 @@ fn rgba(color: AbsoluteColor) -> wr::ColorF {
     )
 }
 
-fn glyphs(
+/// Clear `glyphs` and fill it with a [`GlyphInstance`] for every glyph in the given
+/// `shaped_text_slices`. Return a tuple that contains:
+///
+/// - The measure of the largest advance
+/// - A boolean which is true if the slices only contained white space.
+fn collect_glyphs(
+    glyphs: &mut Vec<GlyphInstance>,
     shaped_text_slices: &[Arc<ShapedTextSlice>],
     mut baseline_origin: PhysicalPoint<Au>,
     justification_adjustment: Au,
-    include_whitespace: bool,
-) -> (Vec<GlyphInstance>, Au) {
-    let mut glyphs = vec![];
+) -> (Au, bool) {
+    glyphs.clear();
     let mut largest_advance = Au::zero();
+    let mut entirely_white_space = true;
 
     for shaped_text_slice in shaped_text_slices {
+        entirely_white_space &= shaped_text_slice.all_white_space();
         for glyph in shaped_text_slice.glyphs() {
-            if !shaped_text_slice.is_whitespace() || include_whitespace {
-                let glyph_offset = glyph.offset().unwrap_or(Point2D::zero());
-                let point = LayoutPoint::new(
-                    baseline_origin.x.to_f32_px() + glyph_offset.x.to_f32_px(),
-                    baseline_origin.y.to_f32_px() + glyph_offset.y.to_f32_px(),
-                );
-                let glyph_instance = GlyphInstance {
-                    index: glyph.id(),
-                    point,
-                };
-                glyphs.push(glyph_instance);
-            }
+            let glyph_offset = glyph.offset().unwrap_or(Point2D::zero());
+            let point = LayoutPoint::new(
+                baseline_origin.x.to_f32_px() + glyph_offset.x.to_f32_px(),
+                baseline_origin.y.to_f32_px() + glyph_offset.y.to_f32_px(),
+            );
+            let glyph_instance = GlyphInstance {
+                index: glyph.id(),
+                point,
+            };
+            glyphs.push(glyph_instance);
 
             if glyph.char_is_word_separator() {
                 baseline_origin.x += justification_adjustment;
@@ -2345,7 +2549,7 @@ fn glyphs(
             largest_advance.max_assign(advance);
         }
     }
-    (glyphs, largest_advance)
+    (largest_advance, entirely_white_space)
 }
 
 /// Given a set of corner radii for a rectangle, this function returns the corresponding radii

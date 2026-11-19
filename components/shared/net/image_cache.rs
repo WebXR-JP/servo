@@ -12,6 +12,7 @@ use pixels::{CorsStatus, ImageMetadata, RasterImage};
 use profile_traits::mem::Report;
 use resvg::usvg::{Font, fontdb};
 use serde::{Deserialize, Serialize};
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::{PipelineId, WebViewId};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
@@ -57,6 +58,7 @@ pub struct VectorImage {
     pub svg_id: Option<Uuid>,
     pub metadata: ImageMetadata,
     pub cors_status: CorsStatus,
+    pub load_time: Option<CrossProcessInstant>,
 }
 
 impl Image {
@@ -80,6 +82,13 @@ impl Image {
             Image::Vector(..) => None,
         }
     }
+
+    pub fn load_time(&self) -> Option<CrossProcessInstant> {
+        match self {
+            Image::Raster(image) => image.load_time,
+            Image::Vector(image) => image.load_time,
+        }
+    }
 }
 
 /// Indicating either entire image or just metadata availability
@@ -87,6 +96,17 @@ impl Image {
 pub enum ImageOrMetadataAvailable {
     ImageAvailable { image: Image, url: ServoUrl },
     MetadataAvailable(ImageMetadata, PendingImageId),
+}
+
+/// The result of requesting vector image rasterization.
+#[derive(Clone, Debug, MallocSizeOf)]
+pub enum RasterizationResult {
+    /// The raster image is already available in the cache.
+    Image(RasterImage),
+    /// The image is being rasterized asynchronously.
+    PendingRasterization,
+    /// Rasterization was not started because the requested parameters were invalid.
+    InvalidSvgParameters,
 }
 
 pub type ImageCacheResponseCallback = Box<dyn Fn(ImageCacheResponseMessage) + Send + 'static>;
@@ -213,20 +233,21 @@ pub trait ImageCache: Sync + Send {
     fn get_cached_image_status(
         &self,
         url: ServoUrl,
-        origin: ImmutableOrigin,
+        origin: &ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
     ) -> ImageCacheResult;
 
-    /// Returns `Some` if the given `image_id` has already been rasterized at the given `size`.
-    /// Otherwise, triggers a new job to perform the rasterization. If a notification
-    /// is needed after rasterization is completed, the `add_rasterization_complete_listener`
+    /// Returns `RasterizationResult::Image` if the given `image_id` has already been rasterized at the given `size`.
+    /// Returns `RasterizationResult::PendingRasterization` if a new job was triggered to perform the rasterization.
+    /// If a notification is needed after rasterization is completed, the `add_rasterization_complete_listener`
     /// API below can be used to add a listener.
+    /// Returns `RasterizationResult::InvalidSvgParameters` if the parameters were invalid & no job was started.
     fn rasterize_vector_image(
         &self,
         image_id: VectorImageId,
         size: DeviceIntSize,
         svg_id: Option<Uuid>,
-    ) -> Option<RasterImage>;
+    ) -> RasterizationResult;
 
     /// Adds a new listener to be notified once the given `image_id` has been rasterized at
     /// the given `size`. The listener will receive a `VectorImageRasterizationComplete`

@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::{ptr, slice};
+use std::{ffi, ptr, slice};
 
 use js::context::JSContext;
 use js::conversions::{
@@ -19,8 +19,8 @@ use js::rust::wrappers2::{
     JS_NewStringCopyN, UnwrapObjectDynamic,
 };
 use js::rust::{
-    HandleId, HandleValue, MutableHandleValue, ToString, get_object_class, is_dom_class,
-    is_dom_object, maybe_wrap_value,
+    HandleId, HandleObject, HandleValue, MutableHandleValue, ToString, get_object_class,
+    is_dom_class, is_dom_object, maybe_wrap_value,
 };
 use keyboard_types::Modifiers;
 use num_traits::Float;
@@ -28,7 +28,9 @@ use num_traits::Float;
 use crate::JSTraceable;
 use crate::codegen::GenericBindings::EventModifierInitBinding::EventModifierInit;
 use crate::codegen::PrototypeList;
+use crate::error::{Error, Fallible};
 use crate::inheritance::Castable;
+use crate::js::JS_GetProperty;
 use crate::num::Finite;
 use crate::reflector::{DomObject, Reflector};
 use crate::root::DomRoot;
@@ -383,8 +385,13 @@ where
 pub fn jsid_to_string(cx: &js::context::JSContext, id: HandleId) -> Option<DOMString> {
     let id_raw = *id;
     if id_raw.is_string() {
-        let jsstr = ptr::NonNull::new(id_raw.to_string()).unwrap();
-        return Some(unsafe { jsstr_to_string(cx, jsstr) }.into());
+        let jsstr = id_raw.to_string();
+        return Some(unsafe {
+            // Safe as `to_string` should always point to a valid JSString.
+            DOMString::from_raw_js_string(cx, jsstr).expect(
+                "Should always be able to convert a property id that is a string to a DOMString",
+            )
+        });
     }
 
     if id_raw.is_int() {
@@ -620,5 +627,44 @@ impl<D: crate::DomTypes> EventModifierInit<D> {
             modifiers.insert(Modifiers::SYMBOL_LOCK);
         }
         modifiers
+    }
+}
+
+/// Get a property from a JS object.
+pub fn get_property_jsval(
+    cx: &mut JSContext,
+    object: HandleObject,
+    name: &ffi::CStr,
+    rval: MutableHandleValue,
+) -> Fallible<()> {
+    if !JS_GetProperty(cx, object, name, rval) {
+        return Err(Error::JSFailed);
+    }
+
+    Ok(())
+}
+
+/// Get a property from a JS object, and convert it to a Rust value.
+pub fn get_property<T>(
+    cx: &mut JSContext,
+    object: HandleObject,
+    name: &ffi::CStr,
+    option: T::Config,
+) -> Fallible<Option<T>>
+where
+    T: FromJSValConvertible,
+{
+    rooted!(&in(cx) let mut result = UndefinedValue());
+    get_property_jsval(cx, object, name, result.handle_mut())?;
+
+    if result.is_undefined() {
+        return Ok(None);
+    }
+
+    let value = T::from_jsval(cx, result.handle(), option);
+    match value {
+        Ok(ConversionResult::Success(value)) => Ok(Some(value)),
+        Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),
+        Err(()) => Err(Error::JSFailed),
     }
 }

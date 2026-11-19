@@ -32,10 +32,10 @@ use servo::{
     AllowOrDenyRequest, AuthenticationRequest, BluetoothDeviceSelectionRequest, CSSPixel,
     ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntPoint, DeviceIntSize, EmbedderControl,
     EmbedderControlId, EventLoopWaker, GenericSender, InputEvent, InputEventId, InputEventResult,
-    JSValue, LoadStatus, MediaSessionEvent, PermissionRequest, PrefValue, Preferences,
-    ScreenshotCaptureError, Servo, ServoDelegate, ServoError, TraversalId, UserContentManager,
-    WebDriverCommandMsg, WebDriverJSResult, WebDriverLoadStatus, WebDriverScriptCommand,
-    WebDriverSenders, WebView, WebViewDelegate, WebViewId,
+    JSValue, LoadStatus, PermissionRequest, PrefValue, Preferences, ScreenshotCaptureError, Servo,
+    ServoDelegate, ServoError, TraversalId, UserContentManager, WebDriverCommandMsg,
+    WebDriverJSResult, WebDriverLoadStatus, WebDriverScriptCommand, WebDriverSenders, WebView,
+    WebViewDelegate, WebViewId,
 };
 use url::Url;
 
@@ -846,17 +846,21 @@ impl WebViewDelegate for RunningAppState {
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
         self.window_for_webview(&webview).set_needs_update();
 
-        if status == LoadStatus::Complete {
-            if let Some(sender) = self
-                .webdriver_senders
-                .borrow_mut()
-                .load_status_senders
-                .remove(&webview.id())
-            {
-                let _ = sender.send(WebDriverLoadStatus::Complete);
-            }
-            self.maybe_request_screenshot(webview);
+        let webdriver_status = match status {
+            LoadStatus::Complete => WebDriverLoadStatus::Complete,
+            LoadStatus::Stopped => WebDriverLoadStatus::NavigationStop,
+            _ => return,
+        };
+
+        if let Some(sender) = self
+            .webdriver_senders
+            .borrow_mut()
+            .load_status_senders
+            .remove(&webview.id())
+        {
+            let _ = sender.send(webdriver_status);
         }
+        self.maybe_request_screenshot(webview);
     }
 
     fn notify_fullscreen_state_changed(&self, webview: WebView, fullscreen_state: bool) {
@@ -921,11 +925,6 @@ impl WebViewDelegate for RunningAppState {
     fn notify_favicon_changed(&self, webview: WebView) {
         self.window_for_webview(&webview)
             .notify_favicon_changed(webview);
-    }
-
-    fn notify_media_session_event(&self, webview: WebView, event: MediaSessionEvent) {
-        self.platform_window_for_webview(&webview)
-            .notify_media_session_event(event);
     }
 
     fn notify_crashed(&self, webview: WebView, reason: String, backtrace: Option<String>) {

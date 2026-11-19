@@ -4,7 +4,7 @@
 
 use style::computed_values::position::T as ComputedPosition;
 
-use crate::fragment_tree::Fragment;
+use crate::fragment_tree::BoxFragment;
 
 /// A data structure used to track the containing block when recursing
 /// through the Fragment tree. It tracks the three types of containing
@@ -50,11 +50,8 @@ pub(crate) struct ContainingBlockManager<'a, T> {
 }
 
 impl<'a, T> ContainingBlockManager<'a, T> {
-    pub(crate) fn get_containing_block_for_fragment(&self, fragment: &Fragment) -> &T {
-        let Some(box_fragment) = fragment.retrieve_box_fragment() else {
-            return self.for_non_absolute_descendants;
-        };
-        match box_fragment.style().clone_position() {
+    pub(crate) fn containing_block_for_box(&self, fragment: &BoxFragment) -> &T {
+        match fragment.style().get_box().position {
             ComputedPosition::Fixed => self.for_absolute_and_fixed_descendants,
             ComputedPosition::Absolute => self
                 .for_absolute_descendants
@@ -63,38 +60,27 @@ impl<'a, T> ContainingBlockManager<'a, T> {
         }
     }
 
-    pub(crate) fn new_for_non_absolute_descendants(
-        &self,
-        for_non_absolute_descendants: &'a T,
-    ) -> Self {
+    pub(crate) fn new_for_non_absolute_descendants(&self, containing_block: &'a T) -> Self {
         ContainingBlockManager {
-            for_non_absolute_descendants,
+            for_non_absolute_descendants: containing_block,
             for_absolute_descendants: self.for_absolute_descendants,
             for_absolute_and_fixed_descendants: self.for_absolute_and_fixed_descendants,
         }
     }
 
-    pub(crate) fn new_for_absolute_descendants(
-        &self,
-        for_non_absolute_descendants: &'a T,
-        for_absolute_descendants: &'a T,
-    ) -> Self {
+    pub(crate) fn new_for_absolute_descendants(&self, containing_block: &'a T) -> Self {
         ContainingBlockManager {
-            for_non_absolute_descendants,
-            for_absolute_descendants: Some(for_absolute_descendants),
+            for_non_absolute_descendants: containing_block,
+            for_absolute_descendants: Some(containing_block),
             for_absolute_and_fixed_descendants: self.for_absolute_and_fixed_descendants,
         }
     }
 
-    pub(crate) fn new_for_absolute_and_fixed_descendants(
-        &self,
-        for_non_absolute_descendants: &'a T,
-        for_absolute_and_fixed_descendants: &'a T,
-    ) -> Self {
+    pub(crate) fn new_for_absolute_and_fixed_descendants(&self, containing_block: &'a T) -> Self {
         ContainingBlockManager {
-            for_non_absolute_descendants,
+            for_non_absolute_descendants: containing_block,
             for_absolute_descendants: None,
-            for_absolute_and_fixed_descendants,
+            for_absolute_and_fixed_descendants: containing_block,
         }
     }
 }

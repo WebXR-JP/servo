@@ -33,7 +33,7 @@ use crate::fragment_tree::FragmentFlags;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::AbsolutelyPositionedBox;
 use crate::style_ext::{ComputedValuesExt, DisplayGeneratingBox, DisplayInside, DisplayOutside};
-use crate::table::{AnonymousTableContent, Table};
+use crate::table::{AnonymousTableContent, AnonymousTableContentElement, Table};
 
 impl BlockFormattingContext {
     pub(crate) fn construct(
@@ -215,7 +215,7 @@ impl BlockContainer {
         if is_list_item &&
             let Some((marker_info, marker_contents)) = crate::lists::make_marker(context, info)
         {
-            match marker_info.style.clone_list_style_position() {
+            match marker_info.style.get_list_style_position() {
                 ListStylePosition::Inside => {
                     builder.handle_list_item_marker_inside(&marker_info, marker_contents)
                 },
@@ -332,7 +332,7 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
         let inline_table = self.currently_processing_inline_box();
 
         let mut contents: Vec<AnonymousTableContent<'dom>> =
-            self.anonymous_table_content.drain(..).collect();
+            std::mem::take(&mut self.anonymous_table_content);
         let last_element_index = contents
             .iter()
             .rposition(|content| matches!(content, AnonymousTableContent::Element { .. }))
@@ -425,18 +425,20 @@ impl<'dom> TraversalHandler<'dom> for BlockContainerBuilder<'dom, '_> {
             },
             DisplayGeneratingBox::LayoutInternal(_) => {
                 self.anonymous_table_content
-                    .push(AnonymousTableContent::Element {
-                        info: info.clone(),
-                        display,
-                        contents,
-                        box_slot,
-                    });
+                    .push(AnonymousTableContent::Element(Box::new(
+                        AnonymousTableContentElement {
+                            info: info.clone(),
+                            display,
+                            contents,
+                            box_slot,
+                        },
+                    )));
             },
         }
     }
 
     fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: BoxTreeString<'dom>) {
-        if text.is_empty() {
+        if text.is_empty() && !info.node.text_node_needs_caret_placeholder() {
             return;
         }
 
@@ -562,6 +564,10 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
             old_layout_box,
         );
         box_slot.set(LayoutBox::InlineLevel(inline_item));
+
+        if info.node.is_html_wbr_element() {
+            inline_builder.push_soft_wrap_opportunity();
+        }
 
         if is_list_item &&
             let Some((marker_info, marker_contents)) =

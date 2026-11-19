@@ -220,6 +220,31 @@ class BidiEmulationSetLocaleOverrideAction:
                                                                       contexts)
 
 
+class BidiEmulationSetMediaFeaturesOverrideAction:
+    name = "bidi.emulation.set_media_features_override"
+
+    def __init__(self, logger, protocol):
+        do_delayed_imports()
+        self.logger = logger
+        self.protocol = protocol
+
+    async def __call__(self, payload):
+        features = payload['features'] \
+            if 'features' in payload \
+            else None
+
+        if "contexts" not in payload:
+            raise ValueError("Missing required parameter: contexts")
+        contexts = []
+        for context in payload["contexts"]:
+            contexts.append(get_browsing_context_id(context))
+        if len(contexts) == 0:
+            raise ValueError("At least one context must be provided")
+
+        return await self.protocol.bidi_emulation.set_media_features_override(
+            features, contexts)
+
+
 class BidiEmulationSetScreenOrientationOverrideAction:
     name = "bidi.emulation.set_screen_orientation_override"
 
@@ -245,6 +270,31 @@ class BidiEmulationSetScreenOrientationOverrideAction:
             screen_orientation, contexts)
 
 
+class BidiEmulationSetScrollbarTypeOverrideAction:
+    name = "bidi.emulation.set_scrollbar_type_override"
+
+    def __init__(self, logger, protocol):
+        do_delayed_imports()
+        self.logger = logger
+        self.protocol = protocol
+
+    async def __call__(self, payload):
+        scrollbar_type = payload['scrollbarType'] \
+            if 'scrollbarType' in payload \
+            else None
+
+        if "contexts" not in payload:
+            raise ValueError("Missing required parameter: contexts")
+        contexts = []
+        for context in payload["contexts"]:
+            contexts.append(get_browsing_context_id(context))
+        if len(contexts) == 0:
+            raise ValueError("At least one context must be provided")
+
+        return await self.protocol.bidi_emulation.set_scrollbar_type_override(
+            scrollbar_type, contexts)
+
+
 class BidiEmulationSetTouchOverrideAction:
     name = "bidi.emulation.set_touch_override"
 
@@ -268,6 +318,31 @@ class BidiEmulationSetTouchOverrideAction:
 
         return await self.protocol.bidi_emulation.set_touch_override(
             max_touch_points, contexts)
+
+
+class BidiEmulationSetViewportMetaOverrideAction:
+    name = "bidi.emulation.set_viewport_meta_override"
+
+    def __init__(self, logger, protocol):
+        do_delayed_imports()
+        self.logger = logger
+        self.protocol = protocol
+
+    async def __call__(self, payload):
+        viewport_meta = payload['viewportMeta'] \
+            if 'viewportMeta' in payload \
+            else None
+
+        if "contexts" not in payload:
+            raise ValueError("Missing required parameter: contexts")
+        contexts = []
+        for context in payload["contexts"]:
+            contexts.append(get_browsing_context_id(context))
+        if len(contexts) == 0:
+            raise ValueError("At least one context must be provided")
+
+        return await self.protocol.bidi_emulation.set_viewport_meta_override(
+            viewport_meta, contexts)
 
 
 class BidiSessionSubscribeAction:
@@ -376,8 +451,11 @@ async_actions = [
     BidiBluetoothSimulateDescriptorResponseAction,
     BidiEmulationSetGeolocationOverrideAction,
     BidiEmulationSetLocaleOverrideAction,
+    BidiEmulationSetMediaFeaturesOverrideAction,
     BidiEmulationSetScreenOrientationOverrideAction,
+    BidiEmulationSetScrollbarTypeOverrideAction,
     BidiEmulationSetTouchOverrideAction,
+    BidiEmulationSetViewportMetaOverrideAction,
     BidiUserAgentClientHintsSetClientHintsOverrideAction,
     BidiPermissionsSetPermissionAction,
     BidiSessionSubscribeAction,

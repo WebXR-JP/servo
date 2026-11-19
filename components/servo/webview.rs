@@ -39,6 +39,7 @@ use webrender_api::units::{DeviceIntRect, DevicePixel, DevicePoint, DeviceSize};
 use crate::clipboard_delegate::{ClipboardDelegate, DefaultClipboardDelegate};
 #[cfg(feature = "gamepad")]
 use crate::gamepad_delegate::{DefaultGamepadDelegate, GamepadDelegate};
+use crate::geolocation_delegate::{DefaultGeolocationDelegate, GeolocationDelegate};
 use crate::responders::AutomaticResponder;
 use crate::servo::PendingHandledInputEvent;
 use crate::webview_delegate::{CreateNewWebViewRequest, DefaultWebViewDelegate, WebViewDelegate};
@@ -102,6 +103,7 @@ pub(crate) struct WebViewInner {
     pub(crate) clipboard_delegate: Rc<dyn ClipboardDelegate>,
     #[cfg(feature = "gamepad")]
     pub(crate) gamepad_delegate: Rc<dyn GamepadDelegate>,
+    pub(crate) geolocation_delegate: Rc<dyn GeolocationDelegate>,
 
     /// AccessKit subtree id for this [`WebView`], if accessibility is active.
     ///
@@ -170,6 +172,9 @@ impl WebView {
             gamepad_delegate: builder
                 .gamepad_delegate
                 .unwrap_or_else(|| Rc::new(DefaultGamepadDelegate)),
+            geolocation_delegate: builder
+                .geolocation_delegate
+                .unwrap_or_else(|| Rc::new(DefaultGeolocationDelegate)),
             accesskit_tree_id: None,
             grafted_accesskit_tree_id: None,
             grafted_accesskit_tree_epoch: None,
@@ -301,6 +306,11 @@ impl WebView {
     #[cfg(feature = "gamepad")]
     pub fn gamepad_delegate(&self) -> Rc<dyn GamepadDelegate> {
         self.inner().gamepad_delegate.clone()
+    }
+
+    /// Get the [`GeolocationDelegate`] associated with this [`WebView`].
+    pub fn geolocation_delegate(&self) -> Rc<dyn GeolocationDelegate> {
+        self.inner().geolocation_delegate.clone()
     }
 
     /// Get the unique identifier for this [`WebView`].
@@ -1004,6 +1014,25 @@ impl WebView {
         );
     }
 
+    /// After a new tree has been grafted, move focus to the graft node so that the grafted tree's
+    /// focused node becomes the focused node for the webview.
+    fn move_accessibility_focus_to_graft_node(&self) {
+        let Some(webview_accesskit_tree_id) = self.inner().accesskit_tree_id else {
+            return;
+        };
+        let graft_node_id = NodeId(1);
+
+        self.delegate().notify_accessibility_tree_update(
+            self.clone(),
+            TreeUpdate {
+                nodes: vec![],
+                tree: None,
+                tree_id: webview_accesskit_tree_id,
+                focus: graft_node_id,
+            },
+        );
+    }
+
     pub(crate) fn process_accessibility_tree_update(&self, tree_update: TreeUpdate, epoch: Epoch) {
         if self
             .inner()
@@ -1021,9 +1050,19 @@ impl WebView {
             .grafted_accesskit_tree_epoch
             .is_none_or(|current| epoch > current)
         {
+            // This three-step process is necessary because we need the graft node to be the focused
+            // node in the WebView's accessibility tree, but we can't make it the focused node until
+            // the graft is completed by sending the initial tree update for the new tree.
             self.notify_document_accessibility_tree_id(tree_update.tree_id);
             self.inner_mut().grafted_accesskit_tree_epoch = Some(epoch);
+
+            self.delegate()
+                .notify_accessibility_tree_update(self.clone(), tree_update);
+
+            self.move_accessibility_focus_to_graft_node();
+            return;
         }
+
         self.delegate()
             .notify_accessibility_tree_update(self.clone(), tree_update);
     }
@@ -1081,6 +1120,7 @@ pub struct WebViewBuilder {
     clipboard_delegate: Option<Rc<dyn ClipboardDelegate>>,
     #[cfg(feature = "gamepad")]
     gamepad_delegate: Option<Rc<dyn GamepadDelegate>>,
+    geolocation_delegate: Option<Rc<dyn GeolocationDelegate>>,
 }
 
 impl WebViewBuilder {
@@ -1100,6 +1140,7 @@ impl WebViewBuilder {
             clipboard_delegate: None,
             #[cfg(feature = "gamepad")]
             gamepad_delegate: None,
+            geolocation_delegate: None,
         }
     }
 
@@ -1155,6 +1196,16 @@ impl WebViewBuilder {
     #[cfg(feature = "gamepad")]
     pub fn gamepad_delegate(mut self, gamepad_delegate: Rc<dyn GamepadDelegate>) -> Self {
         self.gamepad_delegate = Some(gamepad_delegate);
+        self
+    }
+
+    /// Set the [`GeolocationDelegate`] for the `WebView` being created. The same
+    /// [`GeolocationDelegate`] can be shared among multiple `WebView`s.
+    pub fn geolocation_delegate(
+        mut self,
+        geolocation_delegate: Rc<dyn GeolocationDelegate>,
+    ) -> Self {
+        self.geolocation_delegate = Some(geolocation_delegate);
         self
     }
 

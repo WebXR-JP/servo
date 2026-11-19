@@ -331,12 +331,17 @@ impl FontList {
         })
     }
 
-    /// Detect available fonts or fallback to a hardcoded list
+    /// Detect available fonts or fallback to a hardcoded list and sort the resulting list in a way
+    /// that allows `HarmonyOS` & `HMOS` font families to be placed at the front of the list.
+    /// The reason is optimization: the ordering of the list returned by `Fontations` is random,
+    /// so we pre-sort the list since we want to prioritize the use of HarmonyOS fonts.
     fn detect_installed_font_families() -> Vec<FontFamily> {
-        enumerate_font_files()
+        let mut families = enumerate_font_files()
             .inspect_err(|e| error!("Failed to enumerate font files due to `{e:?}`"))
             .map(get_system_font_families)
-            .unwrap_or_else(|_| FontList::fallback_font_families())
+            .unwrap_or_else(|_| FontList::fallback_font_families());
+        families.sort_by(|a, b| a.name.cmp(&b.name));
+        families
     }
 
     fn fallback_font_families() -> Vec<FontFamily> {
@@ -416,13 +421,13 @@ impl FontList {
 // Functions used by SystemFontService
 pub(crate) fn for_each_available_family<F>(mut callback: F)
 where
-    F: FnMut(String),
+    F: FnMut(&str),
 {
     for family in &FONT_LIST.families {
-        callback(family.name.clone());
+        callback(&family.name);
     }
     for alias in &FONT_LIST.aliases {
-        callback(alias.from.clone());
+        callback(&alias.from);
     }
 }
 
@@ -481,10 +486,7 @@ where
     }
 }
 
-/// Generate a list of candidate fonts and returns the list after sorting them: prioritize fonts whose family name contains `HarmonyOS` or `HMOS`.
-///
-/// The reason this is done is optimization: because the ordering returned by `fontations` (and therefore the generated FONT_LIST) is random,
-/// we want to prioritize `HarmonyOS` fonts during checks.
+/// Generate a list of candidate fallback fonts.
 ///
 /// TODO: in the future, consider other factors such as language. And use multithreading to improve performance.
 pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'static str> {
@@ -514,10 +516,6 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
         },
     }
 
-    families.sort_by_key(|name| {
-        let is_priority = name.contains("HarmonyOS") || name.contains("HMOS");
-        (!is_priority, *name)
-    });
     families
 }
 
@@ -544,21 +542,25 @@ mod test {
     #[test]
     fn test_get_system_font_families() {
         use super::get_system_font_families;
-        let families = get_system_font_families(vec![PathBuf::from("NotoSansCJK-Regular.ttc")]);
+        let fonts_dir = PathBuf::from(super::OHOS_FONTS_DIR);
+        let families = get_system_font_families(vec![fonts_dir.join("NotoSansCJK-Regular.ttc")]);
         assert_eq!(families.len(), 1);
         let family = families.first().unwrap();
         assert_eq!(family.name, "Noto Sans CJK".to_string());
 
-        let families = get_system_font_families(vec![
-            PathBuf::from("NotoSerifGeorgian[wdth,wght].ttf"),
-            PathBuf::from("HarmonyOS_Sans_Naskh_Arabic_UI.ttf"),
-            PathBuf::from("HarmonyOS_Sans_Condensed.ttf"),
-            PathBuf::from("HarmonyOS_Sans_Condensed_Italic.ttf"),
-            PathBuf::from("NotoSansDevanagariUI-Bold.ttf"),
-            PathBuf::from("NotoSansDevanagariUI-Medium.ttf"),
-            PathBuf::from("NotoSansDevanagariUI-Regular.ttf"),
-            PathBuf::from("NotoSansDevanagariUI-SemiBold.ttf"),
-        ]);
+        let families_paths = [
+            "NotoSerifGeorgian[wdth,wght].ttf",
+            "HarmonyOS_Sans_Naskh_Arabic_UI.ttf",
+            "HarmonyOS_Sans_Condensed.ttf",
+            "HarmonyOS_Sans_Condensed_Italic.ttf",
+            "NotoSansDevanagariUI-Bold.ttf",
+            "NotoSansDevanagariUI-Medium.ttf",
+            "NotoSansDevanagariUI-Regular.ttf",
+            "NotoSansDevanagariUI-SemiBold.ttf",
+        ]
+        .map(|filename| fonts_dir.join(filename))
+        .to_vec();
+        let families = get_system_font_families(families_paths);
         assert_eq!(families.len(), 4);
     }
 

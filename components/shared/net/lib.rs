@@ -4,6 +4,7 @@
 
 #![deny(unsafe_code)]
 
+use std::collections::hash_map::Entry;
 use std::fmt::{self, Debug, Display};
 use std::sync::{LazyLock, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -20,6 +21,7 @@ use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
 use parking_lot::RwLock;
+use pixels::CorsStatus;
 use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use profile_traits::mem::ReportsChan;
 use rand::{Rng, rng};
@@ -37,6 +39,8 @@ use servo_base::id::{CookieStoreId, HistoryStateId, PipelineId};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
 
+use crate::response::RedirectTaint;
+
 /// Identifies a pending asynchronous cookie operation initiated by the embedder.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CookieOperationId(pub u64);
@@ -49,6 +53,7 @@ use crate::request::{Request, RequestBuilder};
 use crate::response::{Response, ResponseInit};
 
 pub mod blob_url_store;
+pub mod fetch;
 pub mod filemanager_thread;
 pub mod http_status;
 pub mod image_cache;
@@ -67,11 +72,6 @@ pub use resource_fetch_timing::{
 /// <https://fetch.spec.whatwg.org/#document-accept-header-value>
 pub const DOCUMENT_ACCEPT_HEADER_VALUE: HeaderValue =
     HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-
-/// An implementation of the [Fetch specification](https://fetch.spec.whatwg.org/)
-pub mod fetch {
-    pub mod headers;
-}
 
 /// A loading context, for context-specific sniffing, as defined in
 /// <https://mimesniff.spec.whatwg.org/#context-specific-sniffing>
@@ -117,7 +117,7 @@ impl CustomResponse {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct CustomResponseMediator {
     pub response_chan: GenericCallback<Option<CustomResponse>>,
     pub load_url: ServoUrl,
@@ -313,16 +313,46 @@ pub trait FetchTaskTarget {
     fn process_response_length_hint(&mut self, request_id: &Request, length: usize);
 }
 
+/// <https://fetch.spec.whatwg.org/#concept-filtered-response>
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExposedMetadata {
+    pub final_url: ServoUrl,
+    pub headers: Serde<HeaderMap>,
+    pub status: HttpStatus,
+    pub redirected: bool,
+}
+
+impl From<Metadata> for ExposedMetadata {
+    fn from(value: Metadata) -> Self {
+        ExposedMetadata {
+            final_url: value.final_url,
+            headers: value.headers.unwrap_or_else(|| Serde(HeaderMap::new())),
+            status: value.status,
+            redirected: value.redirected,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum FilteredMetadata {
-    Basic(Metadata),
-    Cors(Metadata),
+    Basic(ExposedMetadata),
+    Cors(ExposedMetadata),
     Opaque,
     OpaqueRedirect(ServoUrl),
 }
 
-// FIXME: https://github.com/servo/servo/issues/34591
-#[expect(clippy::large_enum_variant)]
+impl From<FetchMetadata> for Metadata {
+    fn from(value: FetchMetadata) -> Self {
+        match value {
+            FetchMetadata::Unfiltered(metadata) => metadata,
+            FetchMetadata::Filtered {
+                filtered: _,
+                unsafe_,
+            } => unsafe_,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum FetchMetadata {
     Unfiltered(Metadata),
@@ -341,14 +371,16 @@ impl FetchMetadata {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#cors-cross-origin>
-    pub fn is_cors_cross_origin(&self) -> bool {
+    pub fn cors_status(&self) -> CorsStatus {
         if let Self::Filtered { filtered, .. } = self {
             match filtered {
-                FilteredMetadata::Basic(_) | FilteredMetadata::Cors(_) => false,
-                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => true,
+                FilteredMetadata::Basic(_) | FilteredMetadata::Cors(_) => CorsStatus::Safe,
+                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => {
+                    CorsStatus::Unsafe
+                },
             }
         } else {
-            false
+            CorsStatus::Safe
         }
     }
 }
@@ -874,10 +906,12 @@ impl CacheEntryDescriptor {
     }
 }
 
-// FIXME: https://github.com/servo/servo/issues/34591
-#[expect(clippy::large_enum_variant)]
 enum ToFetchThreadMessage {
-    Cancel(Vec<RequestId>, CoreResourceThread),
+    Cancel {
+        request_ids: Vec<RequestId>,
+        forget: bool,
+        core_resource_thread: CoreResourceThread,
+    },
     StartFetch(
         /* request_builder */ RequestBuilder,
         /* response_init */ Option<ResponseInit>,
@@ -976,18 +1010,31 @@ impl FetchThread {
                     let request_id = fetch_response_msg.request_id();
                     let fetch_finished =
                         matches!(fetch_response_msg, FetchResponseMsg::ProcessResponseEOF(..));
+                    let mut active_fetch = match self.active_fetches.entry(request_id) {
+                        Entry::Occupied(occupied_entry) => occupied_entry,
+                        Entry::Vacant(..) => {
+                            // The callback might no longer be in the map if it was cancelled and forgotten
+                            // (for instance, during a Document teardown).
+                            continue;
+                        },
+                    };
 
-                    self.active_fetches
-                        .get_mut(&request_id)
-                        .expect("Got fetch response for unknown fetch")(
-                        fetch_response_msg
-                    );
-
+                    active_fetch.get_mut()(fetch_response_msg);
                     if fetch_finished {
-                        self.active_fetches.remove(&request_id);
+                        let _ = active_fetch.remove();
                     }
                 },
-                Ok(ToFetchThreadMessage::Cancel(request_ids, core_resource_thread)) => {
+                Ok(ToFetchThreadMessage::Cancel {
+                    request_ids,
+                    forget,
+                    core_resource_thread,
+                }) => {
+                    if forget {
+                        for request_id in &request_ids {
+                            self.active_fetches.remove(request_id);
+                        }
+                    }
+
                     // Errors are ignored here, because Servo sends many cancellation requests when shutting down.
                     // At this point the networking task might be shut down completely, so just ignore errors
                     // during this time.
@@ -1014,12 +1061,17 @@ impl FetchThread {
         );
     }
 
-    fn cancel_async_fetch(request_ids: Vec<RequestId>, core_resource_thread: &CoreResourceThread) {
+    fn cancel_async_fetch(
+        request_ids: Vec<RequestId>,
+        core_resource_thread: &CoreResourceThread,
+        forget: bool,
+    ) {
         if let Some(fetch_thread) = FETCH_THREAD.get() {
-            let _ = fetch_thread.sender.send(ToFetchThreadMessage::Cancel(
+            let _ = fetch_thread.sender.send(ToFetchThreadMessage::Cancel {
                 request_ids,
-                core_resource_thread.clone(),
-            ));
+                forget,
+                core_resource_thread: core_resource_thread.clone(),
+            });
         }
     }
 
@@ -1057,7 +1109,17 @@ pub fn fetch_async(
 /// Instruct the resource thread to cancel an existing request. Does nothing if the
 /// request has already completed or has not been fetched yet.
 pub fn cancel_async_fetch(request_ids: Vec<RequestId>, core_resource_thread: &CoreResourceThread) {
-    FetchThread::cancel_async_fetch(request_ids, core_resource_thread);
+    FetchThread::cancel_async_fetch(request_ids, core_resource_thread, false /* forget */);
+}
+
+/// Instruct the resource thread to cancel an existing request. Does nothing if the
+/// request has already completed or has not been fetched yet. This also "forgets"
+/// the request, which means that no further callbacks will be called when canceled.
+pub fn cancel_and_forget_async_fetch(
+    request_ids: Vec<RequestId>,
+    core_resource_thread: &CoreResourceThread,
+) {
+    FetchThread::cancel_async_fetch(request_ids, core_resource_thread, true /* forget */);
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -1077,14 +1139,12 @@ pub struct Metadata {
     /// Location URL from the response headers.
     pub location_url: Option<Result<ServoUrl, String>>,
 
-    #[ignore_malloc_size_of = "Defined in hyper"]
     /// MIME type / subtype.
     pub content_type: Option<Serde<ContentType>>,
 
     /// Character set.
     pub charset: Option<String>,
 
-    #[ignore_malloc_size_of = "Defined in hyper"]
     /// Headers
     pub headers: Option<Serde<HeaderMap>>,
 
@@ -1102,6 +1162,8 @@ pub struct Metadata {
     pub redirected: bool,
     /// Detailed TLS metadata associated with the response, if any.
     pub tls_security_info: Option<TlsSecurityInfo>,
+    /// Redirect taint of response
+    pub redirect_taint: RedirectTaint,
 }
 
 impl Metadata {
@@ -1119,6 +1181,7 @@ impl Metadata {
             timing: None,
             redirected: false,
             tls_security_info: None,
+            redirect_taint: Default::default(),
         }
     }
 

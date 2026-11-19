@@ -3,6 +3,7 @@ import java.util.regex.Pattern
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 android {
@@ -16,7 +17,7 @@ android {
         minSdk = libs.versions.android.sdk.min.get().toInt()
         targetSdk = 34
         versionCode = generatedVersionCode
-        versionName = "0.7.0"
+        versionName = "0.8.0"
     }
 
     compileOptions {
@@ -121,13 +122,10 @@ project.afterEvaluate {
 }
 
 dependencies {
-    if (findProject(":servoview-local") != null) {
-        implementation(project(":servoview-local"))
-    } else {
-        implementation(project(":servoview"))
-    }
+    implementation(project(":servoview"))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.material3.compose)
     implementation(libs.androidx.material3.compose.adaptive)
     implementation(libs.androidx.preference)
+    implementation(libs.kotlinx.serialization.json)
 }

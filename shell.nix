@@ -8,14 +8,14 @@ with import (builtins.fetchTarball {
   # NixOS users: if servoshell crashes with an assertion failure in surfman’s x11/connection.rs,
   # eglInitialize() may be failing, or you may be building with an incompatible version of glibc.
   # Use your system nixpkgs here, change `llvmPackages` below if necessary, then do a clean build.
-  url = "https://github.com/NixOS/nixpkgs/archive/34ab99075ac4f7e40cf037eef32cb1c360bb85e9.tar.gz";
+  url = "https://github.com/NixOS/nixpkgs/archive/e7439b6b14ad3cc35d05608ebca9bce01a25f5f8.tar.gz";
 }) {
   overlays = [
     (import (builtins.fetchTarball {
       # Bumped the channel in rust-toolchain.toml? Bump this commit too!
       # Use the latest commit hash for the manifest associated with the relevant version number in
       # https://github.com/oxalica/rust-overlay/tree/master/manifests
-      url = "https://github.com/oxalica/rust-overlay/archive/57a23bfaf4f7017267294b161175db1e32eb1c85.tar.gz";
+      url = "https://github.com/oxalica/rust-overlay/archive/87ffb7f777aef2e2647fd8fd718a5b3cbc825588.tar.gz";
     }))
   ];
   config = {

@@ -2,8 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::RefCell;
 use std::collections::hash_map::HashMap;
 use std::convert::TryFrom;
+use std::error::Error;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use std::{fmt, io};
@@ -20,7 +22,7 @@ use hyper_util::client::legacy::connect::proxy::Tunnel;
 use hyper_util::client::legacy::connect::{
     Connected, Connection, HttpConnector as HyperHttpConnector,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use log::warn;
 use parking_lot::Mutex;
 use rustls::client::danger::ServerCertVerifier;
@@ -87,7 +89,7 @@ impl Service<Destination> for ServoHttpConnector {
         Box::pin(
             self.inner
                 .call(new_dest)
-                .map_err(|e| ConnectionError::HttpError(format!("{e}"))),
+                .map_err(|error| ConnectionError::HttpError(BoxError::from(error))),
         )
     }
 
@@ -117,7 +119,7 @@ impl<T> From<HyperRustlsHttpsConnector<T>> for InstrumentedConnector<T> {
 
 pub struct InstrumentedStream<T> {
     inner: MaybeHttpsStream<T>,
-    tls_info: Option<TlsHandshakeInfo>,
+    tls_info: RefCell<Option<TlsHandshakeInfo>>,
 }
 
 impl<T: Unpin> Unpin for InstrumentedStream<T> {}
@@ -177,7 +179,7 @@ where
         match stream {
             MaybeHttpsStream::Http(inner) => Self {
                 inner: MaybeHttpsStream::Http(inner),
-                tls_info: None,
+                tls_info: RefCell::new(None),
             },
             MaybeHttpsStream::Https(tls_stream) => {
                 let (_tcp, tls) = tls_stream.inner().get_ref();
@@ -185,7 +187,7 @@ where
 
                 Self {
                     inner: MaybeHttpsStream::Https(tls_stream),
-                    tls_info: Some(tls_info),
+                    tls_info: RefCell::new(Some(tls_info)),
                 }
             },
         }
@@ -208,8 +210,8 @@ where
                 }
             },
         };
-        if let Some(info) = &self.tls_info {
-            connected.extra(info.clone())
+        if let Some(info) = self.tls_info.borrow_mut().take() {
+            connected.extra(info)
         } else {
             connected
         }
@@ -576,9 +578,9 @@ pub type BoxedBody = BoxBody<Bytes, hyper::Error>;
 #[derive(Debug)]
 /// The error type for the MaybeProxyConnector
 pub enum ConnectionError {
-    HttpError(String),
+    HttpError(BoxError),
     // It looks like currently the type is not exported.
-    ProxyError(String),
+    ProxyError(BoxError),
 }
 
 impl std::fmt::Display for ConnectionError {
@@ -587,7 +589,14 @@ impl std::fmt::Display for ConnectionError {
     }
 }
 
-impl std::error::Error for ConnectionError {}
+impl std::error::Error for ConnectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ConnectionError::HttpError(error) => error.source(),
+            ConnectionError::ProxyError(error) => error.source(),
+        }
+    }
+}
 
 #[derive(Clone)]
 /// A proxy connector. This will automatically open a proxy connection if the uri matches the proxy uri.
@@ -622,7 +631,7 @@ impl Service<Destination> for ProxyConnector {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.client
             .poll_ready(cx)
-            .map_err(|e| ConnectionError::ProxyError(format!("{e}")))
+            .map_err(|error| ConnectionError::ProxyError(BoxError::from(error)))
     }
 
     fn call(&mut self, req: Destination) -> Self::Future {
@@ -635,13 +644,13 @@ impl Service<Destination> for ProxyConnector {
                     tunnel
                 }
                 .call(req)
-                .map_err(|e| ConnectionError::ProxyError(format!("{e}")));
+                .map_err(|error| ConnectionError::ProxyError(BoxError::from(error)));
                 Box::pin(final_tunnel)
             },
             None => Box::pin(
                 self.client
                     .call(req)
-                    .map_err(|e| ConnectionError::ProxyError(format!("{e}"))),
+                    .map_err(|error| ConnectionError::ProxyError(BoxError::from(error))),
             ),
         }
     }
@@ -659,5 +668,14 @@ pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
 
     Client::builder(TokioExecutor {})
         .http1_title_case_headers(true)
+        // This is necessary to allow hyper to perform various background tasks for HTTP/2.
+        .timer(TokioTimer::new())
+        // This is necessary for hyper to reap unused idle keep-alive connections.
+        .pool_timer(TokioTimer::new())
+        // Other browsers control the maximum connections per host, tyipcally set to 6, but hyper
+        // does not allow controlling this directly. Until we have code to manually do that, this
+        // limit controls the maximum idle connections per host, which we still don't want to grow
+        // without bound.
+        .pool_max_idle_per_host(6)
         .build(InstrumentedConnector::from(connector))
 }

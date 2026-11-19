@@ -15,6 +15,8 @@ use crate::buffer_source_node::AudioBufferSourceNode;
 use crate::channel_node::{ChannelMergerNode, ChannelSplitterNode};
 use crate::constant_source_node::ConstantSourceNode;
 use crate::context::{AudioContextOptions, ProcessingState, StateChangeResult};
+use crate::convolver_node::ConvolverNode;
+use crate::delay_node::DelayNode;
 use crate::gain_node::GainNode;
 use crate::graph::{AudioGraph, InputPort, NodeId, OutputPort, PortId};
 use crate::iir_filter_node::IIRFilterNode;
@@ -215,6 +217,7 @@ impl AudioRenderThread {
             AudioNodeInit::BiquadFilterNode(options) => {
                 Box::new(BiquadFilterNode::new(options, ch, self.sample_rate))
             },
+            AudioNodeInit::DelayNode(options) => Box::new(DelayNode::new(options, ch)),
             AudioNodeInit::GainNode(options) => Box::new(GainNode::new(options, ch)),
             AudioNodeInit::StereoPannerNode(options) => {
                 Box::new(StereoPannerNode::new(options, ch))
@@ -234,6 +237,7 @@ impl AudioRenderThread {
             AudioNodeInit::ConstantSourceNode(options) => {
                 Box::new(ConstantSourceNode::new(options, ch))
             },
+            AudioNodeInit::ConvolverNode(options) => Box::new(ConvolverNode::new(options, ch)),
             AudioNodeInit::MediaStreamDestinationNode(socket) => {
                 is_dest = true;
                 Box::new(MediaStreamDestinationNode::new(

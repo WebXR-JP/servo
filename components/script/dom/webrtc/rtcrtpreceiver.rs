@@ -4,7 +4,7 @@
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::RTCRtpReceiverBinding::RTCRtpReceiverMethods;
 use crate::dom::bindings::root::{Dom, DomRoot};
@@ -23,13 +23,13 @@ impl RTCRtpReceiver {
         global: &GlobalScope,
         track: &MediaStreamTrack,
     ) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(Self {
                 reflector_: Reflector::new(),
                 track: Dom::from_ref(track),
             }),
             global,
-            cx,
         )
     }
 }

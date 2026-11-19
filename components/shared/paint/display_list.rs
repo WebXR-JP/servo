@@ -15,7 +15,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_base::Epoch;
 use servo_base::cross_process_instant::CrossProcessInstant;
-use servo_base::id::{LCPCandidateID, ScrollTreeNodeId};
+use servo_base::id::{ContainerTimingID, LCPCandidateID, ScrollTreeNodeId};
 use servo_base::print_tree::PrintTree;
 use servo_geometry::FastLayoutTransform;
 use style::values::specified::Overflow;
@@ -741,6 +741,44 @@ impl ScrollTree {
         transforms
     }
 
+    /// This is a replication of WebRender's code for determining the transform to use for
+    /// a reference frame which takes into account perspective frames that scroll relative
+    /// to different scroll frames.
+    fn reference_frame_transform(
+        &self,
+        node: &ScrollTreeNode,
+        info: &ReferenceFrameNodeInfo,
+        cumulative_sticky_offset: LayoutVector2D,
+    ) -> FastLayoutTransform {
+        let ReferenceFrameKind::Perspective {
+            scrolling_relative_to: Some(scrolling_relative_to),
+        } = &info.kind
+        else {
+            return info.transform;
+        };
+
+        let mut scroll_offset = LayoutVector2D::zero();
+        let mut current_node = node;
+        let mut ending_cumulative_sticky_offset = LayoutVector2D::zero();
+
+        while let Some(parent_id) = current_node.parent {
+            let parent_node = self.get_node(parent_id);
+            if let SpatialTreeNodeInfo::Scroll(parent_info) = &parent_node.info {
+                if parent_info.external_id == *scrolling_relative_to {
+                    ending_cumulative_sticky_offset = self.cumulative_sticky_offsets(parent_id);
+                    break;
+                }
+                scroll_offset += parent_info.offset;
+            }
+            current_node = parent_node;
+        }
+
+        scroll_offset -= cumulative_sticky_offset - ending_cumulative_sticky_offset;
+        info.transform
+            .pre_translate(-scroll_offset)
+            .then_translate(scroll_offset)
+    }
+
     /// Traverse a scroll node to its root to calculate the transform.
     #[servo_tracing::instrument(name = "ScrollTree::cumulative_node_transform_inner", skip_all)]
     fn cumulative_node_transform_inner(
@@ -768,9 +806,14 @@ impl ScrollTree {
                 // To apply a transformation we need to make sure the rectangle's
                 // coordinate space is the same as reference frame's coordinate space.
                 let offset = info.frame_origin_for_query.to_vector();
+                let transform = self.reference_frame_transform(
+                    node,
+                    info,
+                    parent_transforms.cumulative_sticky_offsets,
+                );
                 let node_to_parent_transform =
-                    info.transform.pre_translate(-offset).then_translate(offset);
-                let parent_to_node_transform = info.transform.inverse().map(|inverse_transform| {
+                    transform.pre_translate(-offset).then_translate(offset);
+                let parent_to_node_transform = transform.inverse().map(|inverse_transform| {
                     FastLayoutTransform::Offset(-info.origin.to_vector()).then(&inverse_transform)
                 });
                 ScrollTreeNodeTransformationCache {
@@ -1009,6 +1052,12 @@ pub struct PaintDisplayListInfo {
     /// The pair is the candidate's id and its reported area.
     pub lcp_candidate: Option<(LCPCandidateID, usize)>,
 
+    /// The Container Timing updates produced by this display list, if any. Only the IDs
+    /// travel here: the records themselves go straight from layout to script, and paint's
+    /// sole job is to hand these IDs back once the frame has actually been composited.
+    /// <https://wicg.github.io/container-timing/>
+    pub container_timing_candidates: Vec<ContainerTimingID>,
+
     /// If this display list contains a blinking caret, this value will be filled with its animation
     /// key and original color value so that the painter can animate the caret.
     pub caret_property_binding: Option<(PropertyBindingKey<ColorF>, ColorF)>,
@@ -1062,12 +1111,16 @@ impl PaintDisplayListInfo {
             root_scroll_node_id,
             first_reflow,
             lcp_candidate: None,
+            container_timing_candidates: Vec::new(),
             paint_timing_report: PaintTimingReport::default(),
             paint_timing_info: PaintTimingInfo::now(),
             caret_property_binding: Default::default(),
         }
     }
 
+    /// Find the [`ExternalScrollId`] of the scroll node identified by the given
+    /// [`ScrollTreeNodeId`]. This will walk up the tree to find the first inclusive
+    /// ancestor scroll node.
     pub fn external_scroll_id_for_scroll_tree_node(
         &self,
         id: ScrollTreeNodeId,

@@ -56,7 +56,7 @@ use script::ServiceWorkerManager;
 use servo_background_hang_monitor::HangMonitorRegister;
 use servo_base::generic_channel::{GenericCallback, GenericSender, RoutedReceiver, SendError};
 pub use servo_base::id::WebViewId;
-use servo_base::id::{EMBEDDER_PIPELINE_NAMESPACE_ID, PipelineNamespace};
+use servo_base::id::{EMBEDDER_PIPELINE_NAMESPACE_ID, PipelineId, PipelineNamespace};
 #[cfg(feature = "bluetooth")]
 use servo_bluetooth::BluetoothThreadFactory;
 #[cfg(feature = "bluetooth")]
@@ -102,6 +102,7 @@ use webxr::WebXrRegistry;
 use crate::clipboard_delegate::StringRequest;
 #[cfg(feature = "gamepad")]
 use crate::gamepad_delegate::{GamepadHapticEffectRequest, GamepadHapticEffectRequestType};
+use crate::geolocation_delegate::{PositionRequest, PositionWatch};
 use crate::javascript_evaluator::JavaScriptEvaluator;
 use crate::network_manager::NetworkManager;
 use crate::proxies::ConstellationProxy;
@@ -115,10 +116,11 @@ use crate::webview_delegate::{
     ProtocolHandlerRegistration, WebResourceLoad,
 };
 
-#[cfg(feature = "media-gstreamer")]
+#[cfg(all(
+    feature = "media-gstreamer",
+    not(any(target_os = "android", target_env = "ohos"))
+))]
 mod media_platform {
-    use std::path::PathBuf;
-
     use servo_media_gstreamer::GStreamerBackend;
 
     use super::ServoMedia;
@@ -126,6 +128,8 @@ mod media_platform {
     #[cfg(any(windows, target_os = "macos"))]
     pub fn init() {
         ServoMedia::init_with_backend(|| {
+            use servo_media::BackendInit;
+
             let mut plugin_dir = std::env::current_exe().unwrap();
             plugin_dir.pop();
 
@@ -135,7 +139,7 @@ mod media_platform {
 
             let plugin_list = crate::gstreamer_plugins::gstreamer_plugins();
             match GStreamerBackend::init_with_plugins(plugin_dir, &plugin_list) {
-                Ok(b) => b,
+                Ok(backend) => return backend,
                 Err(error) => {
                     // 配布物では exe の隣にプラグインを置くが、開発ビルドでは
                     // 置かれていないことが多い。その場合はシステムの GStreamer
@@ -143,15 +147,10 @@ mod media_platform {
                     log::warn!(
                         "同梱の GStreamer プラグインを読めないため、システムの登録済みプラグインを使う: {error:?}"
                     );
-                    match GStreamerBackend::init_with_plugins::<&str>(PathBuf::new(), &[]) {
-                        Ok(b) => b,
-                        Err(error) => {
-                            log::error!("Error initializing GStreamer: {error:?}");
-                            std::process::exit(1);
-                        },
-                    }
                 },
             }
+
+            GStreamerBackend::init()
         });
     }
 
@@ -161,7 +160,7 @@ mod media_platform {
     }
 }
 
-#[cfg(all(not(feature = "media-gstreamer"), target_env = "ohos"))]
+#[cfg(target_env = "ohos")]
 mod media_platform {
     use servo_media_ohos::OhosBackend;
 
@@ -171,7 +170,10 @@ mod media_platform {
     }
 }
 
-#[cfg(all(not(feature = "media-gstreamer"), not(target_env = "ohos")))]
+#[cfg(all(
+    not(target_env = "ohos"),
+    not(all(feature = "media-gstreamer", not(target_os = "android")))
+))]
 mod media_platform {
     use super::ServoMedia;
     pub fn init() {
@@ -284,6 +286,9 @@ struct ServoInner {
     pending_handled_input_events: RefCell<Vec<PendingHandledInputEvent>>,
     /// An [`EventLoopWaker`] used to wake up the main embedder event loop.
     event_loop_waker: Box<dyn EventLoopWaker>,
+    /// Geolocation watches that have been handed to a GeolocationDelegate grouped by the pipeline
+    /// that asked for them.
+    geolocation_watches: RefCell<FxHashMap<PipelineId, Vec<GeolocationWatchId>>>,
 }
 
 impl ServoInner {
@@ -292,6 +297,34 @@ impl ServoInner {
             .borrow()
             .get(&id)
             .and_then(WebView::from_weak_handle)
+    }
+
+    /// Forget a geolocation watch, returning whether we were still tracking it.
+    fn untrack_geolocation_watch(&self, watch_id: &GeolocationWatchId) -> bool {
+        let mut watches = self.geolocation_watches.borrow_mut();
+        let Some(pipeline_watches) = watches.get_mut(&watch_id.pipeline_id) else {
+            return false;
+        };
+        let Some(index) = pipeline_watches.iter().position(|id| id == watch_id) else {
+            return false;
+        };
+        pipeline_watches.swap_remove(index);
+        if pipeline_watches.is_empty() {
+            watches.remove(&watch_id.pipeline_id);
+        }
+        true
+    }
+
+    /// Tell the GeolocationDelegate to stop a watch, if we still believe it to be running.
+    fn stop_geolocation_watch(&self, watch_id: &GeolocationWatchId) {
+        if !self.untrack_geolocation_watch(watch_id) {
+            return;
+        }
+        if let Some(webview) = self.get_webview_handle(watch_id.webview_id) {
+            webview
+                .geolocation_delegate()
+                .stop_watch(webview.clone(), watch_id);
+        }
     }
 
     #[servo_tracing::instrument(level = "debug", skip_all)]
@@ -671,10 +704,10 @@ impl ServoInner {
                         .request_permission(webview, permission_request);
                 }
             },
-            EmbedderMsg::RequestWakeLockPermission(webview_id, callback, type_) => {
+            EmbedderMsg::RequestPermission(webview_id, requested_feature, callback) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let permission_request = PermissionRequest {
-                        requested_feature: PermissionFeature::ScreenWakeLock(type_),
+                        requested_feature,
                         allow_deny_request: AllowOrDenyRequest::new_from_callback(
                             callback,
                             AllowOrDeny::Deny,
@@ -701,6 +734,30 @@ impl ServoInner {
                         .request_permission(webview, permission_request);
                 }
                 // webview が無ければここで request が drop され、既定の deny が送られる。
+            },
+            EmbedderMsg::RequestGeolocationPosition(webview_id, options, result_sender) => {
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    webview.geolocation_delegate().request_position(
+                        webview.clone(),
+                        PositionRequest::new(result_sender, options),
+                    );
+                }
+            },
+            EmbedderMsg::StartGeolocationWatch(watch_id, options, result_sender) => {
+                if let Some(webview) = self.get_webview_handle(watch_id.webview_id) {
+                    self.geolocation_watches
+                        .borrow_mut()
+                        .entry(watch_id.pipeline_id)
+                        .or_default()
+                        .push(watch_id.clone());
+                    webview.geolocation_delegate().start_watch(
+                        webview.clone(),
+                        PositionWatch::new(watch_id, result_sender, options),
+                    );
+                }
+            },
+            EmbedderMsg::StopGeolocationWatch(watch_id) => {
+                self.stop_geolocation_watch(&watch_id);
             },
             EmbedderMsg::OnDevtoolsStarted(port, token) => match port {
                 Ok(port) => self
@@ -913,6 +970,17 @@ impl ServoInner {
                         .notify_crashed(webview, reason, backtrace);
                 }
             },
+            ConstellationToEmbedderMsg::PipelineExited(pipeline_id) => {
+                let orphaned = self
+                    .geolocation_watches
+                    .borrow()
+                    .get(&pipeline_id)
+                    .cloned()
+                    .unwrap_or_default();
+                for watch_id in orphaned {
+                    self.stop_geolocation_watch(&watch_id);
+                }
+            },
             ConstellationToEmbedderMsg::MediaSessionEvent(webview_id, media_session_event) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
@@ -934,6 +1002,12 @@ impl Drop for ServoInner {
         }
     }
 }
+
+#[cfg(feature = "devtools")]
+type DevtoolsMessage = devtools_traits::DevtoolsControlMsg;
+
+#[cfg(not(feature = "devtools"))]
+type DevtoolsMessage = ();
 
 /// An in-process handle to a `Servo` instance. Cloning the handle does not create a new instance
 /// of `Servo`.
@@ -996,14 +1070,14 @@ impl Servo {
         );
         let mem_profiler_chan = profile_mem::Profiler::create();
 
-        let devtools_sender = if pref!(devtools_server_enabled) {
-            Some(devtools::start_server(
+        let mut devtools_sender: Option<Sender<DevtoolsMessage>> = None;
+        #[cfg(feature = "devtools")]
+        if pref!(devtools_server_enabled) {
+            devtools_sender = Some(devtools::start_server(
                 embedder_proxy.clone(),
                 mem_profiler_chan.clone(),
             ))
-        } else {
-            None
-        };
+        }
 
         // Important that this call is done in a single-threaded fashion, we
         // can't defer it after `create_constellation` has started.
@@ -1058,6 +1132,7 @@ impl Servo {
             paint_proxy,
             time_profiler_chan,
             mem_profiler_chan,
+            #[cfg(feature = "devtools")]
             devtools_sender,
             protocols,
             public_resource_threads.clone(),
@@ -1080,6 +1155,7 @@ impl Servo {
             network_manager: Rc::new(RefCell::new(NetworkManager::new(
                 public_resource_threads.clone(),
                 private_resource_threads.clone(),
+                constellation_proxy.clone(),
             ))),
             site_data_manager: SiteDataManager::new(
                 public_resource_threads,
@@ -1100,6 +1176,7 @@ impl Servo {
             _js_engine_setup: js_engine_setup,
             pending_handled_input_events: Default::default(),
             event_loop_waker,
+            geolocation_watches: Default::default(),
         }))
     }
 
@@ -1279,7 +1356,9 @@ fn create_constellation(
     paint_proxy: PaintProxy,
     time_profiler_chan: time::ProfilerChan,
     mem_profiler_chan: mem::ProfilerChan,
-    devtools_sender: Option<Sender<devtools_traits::DevtoolsControlMsg>>,
+    #[cfg(feature = "devtools")] devtools_sender: Option<
+        Sender<devtools_traits::DevtoolsControlMsg>,
+    >,
     protocols: Arc<ProtocolRegistry>,
     public_resource_threads: ResourceThreads,
     private_resource_threads: ResourceThreads,
@@ -1308,6 +1387,7 @@ fn create_constellation(
         paint_proxy,
         embedder_proxy,
         constellation_to_embedder_proxy,
+        #[cfg(feature = "devtools")]
         devtools_sender,
         #[cfg(feature = "bluetooth")]
         bluetooth_thread,

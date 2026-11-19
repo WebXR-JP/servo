@@ -3,11 +3,9 @@ package org.servo.servoshell
 import android.content.Context
 import android.util.Log
 import java.io.File
-import java.io.FileWriter
 import java.io.IOException
-import org.json.JSONArray
-import org.json.JSONException
-import org.servo.servoshell.HistoryEntry.Companion.fromJSON
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.Json
 
 /** Keeps a history of visited websites in an app-scoped JSON file. */
 class HistoryManager(context: Context) {
@@ -15,7 +13,7 @@ class HistoryManager(context: Context) {
 
     /** Add a new history entry. Only adds if the URL is different from the most recent entry. */
     fun addEntry(url: String, title: String?) {
-        val history = loadHistory()
+        val history = loadHistory().toMutableList()
 
         // "about:blank" sometimes pops up while loading pages, so filter that out
         if (url == "about:blank") {
@@ -43,7 +41,7 @@ class HistoryManager(context: Context) {
         saveHistory(history)
     }
 
-    val history: MutableList<HistoryEntry>
+    val history: List<HistoryEntry>
         get() = loadHistory()
 
     /** Clear all history */
@@ -55,45 +53,31 @@ class HistoryManager(context: Context) {
     }
 
     /** Load history from JSON file */
-    private fun loadHistory(): MutableList<HistoryEntry> {
-        val history = mutableListOf<HistoryEntry>()
-
+    private fun loadHistory(): List<HistoryEntry> {
         if (!historyFile.exists()) {
-            return history
+            return emptyList()
         }
 
         try {
-            val jsonArray = JSONArray(historyFile.readText())
-            for (i in 0..<jsonArray.length()) {
-                val jsonObject = jsonArray.getJSONObject(i)
-                history.add(fromJSON(jsonObject))
-            }
+            return Json.decodeFromString<List<HistoryEntry>>(historyFile.readText())
         } catch (e: IOException) {
             Log.e(TAG, "Error loading history", e)
-        } catch (e: JSONException) {
+        } catch (e: SerializationException) {
             Log.e(TAG, "Error loading history", e)
         }
 
-        return history
+        return emptyList()
     }
 
     /** Save history to JSON file */
-    private fun saveHistory(history: MutableList<HistoryEntry>) {
+    private fun saveHistory(history: List<HistoryEntry>) {
         try {
-            val jsonArray = JSONArray()
-            for (entry in history) {
-                jsonArray.put(entry.toJSON())
-            }
-
-            FileWriter(historyFile).use { writer ->
-                // Pretty print with indent
-                writer.write(jsonArray.toString(2))
-            }
+            historyFile.writeText(Json.encodeToString(history))
 
             Log.d(TAG, "History saved to JSON")
         } catch (e: IOException) {
             Log.e(TAG, "Error saving history", e)
-        } catch (e: JSONException) {
+        } catch (e: SerializationException) {
             Log.e(TAG, "Error saving history", e)
         }
     }

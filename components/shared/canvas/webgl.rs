@@ -322,7 +322,7 @@ pub enum WebGLCommand {
     GetExtensions(GenericSender<String>),
     GetShaderPrecisionFormat(u32, u32, GenericSender<(i32, i32, i32)>),
     GetFragDataLocation(WebGLProgramId, String, GenericSender<i32>),
-    GetUniformLocation(WebGLProgramId, String, GenericSender<i32>),
+    GetUniformLocation(WebGLProgramId, String, GenericSender<Option<i32>>),
     GetShaderInfoLog(WebGLShaderId, GenericSender<String>),
     GetProgramInfoLog(WebGLProgramId, GenericSender<String>),
     GetFramebufferAttachmentParameter(u32, u32, u32, GenericSender<i32>),
@@ -404,6 +404,7 @@ pub enum WebGLCommand {
     VertexAttribI(u32, i32, i32, i32, i32),
     VertexAttribU(u32, u32, u32, u32, u32),
     VertexAttribPointer(u32, i32, u32, bool, i32, u32),
+    VertexAttribIPointer(u32, i32, u32, i32, u32),
     VertexAttribPointer2f(u32, i32, bool, i32, u32),
     SetViewport(i32, i32, i32, i32),
     TexImage3D {
@@ -496,6 +497,7 @@ pub enum WebGLCommand {
     GetParameterFloat(ParameterFloat, GenericSender<f32>),
     GetParameterFloat2(ParameterFloat2, GenericSender<[f32; 2]>),
     GetParameterFloat4(ParameterFloat4, GenericSender<[f32; 4]>),
+    GetParameterString(ParameterString, GenericSender<String>),
     GetProgramValidateStatus(WebGLProgramId, GenericSender<bool>),
     GetProgramActiveUniforms(WebGLProgramId, GenericSender<i32>),
     GetCurrentVertexAttrib(u32, GenericSender<[f32; 4]>),
@@ -952,6 +954,12 @@ parameters! {
             ColorClearValue = gl::COLOR_CLEAR_VALUE,
         }),
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum ParameterString {
+    UnmaskedVendor,
+    UnmaskedRenderer,
 }
 
 parameters! {

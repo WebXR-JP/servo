@@ -418,7 +418,7 @@ impl InlineFormattingContextBuilder {
         let original_size_before = offset_map.total_original_size();
 
         let bidi_class_map = CodePointMapData::<BidiClass>::new();
-        let white_space_collapse = info.style.clone_white_space_collapse();
+        let white_space_collapse = info.style.get_white_space_collapse();
         let mut character_count = Utf32CodeUnits(0);
         let mut new_text = String::with_capacity(text.len());
         for iteration in TextTransformationIterator::new(
@@ -451,20 +451,25 @@ impl InlineFormattingContextBuilder {
                             Self::is_document_white_space(character) && character != '\n'
                         },
                         WhiteSpaceCollapse::Preserve | WhiteSpaceCollapse::BreakSpaces => false,
+                        // preserve-spaces is pref-gated (layout.css.white-space-collapse.preserve-spaces.enabled)
+                        // which Servo does not enable, so it is never parsed.
+                        WhiteSpaceCollapse::PreserveSpaces => unreachable!(),
                     };
 
                 new_text.push(character)
             }
         }
 
-        if new_text.is_empty() {
+        let needs_caret_placeholder = info.node.text_node_needs_caret_placeholder();
+        self.is_empty &= !needs_caret_placeholder;
+        if new_text.is_empty() && !needs_caret_placeholder {
             return;
         }
 
         if let Some(last_character) = new_text.chars().next_back() {
             self.on_word_boundary = last_character.is_whitespace();
             self.last_inline_box_ended_with_collapsible_white_space =
-                self.on_word_boundary && white_space_collapse != WhiteSpaceCollapse::Preserve;
+                self.on_word_boundary && white_space_collapse != &WhiteSpaceCollapse::Preserve;
         }
 
         // TODO: ensure layout doesn’t handle more than 4 GiB at a time?
@@ -488,7 +493,8 @@ impl InlineFormattingContextBuilder {
                 character_range_in_ifc_text: new_character_range,
                 original_offset: original_size_before,
                 selection: AtomicRefCell::new(selection),
-                paint_caret: info.node.text_node_paints_caret(),
+                paints_caret: info.node.text_node_paints_caret(),
+                needs_caret_placeholder,
                 offset_map: self.offset_map.clone(),
             }
             .into(),
@@ -538,6 +544,12 @@ impl InlineFormattingContextBuilder {
             is_single_line_text_input,
             default_bidi_level,
         ))
+    }
+
+    /// Push a soft wrap opportunity to this [`InlineFormattingContextBuilder`] which pushes
+    /// a zero-width space to the text content.
+    pub(crate) fn push_soft_wrap_opportunity(&mut self) {
+        self.push_control_character_string("\u{200B}");
     }
 }
 

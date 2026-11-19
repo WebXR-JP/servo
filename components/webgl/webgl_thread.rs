@@ -89,7 +89,7 @@ pub(crate) struct GLContextData {
 
 #[derive(Debug)]
 pub struct GLState {
-    _webgl_version: WebGLVersion,
+    webgl_version: WebGLVersion,
     _gl_version: GLVersion,
     requested_flags: ContextAttributeFlags,
     // This is the WebGL view of the color mask
@@ -207,7 +207,7 @@ impl Default for GLState {
     fn default() -> GLState {
         GLState {
             _gl_version: GLVersion { major: 1, minor: 0 },
-            _webgl_version: WebGLVersion::WebGL1,
+            webgl_version: WebGLVersion::WebGL1,
             requested_flags: ContextAttributeFlags::empty(),
             color_write_mask: [true, true, true, true],
             clear_color: (0., 0., 0., 0.),
@@ -685,7 +685,7 @@ impl WebGLThread {
 
         let state = GLState {
             _gl_version: gl_version,
-            _webgl_version: webgl_version,
+            webgl_version,
             requested_flags,
             default_vao,
             ..Default::default()
@@ -1753,6 +1753,9 @@ impl WebGLImpl {
                     offset as _,
                 )
             },
+            WebGLCommand::VertexAttribIPointer(attrib_id, size, data_type, stride, offset) => unsafe {
+                gl.vertex_attrib_pointer_i32(attrib_id, size, data_type, stride, offset as _)
+            },
             WebGLCommand::SetViewport(x, y, width, height) => unsafe {
                 gl.viewport(x, y, width, height)
             },
@@ -2034,10 +2037,42 @@ impl WebGLImpl {
                 sender.send(value).unwrap()
             },
             WebGLCommand::GetParameterInt(param, ref sender) => {
+                // The core profiles used for WebGL 2 dropped the `*_BITS` queries.
+                let webgl2 = state.webgl_version == WebGLVersion::WebGL2;
                 let value = match param {
                     webgl::ParameterInt::AlphaBits if state.fake_no_alpha() => 0,
                     webgl::ParameterInt::DepthBits if state.fake_no_depth() => 0,
                     webgl::ParameterInt::StencilBits if state.fake_no_stencil() => 0,
+                    webgl::ParameterInt::RedBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_RED_SIZE,
+                    ),
+                    webgl::ParameterInt::GreenBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_GREEN_SIZE,
+                    ),
+                    webgl::ParameterInt::BlueBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_BLUE_SIZE,
+                    ),
+                    webgl::ParameterInt::AlphaBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE,
+                    ),
+                    webgl::ParameterInt::DepthBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::DEPTH_ATTACHMENT,
+                        gl::FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE,
+                    ),
+                    webgl::ParameterInt::StencilBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::STENCIL_ATTACHMENT,
+                        gl::FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE,
+                    ),
                     _ => unsafe { gl.get_parameter_i32(param as u32) },
                 };
                 sender.send(value).unwrap()
@@ -2084,6 +2119,14 @@ impl WebGLImpl {
                 unsafe {
                     gl.get_parameter_f32_slice(param as u32, &mut value);
                 }
+                sender.send(value).unwrap()
+            },
+            WebGLCommand::GetParameterString(param, ref sender) => {
+                let gl_param = match param {
+                    webgl::ParameterString::UnmaskedVendor => gl::VENDOR,
+                    webgl::ParameterString::UnmaskedRenderer => gl::RENDERER,
+                };
+                let value = unsafe { gl.get_parameter_string(gl_param) };
                 sender.send(value).unwrap()
             },
             WebGLCommand::GetProgramValidateStatus(program, ref sender) => sender
@@ -2152,7 +2195,7 @@ impl WebGLImpl {
                 gl.tex_parameter_f32(target, param, value)
             },
             WebGLCommand::LinkProgram(program_id, ref sender) => {
-                return sender.send(Self::link_program(gl, program_id)).unwrap();
+                sender.send(Self::link_program(gl, program_id)).unwrap()
             },
             WebGLCommand::UseProgram(program_id) => unsafe {
                 gl.use_program(program_id.map(|p| p.glow()))
@@ -2613,8 +2656,16 @@ impl WebGLImpl {
                     attach(attachment)
                 }
             },
-            WebGLCommand::ReadBuffer(buffer) => unsafe { gl.read_buffer(buffer) },
-            WebGLCommand::DrawBuffers(ref buffers) => unsafe { gl.draw_buffers(buffers) },
+            WebGLCommand::ReadBuffer(buffer) => unsafe {
+                gl.read_buffer(Self::default_framebuffer_color_buffer(buffer, ctx, device))
+            },
+            WebGLCommand::DrawBuffers(ref buffers) => {
+                let buffers: Vec<_> = buffers
+                    .iter()
+                    .map(|&buffer| Self::default_framebuffer_color_buffer(buffer, ctx, device))
+                    .collect();
+                unsafe { gl.draw_buffers(&buffers) }
+            },
         }
 
         // If debug asertions are enabled, then check the error state.
@@ -2815,6 +2866,22 @@ impl WebGLImpl {
         chan.send(parameter).unwrap();
     }
 
+    /// Reads one component size of a draw framebuffer attachment, or 0 when
+    /// nothing is attached, as OpenGL ES 3.0.6 §4.4.5 defines the `*_BITS` values.
+    fn read_draw_framebuffer_bits(gl: &Gl, attachment: u32, pname: u32) -> i32 {
+        unsafe {
+            let object_type = gl.get_framebuffer_attachment_parameter_i32(
+                gl::DRAW_FRAMEBUFFER,
+                attachment,
+                gl::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+            );
+            if object_type as u32 == gl::NONE {
+                return 0;
+            }
+            gl.get_framebuffer_attachment_parameter_i32(gl::DRAW_FRAMEBUFFER, attachment, pname)
+        }
+    }
+
     /// <https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.7>
     fn get_renderbuffer_parameter(gl: &Gl, target: u32, pname: u32, chan: &GenericSender<i32>) {
         let parameter = unsafe { gl.get_renderbuffer_parameter_i32(target, pname) };
@@ -2825,14 +2892,13 @@ impl WebGLImpl {
         gl: &Gl,
         program_id: WebGLProgramId,
         name: &str,
-        chan: &GenericSender<i32>,
+        chan: &GenericSender<Option<i32>>,
     ) {
         let location = unsafe {
             gl.get_uniform_location(program_id.glow(), &to_name_in_compiled_shader(name))
         };
         // (#34300): replace this with WebGLUniformId
-        chan.send(location.map(|l| l.0).unwrap_or_default() as i32)
-            .unwrap();
+        chan.send(location.map(|l| l.0 as i32)).unwrap();
     }
 
     fn shader_info_log(gl: &Gl, shader_id: WebGLShaderId, chan: &GenericSender<String>) {
@@ -2925,6 +2991,23 @@ impl WebGLImpl {
             state.drawing_to_default_framebuffer =
                 request == WebGLFramebufferBindingRequest::Default;
             state.restore_invariant(gl);
+        }
+    }
+
+    /// Maps a WebGL default framebuffer color buffer to its GL name: when the surface is backed
+    /// by a framebuffer object, GL rejects `BACK` and uses `COLOR_ATTACHMENT0` for the color
+    /// buffer.
+    fn default_framebuffer_color_buffer(buffer: u32, ctx: &Context, device: &Device) -> u32 {
+        if buffer != gl::BACK {
+            return buffer;
+        }
+        let surface_info = device
+            .context_surface_info(ctx)
+            .expect("WebGL commands run with their context current")
+            .expect("WebGL contexts are created with a surface attached");
+        match surface_info.framebuffer_object {
+            Some(_) => gl::COLOR_ATTACHMENT0,
+            None => gl::BACK,
         }
     }
 

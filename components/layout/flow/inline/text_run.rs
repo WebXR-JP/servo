@@ -34,10 +34,11 @@ use super::{InlineFormattingContextLayout, SharedInlineStyles};
 use crate::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom::WeakLayoutBox;
-use crate::flow::inline::shaping_queue::ShapingQueueEntry;
+use crate::flow::inline::shaping_queue::{ShapingQueueEntry, breaks_for_break_spaces};
 use crate::flow::inline::text_transform::OffsetMap;
 use crate::flow::inline::{BidiLevels, LineBlockSizes, LineItem, SegmentContentFlags};
 use crate::fragment_tree::BaseFragmentInfo;
+use crate::style_ext::ComputedValuesExt;
 
 // There are two reasons why we might want to break at the start:
 //
@@ -282,7 +283,7 @@ impl TextRunSegment {
             }
 
             let run_start = text_run.run_data.character_range_in_ifc_text.start;
-            ifc.push_glyph_store_to_unbreakable_segment(
+            ifc.push_shaped_text_slice_to_unbreakable_segment(
                 run.clone(),
                 text_run,
                 &self.info,
@@ -316,7 +317,10 @@ pub(crate) enum TextRunItem {
     /// A hard line break i.e. a "\n" as other types line breaks are normalized to "\n".
     LineBreak(Option<CaretPlaceholder>),
     /// A preserved tab character that should advance the line to a tab stop.
-    Tab { bidi_level: Level },
+    Tab {
+        bidi_level: Level,
+        break_at_start: bool,
+    },
     /// Any other text for which a font can be matched. We store a `Box` here as [`TextRunSegment`]
     /// is quite a bit larger than the other enum variants.
     TextSegment(Box<TextRunSegment>),
@@ -345,7 +349,10 @@ pub(crate) struct SharedTextRunData {
     // TODO: make this more compact with a pair of `AtomicUsize`?
     pub selection: AtomicRefCell<Option<RangeAny<Utf32CodeUnits>>>,
     /// Whether a caret should be painted when the selection is an empty range (start == end)
-    pub paint_caret: bool,
+    pub paints_caret: bool,
+    /// Whether a caret placeholder should be added for empty text runs or for empty
+    /// lines after a forced line break.
+    pub needs_caret_placeholder: bool,
     /// The [`OffsetMap`] used when creating this `TextRun`'s `InlineFormattingContext`. This
     /// is used for mapping between DOM text offsets and layout text offsets (and vice-versa).
     pub offset_map: ArcRefCell<OffsetMap>,
@@ -380,9 +387,30 @@ impl SharedTextRunData {
         &self,
         offset: Utf32CodeUnits,
     ) -> Utf32CodeUnits {
-        let offset_map = self.offset_map.borrow();
-        let offset_in_ifc_text = self.character_range_in_ifc_text.start;
-        offset_map.reverse_map(offset + offset_in_ifc_text) - self.original_offset
+        self.map_transformed_ifc_offset_to_dom_offset(
+            offset + self.character_range_in_ifc_text.start,
+        )
+    }
+
+    /// Map a UTF-32 offset in the transformed `InlineFormattingContext::text_content`
+    /// into an offset in the `TextRun`'s DOM node. The input value will be clamped to
+    /// this `TextRun`'s actual text range before mapping.
+    pub(crate) fn map_transformed_ifc_offset_to_dom_offset(
+        &self,
+        offset: Utf32CodeUnits,
+    ) -> Utf32CodeUnits {
+        let run_range = &self.character_range_in_ifc_text;
+        let offset = offset.clamp(run_range.start, run_range.end);
+        self.offset_map.borrow().reverse_map(offset) - self.original_offset
+    }
+
+    /// Map an offset in the `TextRun`'s DOM node into a UTF-32 offset in the transformed
+    /// `InlineFormattingContext::text_content`.
+    pub(crate) fn map_dom_offset_to_transformed_ifc_offset(
+        &self,
+        offset: Utf32CodeUnits,
+    ) -> Utf32CodeUnits {
+        self.offset_map.borrow().map(offset + self.original_offset)
     }
 }
 
@@ -536,6 +564,7 @@ impl TextRun {
         let text_run_text =
             &formatting_context_text[Utf8CodeUnits::to_usize_range(&self.text_range)];
         let char_iterator = TwoCharsAtATimeIterator::new(text_run_text.chars());
+
         // The next bytes index of the character within the entire inline formatting context's text.
         let mut next_byte_index = self.text_range.start;
         for (relative_character_index, (character, next_character)) in char_iterator.enumerate() {
@@ -548,8 +577,8 @@ impl TextRun {
 
             if character == '\n' {
                 finish_current_segment(&mut current, &mut results);
-                let paint_caret = self.run_data.paint_caret;
-                results.push(TextRunItem::LineBreak(paint_caret.then(|| {
+                let needs_caret_placeholder = self.run_data.needs_caret_placeholder;
+                results.push(TextRunItem::LineBreak(needs_caret_placeholder.then(|| {
                     CaretPlaceholder {
                         run_data: self.run_data.clone(),
                         base_fragment_info: self.base_fragment_info,
@@ -563,8 +592,19 @@ impl TextRun {
 
             if character == '\t' {
                 finish_current_segment(&mut current, &mut results);
+
+                // There is a soft wrap opportunity between a preceding space and a tab
+                // under `break-spaces`.
+                let break_at_start = *parent_style.get_white_space_collapse() ==
+                    WhiteSpaceCollapse::BreakSpaces &&
+                    formatting_context_text[0..current_byte_index.0 as usize]
+                        .chars()
+                        .next_back()
+                        .is_some_and(breaks_for_break_spaces);
+
                 results.push(TextRunItem::Tab {
                     bidi_level: bidi_levels.level(current_byte_index.into()),
+                    break_at_start,
                 });
                 continue;
             }
@@ -646,6 +686,13 @@ impl TextRun {
 
     pub(super) fn layout_into_line_items(&self, ifc: &mut InlineFormattingContextLayout) {
         if self.text_range.is_empty() {
+            if self.run_data.needs_caret_placeholder {
+                ifc.current_line.caret_placeholder = Some(CaretPlaceholder {
+                    run_data: self.run_data.clone(),
+                    base_fragment_info: self.base_fragment_info,
+                    character_index: Utf32CodeUnits(0),
+                });
+            }
             return;
         }
 
@@ -669,7 +716,10 @@ impl TextRun {
                 TextRunItem::LineBreak(caret_placeholder) => {
                     ifc.defer_forced_line_break_at_character_offset(caret_placeholder);
                 },
-                TextRunItem::Tab { bidi_level } => self.process_preserved_tab(ifc, *bidi_level),
+                TextRunItem::Tab {
+                    bidi_level,
+                    break_at_start,
+                } => self.process_preserved_tab(ifc, *bidi_level, *break_at_start),
                 TextRunItem::TextSegment(segment) => {
                     segment.layout_into_line_items(self, soft_wrap_policy, ifc)
                 },
@@ -682,31 +732,51 @@ impl TextRun {
         &self,
         ifc_layout: &mut InlineFormattingContextLayout,
         bidi_level: Level,
+        break_at_start: bool,
     ) {
-        let advance = ifc_layout.ifc.next_tab_stop_after_inline_advance(
-            &self.inline_styles().style.borrow(),
-            ifc_layout.potential_line_size().inline,
-        );
+        if break_at_start {
+            ifc_layout.process_soft_wrap_opportunity();
+        }
+
+        let position_after_current_segment =
+            ifc_layout.current_line.inline_position + ifc_layout.current_line_segment.inline_size;
+        let style = self.inline_styles().style.borrow();
+        let advance = ifc_layout
+            .ifc
+            .next_tab_stop_after_inline_advance(&style, position_after_current_segment);
         if advance.is_zero() {
             return;
         }
 
+        let conditionally_hangs = style.white_space_may_hang_conditionally();
+        let (flags, hanging_advance) = if conditionally_hangs {
+            (SegmentContentFlags::Contentful, advance)
+        } else {
+            (
+                SegmentContentFlags::Contentful |
+                    SegmentContentFlags::IncorporateTrailingWhiteSpace,
+                Au::zero(),
+            )
+        };
+
         ifc_layout.update_unbreakable_segment_for_new_content(
             &LineBlockSizes::zero(),
             advance,
-            SegmentContentFlags::empty(),
+            hanging_advance,
+            Au::zero(),
+            flags,
         );
         ifc_layout.push_line_item_to_unbreakable_segment(LineItem::Tab {
             inline_box_identifier: ifc_layout.current_inline_box_identifier(),
             advance,
             bidi_level,
+            conditionally_hangs,
         });
 
-        if ifc_layout
+        if *ifc_layout
             .current_inline_container_state()
             .style
-            .get_inherited_text()
-            .white_space_collapse ==
+            .get_white_space_collapse() ==
             WhiteSpaceCollapse::BreakSpaces
         {
             ifc_layout.process_soft_wrap_opportunity();

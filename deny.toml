@@ -40,6 +40,15 @@ ignore = [
     # This is a dependency of `usvg`, `rustybuzz`, `fontdb`.
     # We will need to wait for upstream actions.
     "RUSTSEC-2026-0192",
+    # The crate `zvariant` is unmaintained. Wait for `atspi-common` to start
+    # using `zbus`.
+    "RUSTSEC-2026-0370",
+    # The crate `zbus_names` is unmaintained. Wait for `atspi-common` to start
+    # using `zbus`.
+    "RUSTSEC-2026-0371",
+    # The crate `zvariant_derive` is unmaintained. Wait for `atspi-common` to start
+    # using `zbus`.
+    "RUSTSEC-2026-0372",
 ]
 
 # This section is considered when running `cargo deny check licenses`
@@ -185,23 +194,8 @@ skip = [
     "digest",
     "block-buffer",
 
-    # Duplicated by ml-kem. This should be gone in next version (>0.3.2)
-    # of ml-kem.
-    "sha3",
-
     # Duplicated by bindgen
     "shlex",
-
-    # Duplicated by vello (disabled by default) which uses old wgpu.
-    "bit-set",
-    "naga",
-    "wgpu-core",
-    "wgpu-core-deps-apple",
-    "wgpu-core-deps-emscripten",
-    "wgpu-core-deps-windows-linux-android",
-    "wgpu-hal",
-    "wgpu-naga-bridge",
-    "wgpu-types",
 
     # duplicated by mozjs which brings in new versions
     "anstream",
@@ -216,4 +210,23 @@ skip = [
     "phf_generator",
     "phf_macros",
     "phf_shared",
+
+    # Duplicated by serde_with crate (proc macro helpers, so no binary size increase)
+    "darling",
+    "darling_core",
+    "darling_macro",
+
+    # Duplicated by rfd and vello.
+    "pollster",
 ]
+
+# github.com organizations to allow git sources for
+[sources.allow-org]
+github = [
+    "servo",
+]
+
+# On our releases we switch to crates.io dependencies,
+# so explicitly allow unused allow-org entries to avoid errors.
+[sources]
+unused-allowed-org = "allow"

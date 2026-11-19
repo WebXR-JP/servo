@@ -13,8 +13,6 @@ use std::sync::{Arc, Weak};
 use std::thread;
 
 use cookie::Cookie;
-use crossbeam_channel::Sender;
-use devtools_traits::DevtoolsControlMsg;
 use embedder_traits::GenericEmbedderProxy;
 use hyper_serde::Serde;
 use log::{debug, trace, warn};
@@ -89,7 +87,7 @@ fn load_root_cert_store_from_file(file_path: String) -> io::Result<Vec<Certifica
 /// Returns a tuple of (public, private) senders to the new threads.
 #[expect(clippy::too_many_arguments)]
 pub fn new_resource_threads(
-    devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+    devtools_sender: Option<crossbeam_channel::Sender<DevtoolsMessage>>,
     time_profiler_chan: ProfilerChan,
     mem_profiler_chan: MemProfilerChan,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
@@ -129,7 +127,7 @@ pub fn new_resource_threads(
 /// Create a CoreResourceThread
 #[expect(clippy::too_many_arguments)]
 pub fn new_core_resource_thread(
-    devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+    devtools_sender: Option<crossbeam_channel::Sender<DevtoolsMessage>>,
     time_profiler_chan: ProfilerChan,
     mem_profiler_chan: MemProfilerChan,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
@@ -226,6 +224,7 @@ fn create_http_states(
         hsts_list: RwLock::new(hsts_list),
         cookie_jar: RwLock::new(cookie_jar),
         auth_cache: RwLock::new(auth_cache),
+        cors_cache: RwLock::new(CorsCache::default()),
         history_states: RwLock::new(FxHashMap::default()),
         http_cache: HttpCache::new(HttpCacheAssignment::Public),
         client: create_http_client(create_tls_config(
@@ -244,6 +243,7 @@ fn create_http_states(
         hsts_list: RwLock::new(HstsList::default()),
         cookie_jar: RwLock::new(CookieStorage::new(150)),
         auth_cache: RwLock::new(AuthCache::default()),
+        cors_cache: RwLock::new(CorsCache::default()),
         history_states: RwLock::new(FxHashMap::default()),
         http_cache: HttpCache::new(HttpCacheAssignment::Private),
         client: create_http_client(create_tls_config(
@@ -741,8 +741,14 @@ pub struct AuthCache {
     pub entries: HashMap<String, AuthCacheEntry>,
 }
 
+#[cfg(feature = "devtools")]
+type DevtoolsMessage = devtools_traits::DevtoolsControlMsg;
+
+#[cfg(not(feature = "devtools"))]
+type DevtoolsMessage = ();
+
 pub struct CoreResourceManager {
-    devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+    devtools_sender: Option<crossbeam_channel::Sender<DevtoolsMessage>>,
     sw_managers: HashMap<ImmutableOrigin, GenericSender<CustomResponseMediator>>,
     filemanager: FileManager,
     request_interceptor: RequestInterceptor,
@@ -755,7 +761,7 @@ pub struct CoreResourceManager {
 
 impl CoreResourceManager {
     pub fn new(
-        devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+        devtools_sender: Option<crossbeam_channel::Sender<DevtoolsMessage>>,
         _profiler_chan: ProfilerChan,
         embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
         ca_certificates: CACertificates<'static>,
@@ -824,6 +830,7 @@ impl CoreResourceManager {
         protocols: Arc<ProtocolRegistry>,
     ) {
         let http_state = http_state.clone();
+        #[cfg(feature = "devtools")]
         let devtools_chan = self.devtools_sender.clone();
         let filemanager = self.filemanager.clone();
         let request_interceptor = self.request_interceptor.clone();
@@ -876,12 +883,12 @@ impl CoreResourceManager {
             let context = FetchContext {
                 state: http_state,
                 user_agent: servo_config::pref!(user_agent),
+                #[cfg(feature = "devtools")]
                 devtools_chan,
                 filemanager,
                 file_token,
                 request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
                 cancellation_listener,
-                timing: ResourceFetchTiming::new(request.timing_type()).into(),
                 protocols,
                 websocket_chan: None,
                 ca_certificates,
@@ -894,12 +901,12 @@ impl CoreResourceManager {
                 Some(res_init) => {
                     let response = Response::from_init(res_init, timing_type);
 
-                    let mut fetch_params = FetchParams::new(request);
+                    let timing = ResourceFetchTiming::new(request.timing_type()).into();
+                    let mut fetch_params = FetchParams::new(request, timing);
                     let mut request_body_stream_closer =
                         AutoRequestBodyStreamCloser::new(fetch_params.request.body.as_ref());
                     let response = http_redirect_fetch(
                         &mut fetch_params,
-                        &mut CorsCache::default(),
                         response,
                         true,
                         &mut sender,
@@ -943,6 +950,7 @@ impl CoreResourceManager {
         protocols: Arc<ProtocolRegistry>,
     ) {
         let http_state = http_state.clone();
+        #[cfg(feature = "devtools")]
         let devtools_chan = self.devtools_sender.clone();
         let filemanager = self.filemanager.clone();
         let request_interceptor = self.request_interceptor.clone();
@@ -972,12 +980,12 @@ impl CoreResourceManager {
                     let context = FetchContext {
                         state: http_state,
                         user_agent: servo_config::pref!(user_agent),
+                        #[cfg(feature = "devtools")]
                         devtools_chan,
                         filemanager,
                         file_token: FileTokenCheck::NotRequired,
                         request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
                         cancellation_listener,
-                        timing: ResourceFetchTiming::new(request.timing_type()).into(),
                         protocols: protocols.clone(),
                         websocket_chan: Some(Arc::new(Mutex::new(WebSocketChannel::new(
                             event_sender.clone(),

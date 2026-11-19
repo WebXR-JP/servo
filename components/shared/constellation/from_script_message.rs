@@ -5,9 +5,11 @@
 //! Messages send from the ScriptThread to the Constellation.
 
 use std::fmt;
+use std::sync::Arc;
 
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
-use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, WorkerId};
+#[cfg(feature = "devtools")]
+use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg};
 use embedder_traits::user_contents::UserContentManagerId;
 use embedder_traits::{
     AnimationState, FocusSequenceNumber, JSValue, JavaScriptEvaluationError,
@@ -31,7 +33,7 @@ use servo_base::generic_channel::{GenericCallback, GenericReceiver, GenericSende
 use servo_base::id::{
     BroadcastChannelRouterId, BrowsingContextId, HistoryStateId, MessagePortId,
     MessagePortRouterId, PipelineId, ScriptEventLoopId, ServiceWorkerId,
-    ServiceWorkerRegistrationId, WebViewId,
+    ServiceWorkerRegistrationId, WebViewId, WorkerId,
 };
 use servo_canvas_traits::canvas::{CanvasId, CanvasMsg};
 #[cfg(feature = "webgl")]
@@ -82,6 +84,39 @@ pub enum LoadOrigin {
     Script(OriginSnapshot),
 }
 
+/// Messages sent from the service worker manager to the constellation.
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ServiceWorkerManagerMsg {
+    /// <https://w3c.github.io/ServiceWorker/#update-worker-state>
+    UpdateWorkerState {
+        /// The identity of the service worker.
+        worker_id: ServiceWorkerId,
+        /// The new state of the service worker.
+        state: ServiceWorkerState,
+        /// The script url origin.
+        origin: ImmutableOrigin,
+    },
+}
+
+/// <https://w3c.github.io/ServiceWorker/#dfn-state>
+/// A service worker has an associated state, which is one of:
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum ServiceWorkerState {
+    /// "parsed".
+    /// It is initially "parsed".
+    Parsed,
+    /// "installing".
+    Installing,
+    /// "installed".
+    Installed,
+    /// "activating".
+    Activating,
+    /// "activated".
+    Activated,
+    /// "redundant".
+    Redundant,
+}
+
 /// can be passed to `LoadUrl` to load a page with GET/POST
 /// parameters or headers
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -121,7 +156,7 @@ pub struct LoadData {
     /// The referrer policy.
     pub referrer_policy: ReferrerPolicy,
     /// The policy container.
-    pub policy_container: Option<PolicyContainer>,
+    pub policy_container: Option<Arc<PolicyContainer>>,
 
     /// The source to use instead of a network response for a srcdoc document.
     pub srcdoc: String,
@@ -230,8 +265,10 @@ pub struct ScopeThings {
     /// base resources required to create worker global scopes
     pub init: WorkerGlobalScopeInit,
     /// the port to receive devtools message from
+    #[cfg(feature = "devtools")]
     pub devtools_chan: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
     /// service worker id
+    #[cfg(feature = "devtools")]
     pub worker_id: WorkerId,
     /// the browsing context id of the page that registered the service worker
     pub browsing_context_id: BrowsingContextId,
@@ -252,6 +289,8 @@ pub struct DOMMessage {
 /// Channels to allow service worker manager to communicate with constellation and resource thread
 #[derive(Deserialize, Serialize)]
 pub struct SWManagerSenders {
+    /// Sender of messages to the constellation.
+    pub constellation_sender: GenericSender<ServiceWorkerManagerMsg>,
     /// [`ResourceThreads`] for initating fetches or using i/o.
     pub resource_threads: ResourceThreads,
     /// [`CrossProcessPaintApi`] for communicating with `Paint`.
@@ -279,6 +318,7 @@ pub enum ServiceWorkerMsg {
     },
     /// <https://w3c.github.io/ServiceWorker/#algorithms>
     HandleAlgorithm(ServiceWorkerAlgorithm),
+    SetNetworkOnlineState(bool),
     /// Exit the service worker manager
     Exit,
 }
@@ -517,8 +557,10 @@ pub struct WorkerGlobalScopeInit {
     /// Chan to the time profiler
     pub time_profiler_chan: profile_time::ProfilerChan,
     /// To devtools sender
+    #[cfg(feature = "devtools")]
     pub to_devtools_sender: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
     /// From devtools sender
+    #[cfg(feature = "devtools")]
     pub from_devtools_sender: Option<GenericSender<DevtoolScriptControlMsg>>,
     /// Messages to send to constellation
     pub script_to_constellation_chan: ScriptToConstellationSender,
@@ -539,6 +581,8 @@ pub struct WorkerGlobalScopeInit {
     /// Handle for communicating messages to the WebGL thread, if available.
     #[cfg(feature = "webgl")]
     pub webgl_chan: Option<WebGLChan>,
+    /// Whether or not Servo is online.
+    pub online: bool,
 }
 
 /// Message delivered to a worker event loop to run animation frame callbacks.
@@ -732,9 +776,12 @@ pub enum ScriptToConstellationMessage {
         PipelineId,
         GenericSender<Option<(OriginSnapshot, Vec<ImmutableOrigin>)>>,
     ),
-    /// All pending loads are complete, and the `load` event for this pipeline
-    /// has been dispatched.
-    LoadComplete,
+    /// Inform the constellation that this pipeline's pending loads are finished, either because
+    /// they were completed or because the load has been aborted. In the case it has not been
+    /// aborted this indicates that the pipeline's `load` event has already been dispatched.
+    LoadFinished {
+        aborted: bool,
+    },
     /// A new load has been requested, with an option to replace the current entry once loaded
     /// instead of adding a new entry.
     LoadUrl(LoadData, NavigationHistoryBehavior, TargetSnapshotParams),

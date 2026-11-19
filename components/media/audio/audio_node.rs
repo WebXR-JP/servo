@@ -15,6 +15,8 @@ use crate::block::{Block, Chunk, Tick};
 use crate::buffer_source_node::{AudioBufferSourceNodeMessage, AudioBufferSourceNodeOptions};
 use crate::channel_node::ChannelNodeOptions;
 use crate::constant_source_node::ConstantSourceNodeOptions;
+use crate::convolver_node::{ConvolverNodeMessage, ConvolverNodeOptions};
+use crate::delay_node::DelayNodeOptions;
 use crate::gain_node::GainNodeOptions;
 use crate::iir_filter_node::IIRFilterNodeOptions;
 use crate::media_element_source_node::MediaElementSourceNodeMessage;
@@ -34,8 +36,8 @@ pub enum AudioNodeInit {
     ChannelMergerNode(ChannelNodeOptions),
     ChannelSplitterNode,
     ConstantSourceNode(ConstantSourceNodeOptions),
-    ConvolverNode,
-    DelayNode,
+    ConvolverNode(ConvolverNodeOptions),
+    DelayNode(DelayNodeOptions),
     DynamicsCompressionNode,
     GainNode(GainNodeOptions),
     IIRFilterNode(IIRFilterNodeOptions),
@@ -64,6 +66,8 @@ pub enum AudioNodeType {
     ConstantSourceNode,
     ConvolverNode,
     DelayNode,
+    DelayReader, // Only constructed internally by the DelayNode
+    DelayWriter, // Only constructed internally by the DelayNode
     DestinationNode,
     DynamicsCompressionNode,
     GainNode,
@@ -107,7 +111,7 @@ impl BlockInfo {
     }
 }
 
-#[derive(MallocSizeOf)]
+#[derive(Clone, Copy, MallocSizeOf)]
 pub struct ChannelInfo {
     pub count: u8,
     pub mode: ChannelCountMode,
@@ -239,6 +243,7 @@ pub enum AudioNodeMessage {
     AudioBufferSourceNode(AudioBufferSourceNodeMessage),
     AudioScheduledSourceNode(AudioScheduledSourceNodeMessage),
     BiquadFilterNode(BiquadFilterNodeMessage),
+    ConvolverNode(ConvolverNodeMessage),
     GetParamValue(ParamType, Sender<f32>),
     MediaElementSourceNode(MediaElementSourceNodeMessage),
     OscillatorNode(OscillatorNodeMessage),

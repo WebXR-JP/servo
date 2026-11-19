@@ -6,7 +6,6 @@
 
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::ptr;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
@@ -14,7 +13,6 @@ use js::conversions::ToJSValConvertible;
 use js::jsapi::Heap;
 use js::jsval::UndefinedValue;
 use js::realm::CurrentRealm;
-use js::rust::wrappers2::JS_NewObject;
 use js::rust::{HandleObject, HandleValue, MutableHandleObject};
 
 use crate::codegen::GenericBindings::IterableIteratorBinding::{
@@ -23,9 +21,10 @@ use crate::codegen::GenericBindings::IterableIteratorBinding::{
 use crate::conversions::IDLInterface;
 use crate::error::Fallible;
 use crate::interfaces::{DomHelpers, GlobalScopeHelpers};
+use crate::js::JS_NewObject;
 use crate::reflector::{DomGlobalGeneric, DomObjectIteratorWrap, DomObjectWrap, Reflector};
 use crate::root::{Dom, DomRoot, Root};
-use crate::trace::{NoTrace, RootedTraceableBox};
+use crate::trace::NoTrace;
 use crate::utils::DOMClass;
 use crate::{DomTypes, JSTraceable};
 
@@ -110,7 +109,7 @@ impl<D: DomTypes, T: DomObjectIteratorWrap<D> + JSTraceable + Iterable + DomGlob
             _marker: NoTrace(PhantomData),
         });
         let global = D::GlobalScope::from_current_realm(realm);
-        <D as DomHelpers<D>>::reflect_dom_object_with_cx(realm, iterator, &*global)
+        <D as DomHelpers<D>>::reflect_dom_object(realm, iterator, &*global)
     }
 
     /// Return the next value from the iterable object.
@@ -172,7 +171,7 @@ fn dict_return(
     dict.done = done;
     dict.value.set(value.get());
 
-    unsafe { result.set(JS_NewObject(cx, ptr::null())) };
+    result.set(JS_NewObject(cx, None));
     dict.to_jsobject(cx, result);
     Ok(())
 }
@@ -188,11 +187,11 @@ fn key_and_value_return(
     dict.value = Some(
         vec![key, value]
             .into_iter()
-            .map(|handle| RootedTraceableBox::from_box(Heap::boxed(handle.get())))
+            .map(|handle| Heap::boxed(handle.get()))
             .collect(),
     );
 
-    unsafe { result.set(JS_NewObject(cx, ptr::null())) };
+    result.set(JS_NewObject(cx, None));
     dict.to_jsobject(cx, result);
     Ok(())
 }

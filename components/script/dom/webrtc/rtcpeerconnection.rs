@@ -68,7 +68,6 @@ use crate::tasks::task_source::SendableTaskSource;
 #[dom_struct]
 pub(crate) struct RTCPeerConnection {
     eventtarget: EventTarget,
-    #[ignore_malloc_size_of = "defined in servo-media"]
     #[no_trace]
     controller: DomRefCell<Option<WebRtcController>>,
     closed: Cell<bool>,
@@ -87,7 +86,6 @@ pub(crate) struct RTCPeerConnection {
     #[no_trace]
     ice_config: DomRefCell<IceConfiguration>,
     signaling_state: Cell<RTCSignalingState>,
-    #[ignore_malloc_size_of = "defined in servo-media"]
     data_channels: DomRefCell<FxHashMap<DataChannelId, Dom<RTCDataChannel>>>,
     senders: DomRefCell<Vec<Dom<RTCRtpSender>>>,
     transceivers: DomRefCell<Vec<Dom<RTCRtpTransceiver>>>,
@@ -276,7 +274,7 @@ impl RTCPeerConnection {
             proto,
         );
         let signaller = this.make_signaller();
-        *this.controller.borrow_mut() = Some(ServoMedia::get().create_webrtc(signaller));
+        *this.controller.safe_borrow_mut(cx) = Some(ServoMedia::get().create_webrtc(signaller));
         let policy = match config.bundlePolicy {
             RTCBundlePolicy::Balanced => BundlePolicy::Balanced,
             RTCBundlePolicy::Max_compat => BundlePolicy::MaxCompat,
@@ -765,7 +763,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         // https://w3c.github.io/webrtc-pc/#enqueue-an-operation
 
         self.controller
-            .borrow_mut()
+            .safe_borrow_mut(current_realm.no_gc())
             .as_ref()
             .unwrap()
             .add_ice_candidate(IceCandidate {
@@ -789,7 +787,9 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
             p.reject_error(current_realm, Error::InvalidState(None));
             return p;
         }
-        self.offer_promises.borrow_mut().push(p.to_traced());
+        self.offer_promises
+            .safe_borrow_mut(current_realm.no_gc())
+            .push(p.to_traced());
         self.create_offer();
         p
     }
@@ -805,7 +805,9 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
             p.reject_error(current_realm, Error::InvalidState(None));
             return p;
         }
-        self.answer_promises.borrow_mut().push(p.to_traced());
+        self.answer_promises
+            .safe_borrow_mut(current_realm.no_gc())
+            .push(p.to_traced());
         self.create_answer();
         p
     }
@@ -1077,7 +1079,11 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         self.signaling_state.set(RTCSignalingState::Closed);
 
         // Step 5 handled by backend
-        self.controller.borrow_mut().as_ref().unwrap().quit();
+        self.controller
+            .safe_borrow_mut(cx.no_gc())
+            .as_ref()
+            .unwrap()
+            .quit();
 
         // 以降の replaceTrack を InvalidState で拒否する。
         for sender in self.senders.borrow().iter() {

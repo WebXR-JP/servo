@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::f32::consts::SQRT_2;
+use std::f32::consts::FRAC_1_SQRT_2;
 use std::mem;
 use std::ops::*;
 
@@ -44,6 +44,12 @@ impl Default for Chunk {
 }
 
 impl Chunk {
+    pub fn new(block: Block) -> Self {
+        Chunk {
+            blocks: smallvec![block; 1],
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
@@ -365,7 +371,7 @@ impl Block {
                         // output = sqrt(0.5) * (input.L + input.R) + input.C + 0.5 * (input.SL + input.SR)
                         let o =
                             // sqrt(0.5) * (input.L + input.R)
-                            SQRT_2 * (self.data_chan_frame(frame, 0) +
+                            FRAC_1_SQRT_2 * (self.data_chan_frame(frame, 0) +
                                       self.data_chan_frame(frame, 1)) +
                             // input.C
                             self.data_chan_frame(frame, 2) +
@@ -403,12 +409,12 @@ impl Block {
                     for frame in 0..FRAMES_PER_BLOCK_USIZE {
                         // output.L = L + sqrt(0.5) * (input.C + input.SL)
                         v[frame] = self.data_chan_frame(frame, 0) +
-                            SQRT_2 *
+                            FRAC_1_SQRT_2 *
                                 (self.data_chan_frame(frame, 2) +
                                     self.data_chan_frame(frame, 4));
                         // output.R = R + sqrt(0.5) * (input.C + input.SR)
                         v[frame + FRAMES_PER_BLOCK_USIZE] = self.data_chan_frame(frame, 1) +
-                            SQRT_2 *
+                            FRAC_1_SQRT_2 *
                                 (self.data_chan_frame(frame, 2) +
                                     self.data_chan_frame(frame, 5));
                     }
@@ -424,10 +430,10 @@ impl Block {
                     for frame in 0..FRAMES_PER_BLOCK_USIZE {
                         // output.L = L + sqrt(0.5) * input.C
                         v[frame] = self.data_chan_frame(frame, 0) +
-                            SQRT_2 * self.data_chan_frame(frame, 2);
+                            FRAC_1_SQRT_2 * self.data_chan_frame(frame, 2);
                         // output.R = R + sqrt(0.5) * input.C
                         v[frame + FRAMES_PER_BLOCK_USIZE] = self.data_chan_frame(frame, 1) +
-                            SQRT_2 * self.data_chan_frame(frame, 2);
+                            FRAC_1_SQRT_2 * self.data_chan_frame(frame, 2);
                         // output.SL = input.SL
                         v[frame + 2 * FRAMES_PER_BLOCK_USIZE] = self.data_chan_frame(frame, 4);
                         // output.SR = input.SR
@@ -583,6 +589,24 @@ impl<'a> FrameRef<'a> {
                     chan,
                 )
             }
+        }
+    }
+
+    #[inline]
+    /// Gets the data in the current frame of the block
+    /// Returned slice with one value per channel
+    pub fn get_frame(&self) -> Vec<f32> {
+        if self.block.repeat {
+            vec![self.block.buffer[self.frame.0 as usize]; self.block.channels as usize]
+        } else {
+            let mut frames = Vec::with_capacity(self.block.channels as usize);
+            for channel in 0..self.block.channels {
+                frames.push(
+                    self.block.buffer
+                        [channel as usize * FRAMES_PER_BLOCK_USIZE + self.frame.0 as usize],
+                );
+            }
+            frames
         }
     }
 }

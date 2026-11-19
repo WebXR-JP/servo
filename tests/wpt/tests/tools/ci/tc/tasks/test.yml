@@ -4,7 +4,7 @@ components:
     workerType: ci-gw
     schedulerId: taskcluster-github
     deadline: "24 hours"
-    image: ghcr.io/web-platform-tests/wpt:3
+    image: ghcr.io/web-platform-tests/wpt:4
     maxRunTime: 7200
     artifacts:
       public/results:
@@ -106,6 +106,11 @@ components:
       branch:
         - epochs/weekly
 
+  trigger-three-hourly:
+    trigger:
+      branch:
+        - epochs/three_hourly
+
   trigger-pr:
     trigger:
       pull-request:
@@ -135,6 +140,7 @@ components:
       - "docker-worker:capability:privileged"
     chunks-override:
       testharness: 30
+      reftest: 12
       test262: 16
 
   tox-python3_9:
@@ -174,6 +180,8 @@ tasks:
         - vars:
             suite: testharness
         - vars:
+            suite: reftest
+        - vars:
             suite: wdspec
         - vars:
             suite: crashtest
@@ -186,7 +194,7 @@ tasks:
                 browser: firefox
                 channel: nightly
               use:
-                - trigger-master
+                - trigger-three-hourly
                 - trigger-push
             - vars:
                 browser: firefox
@@ -211,7 +219,7 @@ tasks:
                 browser: chrome
                 channel: canary
               use:
-                - trigger-master
+                - trigger-three-hourly
                 - trigger-push
             - vars:
                 browser: chrome
@@ -282,119 +290,6 @@ tasks:
             - vars:
                 browser: firefox_android
                 channel: stable
-              use:
-                - trigger-daily
-                - trigger-push
-          do:
-            - ${vars.browser}-${vars.channel}-${vars.suite}:
-                use:
-                  - wpt-base
-                  - run-options
-                  - wpt-run
-                  - browser-${vars.browser}
-                  - wpt-${vars.suite}
-                description: >-
-                  A subset of WPT's "${vars.suite}" tests (chunk number ${chunks.id}
-                  of ${chunks.total}), run in the ${vars.channel} release of
-                  ${vars.browser}.
-
-  # Reftests are currently broken on firefox_android; this should otherwise be identical
-  # to the section above
-  - $map:
-      for:
-        - vars:
-            suite: reftest
-      do:
-        $map:
-          for:
-            - vars:
-                browser: firefox
-                channel: nightly
-              use:
-                - trigger-master
-                - trigger-push
-            - vars:
-                browser: firefox
-                channel: beta
-              use:
-                - trigger-daily
-                - trigger-push
-            - vars:
-                browser: firefox
-                channel: stable
-              use:
-                - trigger-daily
-                - trigger-push
-            - vars:
-                # Chromium ToT
-                browser: chromium
-                channel: nightly
-              use:
-                - trigger-daily
-                - trigger-push
-            - vars:
-                browser: chrome
-                channel: canary
-              use:
-                - trigger-master
-                - trigger-push
-            - vars:
-                browser: chrome
-                channel: dev
-              use:
-                - trigger-weekly
-                - trigger-push
-            - vars:
-                browser: chrome
-                channel: beta
-              use:
-                - trigger-weekly
-                - trigger-push
-            - vars:
-                browser: chrome
-                channel: stable
-              use:
-                - trigger-daily
-                - trigger-push
-            - vars:
-                browser: webkitgtk_minibrowser
-                channel: nightly
-              use:
-                - trigger-daily
-                - trigger-push
-            - vars:
-                browser: webkitgtk_minibrowser
-                channel: stable
-              use:
-                - trigger-weekly
-                - trigger-push
-            - vars:
-                browser: webkitgtk_minibrowser
-                channel: beta
-              use:
-                - trigger-weekly
-                - trigger-push
-            - vars:
-                browser: wpewebkit_minibrowser
-                channel: nightly
-              use:
-                - trigger-daily
-                - trigger-push
-            - vars:
-                browser: wpewebkit_minibrowser
-                channel: stable
-              use:
-                - trigger-weekly
-                - trigger-push
-            - vars:
-                browser: wpewebkit_minibrowser
-                channel: beta
-              use:
-                - trigger-weekly
-                - trigger-push
-            - vars:
-                browser: servo
-                channel: nightly
               use:
                 - trigger-daily
                 - trigger-push
@@ -425,7 +320,7 @@ tasks:
                 browser: firefox
                 channel: nightly
               use:
-                - trigger-master
+                - trigger-three-hourly
                 - trigger-push
             - vars:
                 browser: firefox
@@ -450,7 +345,7 @@ tasks:
                 browser: chrome
                 channel: canary
               use:
-                - trigger-master
+                - trigger-three-hourly
                 - trigger-push
             - vars:
                 browser: chrome
@@ -578,6 +473,7 @@ tasks:
         download-firefox-${vars.channel}:
           use:
             - wpt-base
+          priority: very-high
           command: "./wpt install --download-only --destination /home/test/artifacts/ --channel=${vars.channel}  --rename=firefox-${vars.channel} firefox browser"
 
   - lint:
@@ -752,5 +648,6 @@ tasks:
       use:
         - wpt-base
         - trigger-pr
+      priority: highest
       command: "./wpt tc-sink-task --github-checks-text-file=/home/test/artifacts/checkrun.md"
       requires: all-resolved

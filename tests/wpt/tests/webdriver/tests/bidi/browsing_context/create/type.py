@@ -1,7 +1,12 @@
 import pytest
 
 from webdriver.bidi.modules.script import ContextTarget
-from .. import assert_browsing_context, assert_document_status
+from .. import (
+    assert_browsing_context,
+    assert_document_status,
+    get_visibility_state,
+    navigate_and_assert,
+)
 from ... import get_viewport_dimensions
 
 
@@ -32,7 +37,15 @@ async def test_type(
     assert contexts[0]["context"] != new_context["context"]
 
     await assert_document_status(bidi_session, new_context, get_document_focus, visible=True, focused=True)
-    await assert_document_status(bidi_session, top_context, get_document_focus, visible=is_window, focused=False)
+    if is_window:
+        # A new window uses a separate OS window, so the previous window stays
+        # "visible". The specs do not prohibit multiple windows from having
+        # system focus simultaneously, so focus is not asserted.
+        assert await get_visibility_state(bidi_session, top_context) == "visible"
+    else:
+        # A new tab reuses the same OS window, so the backgrounded tab becomes
+        # "hidden" and loses system focus.
+        await assert_document_status(bidi_session, top_context, get_document_focus, visible=False, focused=False)
 
     # Check there is an additional browsing context
     contexts = await bidi_session.browsing_context.get_tree(max_depth=0)
@@ -58,6 +71,24 @@ async def test_type(
         target=ContextTarget(new_context["context"]),
         await_promise=False)
     assert opener_protocol_value["value"] is False
+
+    await bidi_session.browsing_context.close(context=new_context["context"])
+
+
+# The new context's active document is the initial about:blank document, so the
+# first navigation replaces its session history entry instead of appending one.
+# https://html.spec.whatwg.org/#is-initial-about:blank
+@pytest.mark.parametrize("type_hint", ["tab", "window"])
+async def test_first_navigation_replaces_about_blank(bidi_session, inline, type_hint):
+    new_context = await bidi_session.browsing_context.create(type_hint=type_hint)
+
+    await navigate_and_assert(bidi_session, new_context, inline("<p>foo"))
+
+    result = await bidi_session.script.evaluate(
+        expression="history.length",
+        target=ContextTarget(new_context["context"]),
+        await_promise=False)
+    assert result["value"] == 1
 
     await bidi_session.browsing_context.close(context=new_context["context"])
 

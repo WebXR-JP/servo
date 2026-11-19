@@ -8,9 +8,9 @@ use std::rc::Rc;
 
 use crossbeam_channel::Sender;
 use embedder_traits::{
-    AnimationState, InputEvent, InputEventAndId, InputEventId, InputEventResult, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, PaintHitTestResult, Scroll, TouchEvent,
-    TouchEventType, ViewportDetails, WebViewPoint, WheelEvent,
+    AnimationState, InputEvent, InputEventAndId, InputEventId, InputEventResult,
+    PaintHitTestResult, Scroll, TouchEvent, TouchEventType, ViewportDetails, WebViewPoint,
+    WheelEvent,
 };
 use euclid::{Scale, Size2D, Vector2D};
 use log::{debug, warn};
@@ -28,8 +28,10 @@ use servo_constellation_traits::{
 use servo_geometry::DeviceIndependentPixel;
 use style_traits::CSSPixel;
 use webrender::RenderApi;
-use webrender_api::units::{DevicePixel, DevicePoint, DeviceRect, DeviceVector2D, LayoutVector2D};
-use webrender_api::{DocumentId, ExternalScrollId, ScrollLocation};
+use webrender_api::units::{
+    DevicePixel, DevicePoint, DeviceRect, DeviceVector2D, LayoutTransform, LayoutVector2D,
+};
+use webrender_api::{DocumentId, ExternalScrollId, PropertyBindingKey, ScrollLocation};
 
 use crate::paint::RepaintReason;
 use crate::painter::Painter;
@@ -119,9 +121,10 @@ pub(crate) struct WebViewRenderer {
     /// A [`ViewportDescription`] for this [`WebViewRenderer`], which contains the limitations
     /// and initial values for zoom derived from the `viewport` meta tag in web content.
     viewport_description: ViewportDescription,
-
     /// The dimensions of the screen on which this WebView is rendering.
     screen_size: Size2D<f32, DevicePixel>,
+    /// The [`PropertyBindingKey`] that this [`WebViewRenderer`] uses for pinch zoom.
+    pinch_zoom_property_binding_key: PropertyBindingKey<LayoutTransform>,
 
     //
     // Data that is shared with the parent renderer.
@@ -141,6 +144,7 @@ impl WebViewRenderer {
         embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
         refresh_driver: Rc<BaseRefreshDriver>,
         webrender_document: DocumentId,
+        pinch_zoom_property_binding_key: PropertyBindingKey<LayoutTransform>,
     ) -> Self {
         let hidpi_scale_factor = viewport_details.hidpi_scale_factor;
         let size = viewport_details.size * viewport_details.hidpi_scale_factor;
@@ -165,6 +169,7 @@ impl WebViewRenderer {
             embedder_to_constellation_sender,
             refresh_driver,
             webrender_document,
+            pinch_zoom_property_binding_key,
         }
     }
 
@@ -598,11 +603,19 @@ impl WebViewRenderer {
         reached_constellation
     }
 
-    fn on_touch_up(&mut self, render_api: &RenderApi, event: TouchEvent, id: InputEventId) -> bool {
+    fn on_touch_up(
+        &mut self,
+        render_api: &RenderApi,
+        mut event: TouchEvent,
+        id: InputEventId,
+    ) -> bool {
         let point = event
             .point
             .as_device_point(self.device_pixels_per_page_pixel());
-        self.touch_handler.on_touch_up(event.touch_id, point);
+        // Tag taps so script can generate the compatibility mouse events.
+        if self.touch_handler.on_touch_up(event.touch_id, point) {
+            event.can_synthesize_mouse_events = true;
+        }
         self.send_touch_event(render_api, event, id)
     }
 
@@ -621,7 +634,6 @@ impl WebViewRenderer {
 
     fn on_touch_event_processed(
         &mut self,
-        render_api: &RenderApi,
         pending_touch_input_event: PendingTouchInputEvent,
         result: InputEventResult,
     ) {
@@ -631,9 +643,11 @@ impl WebViewRenderer {
             touch_id,
         } = pending_touch_input_event;
 
-        if result.contains(InputEventResult::DefaultPrevented) {
+        // A touch is left to the compositor only if neither script nor a user agent widget
+        // process it.
+        if result.intersects(InputEventResult::DefaultPrevented | InputEventResult::Consumed) {
             debug!(
-                "Touch event {:?} in sequence {:?} prevented!",
+                "Touch event {:?} in sequence {:?} prevented or consumed",
                 event_type, sequence_id
             );
             match event_type {
@@ -673,7 +687,7 @@ impl WebViewRenderer {
                         return;
                     };
                     match info.state {
-                        TouchSequenceState::PendingClick(_) => {
+                        TouchSequenceState::PendingClick => {
                             info.state = TouchSequenceState::Finished;
                             self.touch_handler.remove_touch_sequence(sequence_id);
                         },
@@ -735,13 +749,8 @@ impl WebViewRenderer {
                         return;
                     };
                     match info.state {
-                        TouchSequenceState::PendingClick(point) => {
+                        TouchSequenceState::PendingClick => {
                             info.state = TouchSequenceState::Finished;
-                            // PreventDefault from touch_down may have been processed after
-                            // touch_up already occurred.
-                            if !info.prevent_click {
-                                self.simulate_mouse_click(render_api, point);
-                            }
                             self.touch_handler.remove_touch_sequence(sequence_id);
                         },
                         TouchSequenceState::Flinging { .. } => {
@@ -770,33 +779,6 @@ impl WebViewRenderer {
                 },
             }
         }
-    }
-
-    /// <http://w3c.github.io/touch-events/#mouse-events>
-    fn simulate_mouse_click(&mut self, render_api: &RenderApi, point: DevicePoint) {
-        let button = MouseButton::Primary;
-        self.dispatch_input_event_with_hit_testing(
-            render_api,
-            InputEvent::MouseMove(MouseMoveEvent::new_compatibility_for_touch(point.into())).into(),
-        );
-        self.dispatch_input_event_with_hit_testing(
-            render_api,
-            InputEvent::MouseButton(MouseButtonEvent::new(
-                MouseButtonAction::Down,
-                button,
-                point.into(),
-            ))
-            .into(),
-        );
-        self.dispatch_input_event_with_hit_testing(
-            render_api,
-            InputEvent::MouseButton(MouseButtonEvent::new(
-                MouseButtonAction::Up,
-                button,
-                point.into(),
-            ))
-            .into(),
-        );
     }
 
     pub(crate) fn notify_scroll_event(&mut self, scroll: Scroll, point: WebViewPoint) {
@@ -1071,6 +1053,10 @@ impl WebViewRenderer {
         PinchZoomResult::DidPinchZoom
     }
 
+    pub(crate) fn pinch_zoom_property_binding_key(&self) -> PropertyBindingKey<LayoutTransform> {
+        self.pinch_zoom_property_binding_key
+    }
+
     /// Set the page zoom for this renderer, returning `true` if the value actually changed.
     pub(crate) fn set_page_zoom(
         &mut self,
@@ -1197,7 +1183,6 @@ impl WebViewRenderer {
 
     pub(crate) fn notify_input_event_handled(
         &mut self,
-        render_api: &RenderApi,
         repaint_reason: &Cell<RepaintReason>,
         id: InputEventId,
         result: InputEventResult,
@@ -1205,7 +1190,7 @@ impl WebViewRenderer {
         if let Some(pending_touch_input_event) =
             self.touch_handler.take_pending_touch_input_event(id)
         {
-            self.on_touch_event_processed(render_api, pending_touch_input_event, result);
+            self.on_touch_event_processed(pending_touch_input_event, result);
             self.touch_handler
                 .add_touch_move_refresh_observer_if_necessary(
                     self.refresh_driver.clone(),
@@ -1221,6 +1206,24 @@ impl WebViewRenderer {
                 DeviceVector2D::new(-wheel_event.delta.x as f32, -wheel_event.delta.y as f32);
             self.notify_scroll_event(Scroll::Delta(scroll_delta.into()), wheel_event.point);
         }
+    }
+
+    /// Get the transform from page to device pixels of this [`WebViewRenderer`]
+    /// incorporating the device pixel ratio, page zoom, and pinch zoom.
+    pub(crate) fn root_transform(&self) -> LayoutTransform {
+        let pinch_zoom_transform = self.pinch_zoom.transform().to_untyped();
+        let device_pixels_per_page_pixel_not_including_pinch_zoom = self
+            .device_pixels_per_page_pixel_not_including_pinch_zoom()
+            .get();
+
+        LayoutTransform::scale(
+            device_pixels_per_page_pixel_not_including_pinch_zoom,
+            device_pixels_per_page_pixel_not_including_pinch_zoom,
+            1.0,
+        )
+        .then(&LayoutTransform::from_untyped(
+            &pinch_zoom_transform.to_3d(),
+        ))
     }
 }
 

@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_media::webrtc::{
     TransceiverDirection, TransceiverId, TransceiverKind, TransceiverState, WebRtcController,
 };
@@ -88,12 +88,12 @@ impl RTCRtpTransceiver {
         kind: TransceiverKind,
         stream_ids: Vec<String>,
     ) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(Self::new_inherited(
                 cx, global, direction, track, controller, id, kind, stream_ids,
             )),
             global,
-            cx,
         )
     }
 

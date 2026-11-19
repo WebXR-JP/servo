@@ -414,6 +414,7 @@ class MockRuntime {
 
     this.world_ = null;
     this.worldDirty_ = false;
+    this.skipUpdatedPlanesData_ = false;
 
     this.anchor_controllers_ = new Map();
     // ID of the next anchor to be assigned.
@@ -622,6 +623,11 @@ class MockRuntime {
   clearWorld() {
     this.world_ = null;
     this.worldDirty_ = true;
+  }
+
+  simulateIncompletePlaneDetectionData() {
+    // Test-only hook for simulating a device that sends an incomplete delta.
+    this.skipUpdatedPlanesData_ = true;
   }
 
   // WebXR Test API Anchor extensions
@@ -1297,7 +1303,10 @@ class MockRuntime {
               views: this._getDefaultViews(),
               // Typical OpenXR maxLayerCount is 16. We may also show
               // a base layer, and a layer can have 2 eyes.
-              maxRenderLayers: (16 - 1) / 2,
+              maxRenderLayers: enabled_features.includes(
+                                   xrSessionMojom.XRSessionFeature.LAYERS) ?
+                  (16 - 1) / 2 :
+                  1,
             },
             enviromentBlendMode: this.enviromentBlendMode_,
             interactionMode: this.interactionMode_
@@ -1446,6 +1455,8 @@ class MockRuntime {
       allPlanesIds: [],
       updatedPlanesData: []
     };
+    const skipUpdatedPlanesData = this.skipUpdatedPlanesData_;
+    this.skipUpdatedPlanesData_ = false;
 
     if (!this.world_) {
       this.worldDirty_ = false;
@@ -1464,7 +1475,7 @@ class MockRuntime {
       frameData.detectedPlanesData.allPlanesIds.push(planeId);
 
       // Only treat planes as updated if the world state was changed since last frame.
-      if (this.worldDirty_) {
+      if (this.worldDirty_ && !skipUpdatedPlanesData) {
         const planeInfo = region.planeInfo;
         if (planeInfo) {
           let semanticLabel = null;

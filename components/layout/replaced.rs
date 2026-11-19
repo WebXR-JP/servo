@@ -15,6 +15,7 @@ use net_traits::image_cache::{Image, ImageOrMetadataAvailable, VectorImage};
 use net_traits::request::InternalRequest;
 use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc as ServoArc;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::{BrowsingContextId, PipelineId};
 use servo_url::ServoUrl;
 use style::Zero;
@@ -22,7 +23,7 @@ use style::attr::AttrValue;
 use style::computed_values::object_fit::T as ObjectFit;
 use style::context::TreeCountingCaches;
 use style::dom::DummyElementContext;
-use style::logical_geometry::{Direction, WritingMode};
+use style::logical_geometry::{LogicalAxis, WritingMode};
 use style::properties::{ComputedValues, StyleBuilder};
 use style::rule_cache::RuleCacheConditions;
 use style::rule_tree::RuleCascadeFlags;
@@ -142,12 +143,13 @@ pub(crate) struct ImageInfo {
     pub image: Option<Image>,
     pub showing_broken_image_icon: bool,
     pub url: Option<ServoUrl>,
+    pub load_time: Option<CrossProcessInstant>,
 }
 
 #[derive(Debug, MallocSizeOf)]
 pub(crate) struct VideoInfo {
     pub image_key: Option<ImageKey>,
-    pub poster_url: Option<ServoUrl>,
+    pub poster_or_src_url: Option<ServoUrl>,
 }
 
 #[derive(Debug, MallocSizeOf)]
@@ -340,7 +342,7 @@ impl ReplacedContents {
         // If the `content` property is a single image URL, non-replaced boxes
         // and images get replaced with the given image.
         if let Content::Items(GenericContentItems { items, .. }) =
-            node.style(&context.style_context).clone_content() &&
+            node.style(&context.style_context).get_content() &&
             let [GenericContentItem::Image(image)] = items.as_slice()
         {
             // Invalid images are treated as zero-sized.
@@ -387,6 +389,7 @@ impl ReplacedContents {
         Some(Self {
             base_fragment_info: node.into(),
             kind: ReplacedContentKind::Image(ImageInfo {
+                load_time: image.as_ref().and_then(|image| image.load_time()),
                 image,
                 showing_broken_image_icon: false,
                 url: Some(image_url.clone().into()),
@@ -419,6 +422,7 @@ impl ReplacedContents {
                 image: None,
                 showing_broken_image_icon: false,
                 url: None,
+                load_time: None,
             }),
             is_content_replacement: false,
             selected: Default::default(),
@@ -435,7 +439,7 @@ impl ReplacedContents {
     #[inline]
     fn content_size(
         &self,
-        axis: Direction,
+        axis: LogicalAxis,
         preferred_aspect_ratio: Option<AspectRatio>,
         get_size_in_opposite_axis: &dyn Fn() -> SizeConstraint,
         get_fallback_size: &dyn Fn() -> Au,
@@ -459,7 +463,7 @@ impl ReplacedContents {
         if let ReplacedContentKind::Image(ImageInfo {
             image: Some(Image::Raster(image)),
             showing_broken_image_icon: true,
-            url: _,
+            ..
         }) = &self.kind
         {
             let size = Size2D::new(
@@ -488,7 +492,7 @@ impl ReplacedContents {
                     PhysicalSize::new(size.width, candidate_height)
                 };
 
-            match style.clone_object_fit() {
+            match style.get_object_fit() {
                 ObjectFit::Fill => size,
                 ObjectFit::Contain => preserve_aspect_ratio_with_comparison(size, PartialOrd::le),
                 ObjectFit::Cover => preserve_aspect_ratio_with_comparison(size, PartialOrd::ge),
@@ -499,7 +503,7 @@ impl ReplacedContents {
             }
         });
 
-        let object_position = style.clone_object_position();
+        let object_position = style.get_object_position();
         let horizontal_position = object_position
             .horizontal
             .to_used_value(size.width - object_fit_size.width);
@@ -549,6 +553,7 @@ impl ReplacedContents {
                         image_key: Some(image_key),
                         showing_broken_image_icon: image_info.showing_broken_image_icon,
                         url: image_info.url.clone(),
+                        load_time: image_info.load_time,
                         natural_width: self.natural_size.width,
                         natural_height: self.natural_size.height,
                         selected: self.selected.clone(),
@@ -564,7 +569,8 @@ impl ReplacedContents {
                     clip,
                     image_key: video_info.image_key,
                     showing_broken_image_icon: false,
-                    url: video_info.poster_url.clone(),
+                    url: video_info.poster_or_src_url.clone(),
+                    load_time: None,
                     natural_width: self.natural_size.width,
                     natural_height: self.natural_size.height,
                     selected: self.selected.clone(),
@@ -611,6 +617,7 @@ impl ReplacedContents {
                     image_key: Some(image_key),
                     showing_broken_image_icon: false,
                     url: None,
+                    load_time: None,
                     natural_width: self.natural_size.width,
                     natural_height: self.natural_size.height,
                     selected: self.selected.clone(),
@@ -668,6 +675,7 @@ impl ReplacedContents {
                             image_key: Some(image_key),
                             showing_broken_image_icon: false,
                             url: None,
+                            load_time: None,
                             natural_width: self.natural_size.width,
                             natural_height: self.natural_size.height,
                             selected: self.selected.clone(),
@@ -761,7 +769,7 @@ impl ReplacedContents {
         let writing_mode = base.style.writing_mode;
         let inline_size = containing_block_for_children.size.inline;
         let content_block_size = self.content_size(
-            Direction::Block,
+            LogicalAxis::Block,
             preferred_aspect_ratio,
             &|| SizeConstraint::Definite(inline_size),
             &|| self.fallback_block_size(writing_mode),
@@ -804,7 +812,7 @@ impl ComputeInlineContentSizes for ReplacedContents {
         constraint_space: &ConstraintSpace,
     ) -> InlineContentSizesResult {
         let inline_content_size = self.content_size(
-            Direction::Inline,
+            LogicalAxis::Inline,
             constraint_space.preferred_aspect_ratio,
             &|| constraint_space.block_size,
             &|| self.fallback_inline_size(constraint_space.style.writing_mode),

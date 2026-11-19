@@ -34,11 +34,11 @@ use crate::dom::globalscope::GlobalScope;
 #[dom_struct]
 pub(crate) struct MediaStreamTrack {
     eventtarget: EventTarget,
-    #[ignore_malloc_size_of = "defined in servo-media"]
     #[no_trace]
     id: MediaStreamId,
     web_id: DOMString,
     #[ignore_malloc_size_of = "defined in servo-media"]
+    #[no_trace]
     #[no_trace]
     ty: MediaStreamType,
     #[ignore_malloc_size_of = "generated binding dictionary"]

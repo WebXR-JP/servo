@@ -25,9 +25,13 @@ use uuid::Uuid;
 use crate::ReferrerPolicy;
 use crate::blob_url_store::UrlWithBlobClaim;
 use crate::policy_container::{PolicyContainer, RequestPolicyContainer};
-use crate::pub_domains::is_same_site;
+use crate::pub_domains::{Site, is_same_site};
 use crate::resource_fetch_timing::ResourceTimingType;
 use crate::response::{RedirectTaint, Response};
+
+/// A [network partition key](https://fetch.spec.whatwg.org/#network-partition-keys).
+/// Currently consists of a top-level site, or null if unpartitioned.
+pub type NetworkPartitionKey = Option<Site>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 /// An id to differentiate one network request from another.
@@ -216,7 +220,8 @@ pub struct RequestClient {
     /// <https://html.spec.whatwg.org/multipage/#map-of-preloaded-resources>
     pub preloaded_resources: PreloadedResources,
     /// <https://html.spec.whatwg.org/multipage/#concept-settings-object-policy-container>
-    pub policy_container: PolicyContainer,
+    #[conditional_malloc_size_of]
+    pub policy_container: Arc<PolicyContainer>,
     /// <https://html.spec.whatwg.org/multipage/#concept-settings-object-origin>
     pub origin: Origin,
     /// <https://html.spec.whatwg.org/multipage/#nested-browsing-context>
@@ -225,6 +230,8 @@ pub struct RequestClient {
     pub insecure_requests_policy: InsecureRequestsPolicy,
     /// <https://w3c.github.io/webappsec-secure-contexts/#potentially-trustworthy-origin>
     pub has_trustworthy_ancestor_origin: bool,
+    /// <https://fetch.spec.whatwg.org/#determining-the-network-partition-key>
+    pub network_partition_key: NetworkPartitionKey,
 }
 
 /// <https://html.spec.whatwg.org/multipage/#system-visibility-state>
@@ -304,9 +311,10 @@ pub enum BodyChunkResponse {
     Error,
 }
 
-/// Messages used to implement <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
-/// which are sent from net to script
-/// (with the exception of Done, which is sent from script to script).
+/// Messages used to implement [request body transmission] which are sent from
+/// net to script.
+///
+/// [request body transmission]: <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
 #[derive(Debug, Deserialize, Serialize)]
 pub enum BodyChunkRequest {
     /// Connect a fetch in `net`, with a stream of bytes from `script`.
@@ -315,10 +323,6 @@ pub enum BodyChunkRequest {
     Extract(IpcReceiver<BodyChunkRequest>),
     /// Ask for another chunk.
     Chunk,
-    /// Signal the stream is done(sent from script to script).
-    Done,
-    /// Signal the stream has errored(sent from script to script).
-    Error,
 }
 
 /// A process local view into <https://fetch.spec.whatwg.org/#bodies>.
@@ -507,7 +511,7 @@ pub struct RequestBuilder {
     pub cryptographic_nonce_metadata: String,
 
     /// <https://fetch.spec.whatwg.org/#concept-request-url-list>
-    pub url_list: Vec<ServoUrl>,
+    pub url_list: Vec<UrlWithBlobClaim>,
 
     /// <https://fetch.spec.whatwg.org/#concept-request-parser-metadata>
     pub parser_metadata: ParserMetadata,
@@ -652,7 +656,7 @@ impl RequestBuilder {
     }
 
     /// <https://fetch.spec.whatwg.org/#concept-request-url-list>
-    pub fn url_list(mut self, url_list: Vec<ServoUrl>) -> RequestBuilder {
+    pub fn url_list(mut self, url_list: Vec<UrlWithBlobClaim>) -> RequestBuilder {
         self.url_list = url_list;
         self
     }
@@ -697,7 +701,7 @@ impl RequestBuilder {
     }
 
     /// <https://fetch.spec.whatwg.org/#concept-request-policy-container>
-    pub fn policy_container(mut self, policy_container: PolicyContainer) -> RequestBuilder {
+    pub fn policy_container(mut self, policy_container: Arc<PolicyContainer>) -> RequestBuilder {
         self.policy_container = RequestPolicyContainer::PolicyContainer(policy_container);
         self
     }
@@ -756,11 +760,7 @@ impl RequestBuilder {
         request.cache_mode = self.cache_mode;
         request.referrer_policy = self.referrer_policy;
         request.redirect_mode = self.redirect_mode;
-        let mut url_list: Vec<_> = self
-            .url_list
-            .into_iter()
-            .map(UrlWithBlobClaim::from_url_without_having_claimed_blob)
-            .collect();
+        let mut url_list = self.url_list;
         if url_list.is_empty() {
             url_list.push(self.url);
         }
@@ -1023,7 +1023,7 @@ impl Request {
             } else {
                 // Step 3.2. Otherwise, set request’s policy container to a new policy container.
                 self.policy_container =
-                    RequestPolicyContainer::PolicyContainer(PolicyContainer::default());
+                    RequestPolicyContainer::PolicyContainer(Arc::new(PolicyContainer::default()));
             }
         }
     }
@@ -1274,14 +1274,13 @@ pub fn get_cors_unsafe_header_names(headers: &HeaderMap) -> Vec<HeaderName> {
 
 /// <https://fetch.spec.whatwg.org/#ref-for-convert-header-names-to-a-sorted-lowercase-set>
 pub fn convert_header_names_to_sorted_lowercase_set(
-    header_names: Vec<&HeaderName>,
+    mut header_names: Vec<&HeaderName>,
 ) -> Vec<HeaderName> {
     // HeaderName does not implement the needed traits to use a BTreeSet
-    // So create a new Vec, sort, then dedup
-    let mut ordered_set = header_names.to_vec();
-    ordered_set.sort_by(|a, b| a.as_str().partial_cmp(b.as_str()).unwrap());
-    ordered_set.dedup();
-    ordered_set.into_iter().cloned().collect()
+    // So sort the Vec, then dedup
+    header_names.sort_by(|a, b| a.as_str().partial_cmp(b.as_str()).unwrap());
+    header_names.dedup();
+    header_names.into_iter().cloned().collect()
 }
 
 pub fn create_request_body_with_content(content: String) -> RequestBody {

@@ -9,28 +9,30 @@ use malloc_size_of_derive::MallocSizeOf;
 use script::layout_dom::{ServoDangerousStyleElement, ServoLayoutNode};
 use servo_arc::Arc;
 use style::context::SharedStyleContext;
-use style::logical_geometry::Direction;
+use style::logical_geometry::LogicalAxis;
 use style::properties::ComputedValues;
 use style::selector_parser::PseudoElement;
 
 use crate::context::LayoutContext;
-use crate::dom::WeakLayoutBox;
+use crate::dom::{LayoutBox, NodeExt, WeakLayoutBox};
 use crate::dom_traversal::{Contents, NodeAndStyleInfo, NonReplacedContents};
 use crate::flexbox::FlexContainer;
 use crate::flow::BlockFormattingContext;
+use crate::flow::inline::InlineFormattingContext;
 use crate::fragment_tree::{BaseFragmentInfo, FragmentFlags};
 use crate::layout_box_base::{IndependentFormattingContextLayoutResult, LayoutBoxBase};
 use crate::positioned::{LayoutRootLayoutInputs, PositioningContext};
 use crate::replaced::ReplacedContents;
 use crate::sizing::{
     self, ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, LazySize,
+    SizeConstraint,
 };
 use crate::style_ext::{AspectRatio, Display, DisplayInside, LayoutStyle};
 use crate::table::Table;
 use crate::taffy::TaffyContainer;
 use crate::{
-    ArcRefCell, ConstraintSpace, ContainingBlock, IndefiniteContainingBlock, LogicalVec2,
-    PropagatedBoxTreeData,
+    ArcRefCell, ConstraintSpace, ContainingBlock, ContainingBlockSize, IndefiniteContainingBlock,
+    LogicalVec2, PropagatedBoxTreeData,
 };
 
 /// <https://drafts.csswg.org/css-display/#independent-formatting-context>
@@ -193,25 +195,7 @@ impl IndependentFormattingContext {
                     node.is_root_of_user_agent_widget() &&
                     !contents.is_content_replacement;
                 let widget = should_make_widget.then(|| {
-                    let widget_info = node_and_style_info
-                        .with_pseudo_element(context, PseudoElement::ServoAnonymousBox)
-                        .expect("Should always be able to construct info for anonymous boxes.");
-                    // Use a block formatting context for the widget, since the display inside is always flow.
-                    let widget_contents = IndependentFormattingContextContents::Flow(
-                        BlockFormattingContext::construct(
-                            context,
-                            &widget_info,
-                            NonReplacedContents::OfElement,
-                            propagated_data,
-                            false, /* is_list_item */
-                        ),
-                    );
-                    let widget_base = LayoutBoxBase::new((&widget_info).into(), widget_info.style);
-                    ArcRefCell::new(IndependentFormattingContext::new(
-                        widget_base,
-                        widget_contents,
-                        propagated_data,
-                    ))
+                    Self::construct_for_widget(context, node_and_style_info, propagated_data)
                 });
 
                 return IndependentFormattingContextContents::Replaced(contents, widget);
@@ -239,6 +223,7 @@ impl IndependentFormattingContext {
                     node_and_style_info,
                     non_replaced_contents,
                     propagated_data,
+                    base_fragment_info.flags,
                 ))
             },
             DisplayInside::Flex => {
@@ -268,6 +253,31 @@ impl IndependentFormattingContext {
                 ))
             },
         }
+    }
+
+    fn construct_for_widget(
+        context: &LayoutContext,
+        node_and_style_info: &NodeAndStyleInfo,
+        propagated_data: PropagatedBoxTreeData,
+    ) -> ArcRefCell<IndependentFormattingContext> {
+        let widget_info = node_and_style_info
+            .with_pseudo_element(context, PseudoElement::ServoAnonymousBox)
+            .expect("Should always be able to construct info for anonymous boxes.");
+        // Use a block formatting context for the widget, since the display inside is always flow.
+        let widget_contents =
+            IndependentFormattingContextContents::Flow(BlockFormattingContext::construct(
+                context,
+                &widget_info,
+                NonReplacedContents::OfElement,
+                propagated_data,
+                false, /* is_list_item */
+            ));
+
+        let box_slot = widget_info.node.box_slot();
+        let widget_base = LayoutBoxBase::new((&widget_info).into(), widget_info.style);
+        let widget = ArcRefCell::new(Self::new(widget_base, widget_contents, propagated_data));
+        box_slot.set(LayoutBox::Widget(widget.clone()));
+        widget
     }
 
     #[inline]
@@ -302,7 +312,7 @@ impl IndependentFormattingContext {
     pub(crate) fn tentative_block_content_size(
         &self,
         preferred_aspect_ratio: Option<AspectRatio>,
-        inline_stretch_size: Au,
+        inline_stretch_size: Option<Au>,
     ) -> Option<ContentSizes> {
         let result = self.tentative_block_content_size_with_dependency(
             preferred_aspect_ratio,
@@ -317,7 +327,7 @@ impl IndependentFormattingContext {
     pub(crate) fn tentative_block_content_size_with_dependency(
         &self,
         preferred_aspect_ratio: Option<AspectRatio>,
-        inline_stretch_size: Au,
+        inline_stretch_size: Option<Au>,
     ) -> Option<(ContentSizes, bool)> {
         // See <https://github.com/w3c/csswg-drafts/issues/12333> regarding the difference
         // in behavior for the replaced and non-replaced cases.
@@ -331,11 +341,14 @@ impl IndependentFormattingContext {
                     match (natural_sizes.block, natural_sizes.inline) {
                         (Some(block_size), None) => (block_size, false),
                         (_, Some(inline_size)) => (
-                            ratio.compute_dependent_size(Direction::Block, inline_size),
+                            ratio.compute_dependent_size(LogicalAxis::Block, inline_size),
                             false,
                         ),
                         (None, None) => (
-                            ratio.compute_dependent_size(Direction::Block, inline_stretch_size),
+                            ratio.compute_dependent_size(
+                                LogicalAxis::Block,
+                                inline_stretch_size.unwrap_or_default(),
+                            ),
                             true,
                         ),
                     };
@@ -351,6 +364,7 @@ impl IndependentFormattingContext {
         containing_block: &IndefiniteContainingBlock,
         auto_minimum: &LogicalVec2<Au>,
         auto_block_size_stretches_to_containing_block: bool,
+        skippable_for_block_percentage_quirk: bool,
     ) -> InlineContentSizesResult {
         sizing::outer_inline(
             &self.base,
@@ -360,10 +374,11 @@ impl IndependentFormattingContext {
             auto_block_size_stretches_to_containing_block,
             self.is_replaced(),
             true, /* establishes_containing_block */
+            skippable_for_block_percentage_quirk,
             |padding_border_sums| self.preferred_aspect_ratio(padding_border_sums),
             |constraint_space| self.inline_content_sizes(layout_context, constraint_space),
             |preferred_aspect_ratio| {
-                self.tentative_block_content_size(preferred_aspect_ratio, Au(0))
+                self.tentative_block_content_size(preferred_aspect_ratio, None)
             },
         )
     }
@@ -376,15 +391,8 @@ impl IndependentFormattingContext {
     ) {
         self.base.repair_style(new_style);
         match &mut self.contents {
-            IndependentFormattingContextContents::Replaced(replaced, widget) => {
+            IndependentFormattingContextContents::Replaced(replaced, ..) => {
                 *replaced.selected_style.borrow_mut() = node.selected_style(context);
-
-                if let Some(widget) = widget {
-                    let node = node
-                        .with_pseudo(PseudoElement::ServoAnonymousBox)
-                        .expect("Should always be able to construct info for anonymous boxes.");
-                    widget.borrow_mut().repair_style(context, &node, new_style);
-                }
             },
             IndependentFormattingContextContents::Flow(block_formatting_context) => {
                 block_formatting_context.repair_style(context, node, new_style);
@@ -396,7 +404,7 @@ impl IndependentFormattingContext {
                 taffy_container.repair_style(new_style)
             },
             IndependentFormattingContextContents::Table(table) => {
-                table.repair_style(context, new_style)
+                table.repair_style(context, new_style, &self.base)
             },
         }
     }
@@ -452,12 +460,22 @@ impl IndependentFormattingContext {
                     &self.base,
                     lazy_block_size,
                 );
+                // Widget should know the size of the replaced contents.
+                let resolved_block_size =
+                    lazy_block_size.resolve(|| replaced_layout.content_block_size);
+                let widget_cb = ContainingBlock {
+                    size: ContainingBlockSize {
+                        inline: containing_block_for_children.size.inline,
+                        block: SizeConstraint::Definite(resolved_block_size),
+                    },
+                    style: &self.base.style,
+                };
                 if let Some(widget) = widget {
                     let mut widget_layout = widget.borrow().layout(
                         layout_context,
                         positioning_context,
-                        containing_block_for_children,
-                        containing_block_for_children,
+                        &widget_cb,
+                        &widget_cb,
                         None,
                         &LazySize::intrinsic(),
                     );
@@ -504,15 +522,15 @@ impl IndependentFormattingContext {
         preferred_aspect_ratio: Option<AspectRatio>,
         lazy_block_size: &LazySize,
     ) -> (IndependentFormattingContextLayoutResult, bool) {
-        if let Some(cached_layout_result) = self
+        let content_block_size_under_default_constraint = match self
             .base
             .cached_independent_formatting_context_layout_if_applicable(
                 positioning_context,
                 containing_block_for_children,
-            )
-        {
-            return (cached_layout_result, true);
-        }
+            ) {
+            Ok(cached_layout_result) => return (cached_layout_result, true),
+            Err(v) => v,
+        };
 
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -531,6 +549,7 @@ impl IndependentFormattingContext {
         self.base.cache_independent_formatting_context_layout(
             containing_block_for_children,
             &child_positioning_context,
+            content_block_size_under_default_constraint,
             &result,
         );
         positioning_context.append(child_positioning_context);
@@ -555,6 +574,38 @@ impl IndependentFormattingContext {
             lazy_block_size,
         )
         .0
+    }
+
+    pub(crate) fn content_block_size_under_default_constraint(
+        &self,
+        layout_context: &LayoutContext,
+        positioning_context: &mut PositioningContext,
+        inline_size: Au,
+        containing_block: &ContainingBlock,
+        preferred_aspect_ratio: Option<AspectRatio>,
+        lazy_block_size: &LazySize,
+    ) -> Au {
+        if let Some(content_block_size) = self
+            .base
+            .cached_content_block_size_under_default_constraint_if_applicable(inline_size)
+        {
+            return content_block_size;
+        }
+        self.layout(
+            layout_context,
+            positioning_context,
+            &ContainingBlock {
+                size: ContainingBlockSize {
+                    inline: inline_size,
+                    block: SizeConstraint::default(),
+                },
+                style: self.style(),
+            },
+            containing_block,
+            preferred_aspect_ratio,
+            lazy_block_size,
+        )
+        .content_block_size
     }
 
     #[inline]
@@ -618,6 +669,15 @@ impl IndependentFormattingContext {
                 replaced_contents.set_selection(selected)
             },
             _ => false,
+        }
+    }
+
+    pub(crate) fn inline_formatting_context(&self) -> Option<&InlineFormattingContext> {
+        match &self.contents {
+            IndependentFormattingContextContents::Flow(block_formatting_context) => {
+                block_formatting_context.inline_formatting_context()
+            },
+            _ => None,
         }
     }
 }

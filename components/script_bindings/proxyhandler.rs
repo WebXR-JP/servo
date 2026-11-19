@@ -30,12 +30,10 @@ use js::jsid::SymbolId;
 use js::jsval::{ObjectValue, UndefinedValue};
 use js::realm::{AutoRealm, CurrentRealm};
 use js::rust::wrappers2::{
-    AppendToIdVector, Call, GetObjectProto, GetPropertyKeys, GetRealmKeyObject, GetWeakMapEntry,
-    GetWellKnownSymbol, JS_AlreadyHasOwnPropertyById, JS_AtomizeAndPinString, JS_DefineFunctions,
-    JS_DefineProperties, JS_DefinePropertyById, JS_DeletePropertyById,
-    JS_GetOwnPropertyDescriptorById, JS_IdToValue, JS_IsExceptionPending,
-    JS_NewObjectWithGivenProto, JS_ValueToSource, JS_WrapObject, JS_WrapValue, NewWeakMapObject,
-    RUST_INTERNED_STRING_TO_JSID, RUST_JSID_IS_VOID, SetDataPropertyDescriptor,
+    AppendToIdVector, Call, GetObjectProto, GetRealmKeyObject, GetWeakMapEntry, GetWellKnownSymbol,
+    JS_AlreadyHasOwnPropertyById, JS_AtomizeAndPinString, JS_DefineFunctions, JS_DefineProperties,
+    JS_DefinePropertyById, JS_DeletePropertyById, JS_ValueToSource, JS_WrapObject, JS_WrapValue,
+    NewWeakMapObject, RUST_INTERNED_STRING_TO_JSID, RUST_JSID_IS_VOID, SetDataPropertyDescriptor,
     SetPropertyIgnoringNamedGetter, SetWeakMapEntry, int_to_jsid,
 };
 use js::rust::{
@@ -47,6 +45,10 @@ use crate::DomTypes;
 use crate::conversions::{is_dom_proxy, jsid_to_string, native_from_object};
 use crate::error::Error;
 use crate::interfaces::{DomHelpers, GlobalScopeHelpers};
+use crate::js::{
+    GetPropertyKeys, JS_GetOwnPropertyDescriptorById, JS_IdToValue, JS_IsExceptionPending,
+    JS_NewObjectWithGivenProto,
+};
 use crate::principals::ServoJSPrincipalsRef;
 use crate::reflector::DomObject;
 use crate::str::DOMString;
@@ -240,11 +242,7 @@ pub(crate) fn ensure_expando_object(
         assert!(is_dom_proxy(obj.get()));
         get_expando_object(obj, expando.reborrow());
         if expando.is_null() {
-            expando.set(JS_NewObjectWithGivenProto(
-                cx,
-                ptr::null_mut(),
-                HandleObject::null(),
-            ));
+            expando.set(JS_NewObjectWithGivenProto(cx, None, HandleObject::null()));
             assert!(!expando.is_null());
 
             SetProxyPrivate(obj.get(), &ObjectValue(expando.get()));
@@ -396,7 +394,7 @@ fn get_setter_object(d: &PropertyDescriptor, out: RawMutableHandleObject) {
 }
 
 /// <https://tc39.es/ecma262/#sec-isaccessordescriptor>
-fn is_accessor_descriptor(d: &PropertyDescriptor) -> bool {
+pub(crate) fn is_accessor_descriptor(d: &PropertyDescriptor) -> bool {
     d.hasSetter_() || d.hasGetter_()
 }
 
@@ -464,7 +462,7 @@ pub fn cross_origin_get_own_property_helper(
     {
         return false;
     }
-    unsafe { JS_GetOwnPropertyDescriptorById(cx, holder.handle(), id, desc, is_none) }
+    JS_GetOwnPropertyDescriptorById(cx, holder.handle(), id, desc, is_none)
 }
 
 const ALLOWLISTED_SYMBOL_CODES: &[SymbolCode] = &[
@@ -625,8 +623,7 @@ fn ensure_cross_origin_property_holder(
     // cross-compartment references to all the methods it holds, since those
     // methods need to be in our current Realm. It seems better to allocate the
     // holder in our current Realm.
-    out_holder
-        .set(unsafe { JS_NewObjectWithGivenProto(cx, ptr::null_mut(), HandleObject::null()) });
+    out_holder.set(JS_NewObjectWithGivenProto(cx, None, HandleObject::null()));
 
     if out_holder.get().is_null() ||
         !unsafe {
@@ -697,12 +694,10 @@ pub fn report_cross_origin_denial<D: DomTypes>(
     } else {
         debug!("permission denied to {} on cross-origin object", access);
     }
-    unsafe {
-        if !JS_IsExceptionPending(cx) {
-            let global = D::GlobalScope::from_current_realm(cx);
-            // TODO: include `id` and `access` in the exception message
-            <D as DomHelpers<D>>::throw_dom_exception(cx, &global, Error::Security(None));
-        }
+    if !JS_IsExceptionPending(cx) {
+        let global = D::GlobalScope::from_current_realm(cx);
+        // TODO: include `id` and `access` in the exception message
+        <D as DomHelpers<D>>::throw_dom_exception(cx, &global, Error::Security(None));
     }
     false
 }
@@ -808,9 +803,7 @@ pub fn cross_origin_get<D: DomTypes>(
     // > 1. Let `desc` be `? O.[[GetOwnProperty]](P)`.
     rooted!(&in(cx) let mut descriptor = PropertyDescriptor::default());
     let mut is_none = false;
-    if !unsafe {
-        JS_GetOwnPropertyDescriptorById(cx, proxy, id, descriptor.handle_mut(), &mut is_none)
-    } {
+    if !JS_GetOwnPropertyDescriptorById(cx, proxy, id, descriptor.handle_mut(), &mut is_none) {
         return false;
     }
 
@@ -875,9 +868,7 @@ pub unsafe fn cross_origin_set<D: DomTypes>(
     // > 1. Let desc be ? O.[[GetOwnProperty]](P).
     rooted!(&in(cx) let mut descriptor = PropertyDescriptor::default());
     let mut is_none = false;
-    if !unsafe {
-        JS_GetOwnPropertyDescriptorById(cx, proxy, id, descriptor.handle_mut(), &mut is_none)
-    } {
+    if !JS_GetOwnPropertyDescriptorById(cx, proxy, id, descriptor.handle_mut(), &mut is_none) {
         return false;
     }
 

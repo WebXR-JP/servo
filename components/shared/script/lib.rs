@@ -15,10 +15,11 @@ use std::fmt;
 use accesskit::ActionRequest;
 use bitflags::bitflags;
 use crossbeam_channel::RecvTimeoutError;
+#[cfg(feature = "devtools")]
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use embedder_traits::user_contents::{UserContentManagerId, UserContents};
 use embedder_traits::{
-    EmbedderControlId, EmbedderControlResponse, FocusSequenceNumber, InputEventAndId,
+    EmbedderControlId, EmbedderControlResponse, FocusSequenceNumber, InputEvent, InputEventAndId,
     JavaScriptEvaluationId, MediaSessionActionType, MouseButton, PaintHitTestResult,
     ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
 };
@@ -35,10 +36,12 @@ use profile_traits::mem;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_base::Epoch;
-use servo_base::generic_channel::{GenericCallback, GenericReceiver, GenericSender};
+#[cfg(feature = "devtools")]
+use servo_base::generic_channel::GenericCallback;
+use servo_base::generic_channel::{GenericReceiver, GenericSender};
 use servo_base::id::{
     BrowsingContextId, HistoryStateId, LCPCandidateID, PipelineId, PipelineNamespaceId,
-    PipelineNamespaceRequest, ScriptEventLoopId, WebViewId,
+    PipelineNamespaceRequest, ScriptEventLoopId, ServiceWorkerId, WebViewId,
 };
 #[cfg(feature = "bluetooth")]
 use servo_bluetooth_traits::BluetoothRequest;
@@ -47,8 +50,8 @@ use servo_canvas_traits::webgl::WebGLPipeline;
 use servo_config::prefs::PrefValue;
 use servo_constellation_traits::{
     KeyboardScroll, LoadData, NavigationHistoryBehavior, PaintMetricEvent, RemoteFocusOperation,
-    ScriptToConstellationSender, ScrollStateUpdate, StructuredSerializedData, TargetSnapshotParams,
-    WindowSizeType,
+    ScriptToConstellationSender, ScrollStateUpdate, ServiceWorkerState, StructuredSerializedData,
+    TargetSnapshotParams, WindowSizeType,
 };
 use servo_url::{ImmutableOrigin, OriginSnapshot, ServoUrl};
 use storage_traits::StorageThreads;
@@ -155,6 +158,15 @@ pub enum UpdatePipelineIdReason {
 /// now) `Layout`.
 #[derive(Deserialize, IntoStaticStr, Serialize)]
 pub enum ScriptThreadMessage {
+    /// Update the state of a service worker.
+    UpdateServiceWorkerState {
+        /// The identity of the service worker.
+        worker_id: ServiceWorkerId,
+        /// The new state of the service worker.
+        state: ServiceWorkerState,
+        /// The pipeline.
+        pipeline_id: PipelineId,
+    },
     /// Span a new `Pipeline` in this `ScriptThread` and start fetching the contents
     /// according to the provided `LoadData`. This will ultimately create a `Window`
     /// and all associated data structures such as `Layout` in the `ScriptThread`.
@@ -266,14 +278,18 @@ pub enum ScriptThreadMessage {
     /// that it should try to resolve `document.fonts.ready` because the font was the last one
     /// loading.
     WebFontLoadFinished(PipelineId, WebFontLoadEvent),
-    /// Cause a `load` event to be dispatched at the appropriate iframe element.
-    DispatchIFrameLoadEvent {
+    /// Notify a parent pipeline that one of its `<iframe>` children has finished loading,
+    /// either by completing or by being aborted. When completing this causes the `load` event
+    /// to be dispatched at the appropriate iframe element.
+    IFrameLoadFinished {
         /// The frame that has been marked as loaded.
         target: BrowsingContextId,
         /// The pipeline that contains a frame loading the target pipeline.
         parent: PipelineId,
         /// The pipeline that has completed loading.
         child: PipelineId,
+        /// Whether or not the load was finished by aborting.
+        aborted: bool,
     },
     /// Cause a `storage` event to be dispatched at the appropriate window.
     /// The strings are key, old value and new value.
@@ -286,6 +302,7 @@ pub enum ScriptThreadMessage {
         Option<String>,
     ),
     /// Report an error from a CSS parser for the given pipeline
+    #[cfg(feature = "devtools")]
     ReportCSSError(PipelineId, String, u32, u32, String),
     /// Reload the given page.
     Reload(PipelineId),
@@ -342,6 +359,9 @@ pub enum ScriptThreadMessage {
     ForwardAccessibilityAction(PipelineId, ActionRequest),
     /// Force a garbage collection in this script thread.
     TriggerGarbageCollection,
+    /// Inform the `ScriptThread` that the embedder has indicated that the network has gone
+    /// online or offline.
+    SetNetworkOnlineState(bool),
 }
 
 impl fmt::Debug for ScriptThreadMessage {
@@ -415,7 +435,7 @@ impl TryFrom<MouseButton> for MouseButtons {
 }
 
 /// Input events from the embedder that are sent via the `Constellation`` to the `ScriptThread`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ConstellationInputEvent {
     /// The hit test result of this input event, if any.
     pub hit_test_result: Option<PaintHitTestResult>,
@@ -437,6 +457,15 @@ impl ConstellationInputEvent {
     /// Returns whether `pressed_mouse_buttons` includes the auxiliary (middle) button
     pub fn auxiliary_button_is_pressed(&self) -> bool {
         self.pressed_mouse_buttons.contains(MouseButtons::Auxiliary)
+    }
+
+    /// Returns whether this is a compatibility mouse event synthesized for a touch.
+    pub fn is_compatibility_event_for_touch(&self) -> bool {
+        match self.event.event {
+            InputEvent::MouseMove(ref event) => event.is_compatibility_event_for_touch,
+            InputEvent::MouseButton(ref event) => event.is_compatibility_event_for_touch,
+            _ => false,
+        }
     }
 }
 
@@ -474,6 +503,7 @@ pub struct InitialScriptState {
     /// A channel to the memory profiler thread.
     pub memory_profiler_sender: mem::ProfilerChan,
     /// A channel to the developer tools, if applicable.
+    #[cfg(feature = "devtools")]
     pub devtools_server_sender: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
     /// The ID of the pipeline namespace for this script thread.
     pub pipeline_namespace_id: PipelineNamespaceId,
@@ -490,6 +520,8 @@ pub struct InitialScriptState {
     pub privileged_urls: Vec<ServoUrl>,
     /// A copy of constellation's `UserContentManagerId` to `UserContents` map.
     pub user_contents_for_manager_id: FxHashMap<UserContentManagerId, UserContents>,
+    /// Whether or not the embedder has indicated that networking is online.
+    pub online: bool,
 }
 
 /// Errors from executing a paint worklet

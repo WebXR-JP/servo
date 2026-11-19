@@ -22,6 +22,7 @@ use hyper::{Request as HyperRequest, Response as HyperResponse};
 use image::RgbaImage;
 use itertools::Itertools;
 use net::test_util::{make_body, make_server, replace_host_table};
+use servo::JSValue::Boolean;
 use servo::profile_traits::mem::MemoryReportResult;
 use servo::{
     CreateNewWebViewRequest, Cursor, EmbedderControl, InputEvent, InputMethodType, JSValue,
@@ -996,9 +997,9 @@ fn test_preferences_change() {
     show_webview_and_wait_for_rendering_to_be_ready(&servo_test, &webview, &delegate);
 
     assert_eq!(
-        // The backdrop-filter style is feature flagged by the layout.unimplemented feature,
-        // so when layout.unimplemented feature is disabled, the backdrop-filter style specified
-        // in the stylesheet won't parse and the computed value undefined
+        // The backdrop-filter style is feature flagged by the layout_css_backdrop_filter_enabled
+        // preference, so when it is disabled, the backdrop-filter style specified in the
+        // stylesheet won't parse and the computed value undefined
         Ok(JSValue::Array(vec![
             JSValue::String(String::new()),
             JSValue::String(String::new())
@@ -1015,13 +1016,13 @@ fn test_preferences_change() {
 
     servo_test
         .servo()
-        .set_preference("layout_unimplemented", PrefValue::Bool(true));
+        .set_preference("layout_css_backdrop_filter_enabled", PrefValue::Bool(true));
 
     webview.reload();
 
     assert_eq!(
-        // When layout.unimplemented feature is enabled, the backdrop-filter style specified in
-        // the stylesheet will parse and the computed value will be that value
+        // When layout_css_backdrop_filter_enabled is enabled, the backdrop-filter style specified
+        // in the stylesheet will parse and the computed value will be that value
         Ok(JSValue::Array(vec![
             JSValue::String("sepia(1)".to_string()),
             JSValue::String("opacity(0.5)".to_string())
@@ -1200,4 +1201,67 @@ fn test_hide_animating_webview() {
 
     webview.hide();
     servo_test.spin(|| webview.animating());
+}
+
+#[test]
+fn test_about_memory_page_loads() {
+    let servo_test = ServoTest::new();
+    let delegate = Rc::new(WebViewDelegateImpl::default());
+    // Create a test page containing a custom MARKER
+    let test_page = Url::parse(
+        "data:text/html,\
+        <body>\
+        <h1>MARKER</h1>\
+        <script>\
+        let title = document.createElement('title');\
+        title.textContent = 'Success';\
+        document.body.appendChild(title);\
+        </script>",
+    )
+    .expect("Data URL failed to build");
+
+    let webview = WebViewBuilder::new(servo_test.servo(), servo_test.rendering_context.clone())
+        .delegate(delegate.clone())
+        .url(test_page.clone())
+        .build();
+
+    // Wait for the page to load
+    servo_test.spin(|| webview.load_status() != LoadStatus::Complete);
+
+    let about_memory_page = Url::parse("about:memory").expect("about:memory URL failed to build");
+    let about_memory_webview =
+        WebViewBuilder::new(servo_test.servo(), servo_test.rendering_context.clone())
+            .delegate(delegate.clone())
+            .url(about_memory_page.clone())
+            .build();
+
+    // Wait for about:memory to load
+    servo_test.spin(|| about_memory_webview.load_status() != LoadStatus::Complete);
+
+    // Click the "Measure" button
+    assert!(
+        evaluate_javascript(
+            &servo_test,
+            about_memory_webview.clone(),
+            "document.querySelector('#startButton').click();"
+        )
+        .is_ok()
+    );
+
+    // Spin until you find a report entry that contains the custom MARKER. Each report's heading
+    // contains the document's URL. Since we placed the MARKER in a data: URL, it will be embedded
+    // in the report's heading.
+    servo_test.spin(|| {
+        match evaluate_javascript(
+            &servo_test,
+            about_memory_webview.clone(),
+            r#"Array.from(document.querySelectorAll('#reports .process h4')).some(heading => heading.textContent.includes('MARKER'))"#
+        )
+        .expect("failed to evaluate javascript")
+        {
+            Boolean(true) => false,
+            Boolean(false) => true,
+            value => panic!("unexpected JSValue: {value:?}"),
+        }
+    });
 }

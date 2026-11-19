@@ -160,6 +160,11 @@ fn outside_safe_integer_range(value: i64) -> bool {
     value.unsigned_abs() > MAXIMUM_SAFE_INTEGER
 }
 
+fn pause_action_has_invalid_duration(action: &GeneralAction) -> bool {
+    let GeneralAction::Pause(action) = action;
+    action.duration.is_some_and(exceeds_maximum_safe_integer)
+}
+
 fn compute_tick_duration(tick_actions: &TickActions) -> u64 {
     // Step 1. Let max duration be 0.
     // Step 2. For each action in tick actions:
@@ -211,12 +216,6 @@ impl Handler {
             // Step 1.2. Let tick duration be the result of
             // computing the tick duration with argument tick actions.
             let tick_duration = compute_tick_duration(tick_actions);
-
-            // FIXME: This is out of spec, but the test `perform_actions/invalid.py` requires
-            // that duration more than `MAXIMUM_SAFE_INTEGER` is considered invalid.
-            if tick_duration > MAXIMUM_SAFE_INTEGER {
-                return Err(ErrorStatus::InvalidArgument);
-            }
 
             let tick_start = Instant::now();
 
@@ -1074,7 +1073,18 @@ impl Handler {
                 self.input_state_table_mut()
                     .entry(id)
                     .or_insert(InputSourceState::Null);
-                Ok(null_actions.into_iter().map(ActionItem::Null).collect())
+                // <https://w3c.github.io/webdriver/#dfn-process-a-null-action>
+                null_actions
+                    .into_iter()
+                    .map(|action_item| {
+                        let NullActionItem::General(action) = &action_item;
+                        if pause_action_has_invalid_duration(action) {
+                            Err(ErrorStatus::InvalidArgument)
+                        } else {
+                            Ok(ActionItem::Null(action_item))
+                        }
+                    })
+                    .collect()
             },
             ActionsType::Key {
                 actions: key_actions,
@@ -1082,14 +1092,30 @@ impl Handler {
                 self.input_state_table_mut()
                     .entry(id)
                     .or_insert(InputSourceState::Key(KeyInputState::new()));
-                Ok(key_actions.into_iter().map(ActionItem::Key).collect())
+                // <https://w3c.github.io/webdriver/#dfn-process-a-key-action>
+                key_actions
+                    .into_iter()
+                    .map(|action_item| {
+                        let is_invalid = match &action_item {
+                            KeyActionItem::General(action) => {
+                                pause_action_has_invalid_duration(action)
+                            },
+                            KeyActionItem::Key(_) => false,
+                        };
+                        if is_invalid {
+                            Err(ErrorStatus::InvalidArgument)
+                        } else {
+                            Ok(ActionItem::Key(action_item))
+                        }
+                    })
+                    .collect()
             },
             ActionsType::Pointer {
                 parameters,
                 actions: pointer_actions,
             } => {
                 let pointer_ids = self.session().unwrap().pointer_ids();
-                // Get or create a pointer input source with subtype, and other iterms
+                // Get or create a pointer input source with subtype, and other items
                 // set to default values.
                 self.input_state_table_mut()
                     .entry(id)
@@ -1104,8 +1130,8 @@ impl Handler {
                     .into_iter()
                     .map(|action_item| {
                         let is_invalid = match &action_item {
-                            PointerActionItem::General(GeneralAction::Pause(action)) => {
-                                action.duration.is_some_and(exceeds_maximum_safe_integer)
+                            PointerActionItem::General(action) => {
+                                pause_action_has_invalid_duration(action)
                             },
                             PointerActionItem::Pointer(PointerAction::Down(action)) => {
                                 exceeds_maximum_safe_integer(action.button) ||
@@ -1118,7 +1144,8 @@ impl Handler {
                                     action.height.is_some_and(exceeds_maximum_safe_integer)
                             },
                             PointerActionItem::Pointer(PointerAction::Move(action)) => {
-                                action.width.is_some_and(exceeds_maximum_safe_integer) ||
+                                action.duration.is_some_and(exceeds_maximum_safe_integer) ||
+                                    action.width.is_some_and(exceeds_maximum_safe_integer) ||
                                     action.height.is_some_and(exceeds_maximum_safe_integer)
                             },
                             PointerActionItem::Pointer(PointerAction::Cancel) => false,
@@ -1142,11 +1169,12 @@ impl Handler {
                     .into_iter()
                     .map(|action_item| {
                         let is_invalid = match &action_item {
-                            WheelActionItem::General(GeneralAction::Pause(action)) => {
-                                action.duration.is_some_and(exceeds_maximum_safe_integer)
+                            WheelActionItem::General(action) => {
+                                pause_action_has_invalid_duration(action)
                             },
                             WheelActionItem::Wheel(WheelAction::Scroll(action)) => {
-                                action.x.is_some_and(outside_safe_integer_range) ||
+                                action.duration.is_some_and(exceeds_maximum_safe_integer) ||
+                                    action.x.is_some_and(outside_safe_integer_range) ||
                                     action.y.is_some_and(outside_safe_integer_range) ||
                                     action.deltaX.is_some_and(outside_safe_integer_range) ||
                                     action.deltaY.is_some_and(outside_safe_integer_range)

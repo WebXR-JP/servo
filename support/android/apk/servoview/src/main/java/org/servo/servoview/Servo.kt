@@ -10,12 +10,21 @@ import android.util.Size
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.inputmethod.BaseInputConnection
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.AndroidExternalSurface
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.Interaction
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -26,39 +35,73 @@ import androidx.compose.ui.input.key.nativeKeyCode
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInteropFilter
-import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.node.ModifierNodeElement
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalResources
+import androidx.compose.ui.platform.PlatformTextInputModifierNode
+import androidx.compose.ui.platform.establishTextInputSession
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import java.util.concurrent.Executors
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 
 @Composable
 fun Servo(
-    servoView: ServoView,
+    experimentalModeEnabled: Boolean,
+    softKeyboardVisible: Boolean,
+    args: String?,
+    initialUrl: String?,
+    logStr: String?,
+    client: Servo.Client,
+    navigator: ServoNavigator,
     modifier: Modifier = Modifier,
 ) {
-    LifecycleResumeEffect(servoView) {
-        servoView.servo.suspend(false)
-        onPauseOrDispose { servoView.servo.suspend(true) }
-    }
-    LaunchedEffect(servoView.servo, servoView.navigator) {
-        servoView.navigator.consumeNavigationEvents(servoView.servo)
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val servo = remember {
+        Servo(
+            args = args,
+            url = initialUrl,
+            logStr = logStr,
+            experimentalMode = experimentalModeEnabled,
+            scope = scope,
+            client = client,
+            context = context,
+            navigator = navigator,
+        )
     }
 
+    LifecycleResumeEffect(servo) {
+        servo.suspend(false)
+        onPauseOrDispose { servo.suspend(true) }
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            withFrameNanos { servo.onDoFrame() }
+        }
+    }
+    LaunchedEffect(servo, navigator) { navigator.consumeNavigationEvents(servo) }
+    BackHandler(enabled = navigator.canGoBack) { navigator.back() }
+    LaunchedEffect(experimentalModeEnabled) { servo.setExperimentalMode(experimentalModeEnabled) }
+    DisposableEffect(servo) { onDispose { servo.glDispatcher.close() } }
+
+    val resources = LocalResources.current
     val focusRequester = remember { FocusRequester() }
-    AndroidView(
-        factory = { _ -> servoView },
+    AndroidExternalSurface(
         modifier =
             modifier
                 .focusRequester(focusRequester)
+                .focusable()
+                .softKeyboardVisible(softKeyboardVisible)
                 .onKeyEvent { keyEvent ->
                     when (keyEvent.type) {
                         KeyEventType.KeyDown if keyEvent.key != Key.Back -> {
-                            servoView.servo.onKeyDown(
+                            servo.onKeyDown(
                                 keyEvent.key.nativeKeyCode,
                                 keyEvent.nativeKeyEvent,
                             )
@@ -66,7 +109,7 @@ fun Servo(
                         }
 
                         KeyEventType.KeyUp if keyEvent.key != Key.Back -> {
-                            servoView.servo.onKeyUp(
+                            servo.onKeyUp(
                                 keyEvent.key.nativeKeyCode,
                                 keyEvent.nativeKeyEvent,
                             )
@@ -87,28 +130,54 @@ fun Servo(
 
                     when (action) {
                         MotionEvent.ACTION_DOWN,
-                        MotionEvent.ACTION_POINTER_DOWN ->
-                            servoView.servo.touchDown(x, y, pointerId)
-                        MotionEvent.ACTION_MOVE -> servoView.servo.touchMove(x, y, pointerId)
+                        MotionEvent.ACTION_POINTER_DOWN -> servo.touchDown(x, y, pointerId)
+                        MotionEvent.ACTION_MOVE -> servo.touchMove(x, y, pointerId)
                         MotionEvent.ACTION_UP,
-                        MotionEvent.ACTION_POINTER_UP -> servoView.servo.touchUp(x, y, pointerId)
-                        MotionEvent.ACTION_CANCEL -> servoView.servo.touchCancel(x, y, pointerId)
+                        MotionEvent.ACTION_POINTER_UP -> servo.touchUp(x, y, pointerId)
+                        MotionEvent.ACTION_CANCEL -> servo.touchCancel(x, y, pointerId)
                     }
 
                     true
-                },
-        onRelease = { servoView.servo.glDispatcher.close() },
-    )
+                }
+    ) {
+        var paused = false
+
+        onSurface { surface, width, height ->
+            val size = Size(width, height)
+
+            if (!paused) {
+                servo.addPlatformWindow(
+                    size,
+                    resources.displayMetrics.density,
+                    surface,
+                )
+            } else {
+                paused = false
+                servo.resumePainting(surface, size)
+            }
+
+            surface.onChanged { width, height -> servo.resize(Size(width, height)) }
+
+            surface.onDestroyed {
+                paused = true
+                servo.pausePainting()
+            }
+        }
+    }
 }
 
 @Stable
 class ServoNavigator {
     private sealed interface NavigationEvent : Interaction {
+        data class Navigate(val uri: String) : NavigationEvent
+
         data object Back : NavigationEvent
 
         data object Forward : NavigationEvent
 
         data object Reload : NavigationEvent
+
+        data object Stop : NavigationEvent
     }
 
     private val coroutineScope = CoroutineScope(EmptyCoroutineContext)
@@ -117,18 +186,24 @@ class ServoNavigator {
     internal suspend fun consumeNavigationEvents(servo: Servo) {
         navigationEvents.collect { navigationEvent ->
             when (navigationEvent) {
+                is NavigationEvent.Navigate -> servo.loadUri(navigationEvent.uri)
                 NavigationEvent.Back -> servo.goBack()
                 NavigationEvent.Forward -> servo.goForward()
                 NavigationEvent.Reload -> servo.reload()
+                NavigationEvent.Stop -> servo.stop()
             }
         }
     }
 
-    var canGoBackState = mutableStateOf(false)
+    var canGoBack by mutableStateOf(false)
         internal set
 
-    var canGoForwardState = mutableStateOf(false)
+    var canGoForward by mutableStateOf(false)
         internal set
+
+    fun navigate(uri: String) {
+        coroutineScope.launch { navigationEvents.emit(NavigationEvent.Navigate(uri)) }
+    }
 
     fun back() {
         coroutineScope.launch { navigationEvents.emit(NavigationEvent.Back) }
@@ -141,9 +216,40 @@ class ServoNavigator {
     fun reload() {
         coroutineScope.launch { navigationEvents.emit(NavigationEvent.Reload) }
     }
+
+    fun stop() {
+        coroutineScope.launch { navigationEvents.emit(NavigationEvent.Stop) }
+    }
 }
 
-class Servo(
+private fun Modifier.softKeyboardVisible(visible: Boolean) = this then SoftKeyboardVisible(visible)
+
+private data class SoftKeyboardVisible(val visible: Boolean) :
+    ModifierNodeElement<SoftKeyboardVisibleNode>() {
+    override fun create() = SoftKeyboardVisibleNode()
+
+    override fun update(node: SoftKeyboardVisibleNode) {
+        node.update(visible)
+    }
+}
+
+private class SoftKeyboardVisibleNode : Modifier.Node(), PlatformTextInputModifierNode {
+    private var textInputSessionJob: Job? = null
+
+    fun update(visible: Boolean) {
+        textInputSessionJob?.cancel()
+        if (visible) {
+            textInputSessionJob = coroutineScope.launch {
+                establishTextInputSession {
+                    startInputMethod { _ -> BaseInputConnection(view, true) }
+                }
+            }
+        }
+    }
+}
+
+class Servo
+internal constructor(
     args: String?,
     url: String?,
     logStr: String?,
@@ -184,14 +290,6 @@ class Servo(
         }
     }
 
-    fun version(): String {
-        return jni.version()
-    }
-
-    fun performUpdates() {
-        scope.launch(glDispatcher) { jni.performUpdates() }
-    }
-
     fun resize(size: Size) {
         scope.launch(glDispatcher) { jni.resize(size) }
     }
@@ -214,10 +312,6 @@ class Servo(
 
     fun loadUri(uri: String) {
         scope.launch(glDispatcher) { jni.loadUri(uri) }
-    }
-
-    fun scroll(dx: Int, dy: Int, x: Int, y: Int) {
-        scope.launch(glDispatcher) { jni.scroll(dx, dy, x, y) }
     }
 
     fun onKeyDown(keyCode: Int, event: KeyEvent) {
@@ -244,22 +338,6 @@ class Servo(
         scope.launch(glDispatcher) { jni.touchCancel(x, y, pointerId) }
     }
 
-    fun pinchZoomStart(factor: Float, x: Float, y: Float) {
-        scope.launch(glDispatcher) { jni.pinchZoomStart(factor, x, y) }
-    }
-
-    fun pinchZoom(factor: Float, x: Float, y: Float) {
-        scope.launch(glDispatcher) { jni.pinchZoom(factor, x, y) }
-    }
-
-    fun pinchZoomEnd(factor: Float, x: Float, y: Float) {
-        scope.launch(glDispatcher) { jni.pinchZoomEnd(factor, x, y) }
-    }
-
-    fun click(x: Float, y: Float) {
-        scope.launch(glDispatcher) { jni.click(x, y) }
-    }
-
     fun pausePainting() {
         scope.launch(glDispatcher) { jni.pausePainting() }
     }
@@ -270,10 +348,6 @@ class Servo(
 
     fun suspend(suspended: Boolean) {
         servoCallbacks.suspended = suspended
-    }
-
-    fun mediaSessionAction(action: Int) {
-        scope.launch(glDispatcher) { jni.mediaSessionAction(action) }
     }
 
     fun setExperimentalMode(enable: Boolean) {
@@ -298,12 +372,6 @@ class Servo(
         fun onImeShow()
 
         fun onImeHide()
-
-        fun onMediaSessionMetadata(title: String, artist: String, album: String)
-
-        fun onMediaSessionPlaybackStateChange(state: Int)
-
-        fun onMediaSessionSetPositionState(duration: Float, position: Float, playbackRate: Float)
     }
 
     private class Callbacks(
@@ -350,24 +418,8 @@ class Servo(
         }
 
         override fun onHistoryChanged(canGoBack: Boolean, canGoForward: Boolean) {
-            navigator.canGoBackState.value = canGoBack
-            navigator.canGoForwardState.value = canGoForward
-        }
-
-        override fun onMediaSessionMetadata(title: String, artist: String, album: String) {
-            scope.launch { client.onMediaSessionMetadata(title, artist, album) }
-        }
-
-        override fun onMediaSessionPlaybackStateChange(state: Int) {
-            scope.launch { client.onMediaSessionPlaybackStateChange(state) }
-        }
-
-        override fun onMediaSessionSetPositionState(
-            duration: Float,
-            position: Float,
-            playbackRate: Float,
-        ) {
-            scope.launch { client.onMediaSessionSetPositionState(duration, position, playbackRate) }
+            navigator.canGoBack = canGoBack
+            navigator.canGoForward = canGoForward
         }
     }
 }
