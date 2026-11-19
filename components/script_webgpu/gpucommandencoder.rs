@@ -309,17 +309,40 @@ where
     fn CopyBufferToBuffer(
         &self,
         source: &GPUBuffer<D>,
+        destination: &GPUBuffer<D>,
+        size: Option<GPUSize64>,
+    ) {
+        // Short overload: equivalent to the full form with both offsets set to 0.
+        // A missing `size` is forwarded as `None`; the device timeline resolves it
+        // to `source.size - sourceOffset` and validates all ranges
+        // (<https://gpuweb.github.io/gpuweb/#dom-gpucommandencoder-copybuffertobuffer>).
+        self.send_command(CommandEncoderCommand::CopyBufferToBuffer {
+            source: source.id().0,
+            source_offset: 0,
+            destination: destination.id().0,
+            destination_offset: 0,
+            size,
+        });
+    }
+
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpucommandencoder-copybuffertobuffer>
+    fn CopyBufferToBuffer_(
+        &self,
+        source: &GPUBuffer<D>,
         source_offset: GPUSize64,
         destination: &GPUBuffer<D>,
         destination_offset: GPUSize64,
-        size: GPUSize64,
+        size: Option<GPUSize64>,
     ) {
+        // A missing `size` is forwarded as `None`; the device timeline resolves it
+        // to `source.size - sourceOffset` and validates all ranges
+        // (<https://gpuweb.github.io/gpuweb/#dom-gpucommandencoder-copybuffertobuffer>).
         self.send_command(CommandEncoderCommand::CopyBufferToBuffer {
             source: source.id().0,
             source_offset,
             destination: destination.id().0,
             destination_offset,
-            size: Some(size),
+            size,
         });
     }
 
@@ -369,6 +392,23 @@ where
         });
 
         Ok(())
+    }
+
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpucommandencoder-clearbuffer>
+    fn ClearBuffer(
+        &self,
+        buffer: &GPUBuffer<D>,
+        offset: GPUSize64,
+        size: Option<GPUSize64>,
+    ) {
+        // A missing `size` is forwarded as `None`; the device timeline resolves it
+        // to `max(0, buffer.size - offset)` and validates the range
+        // (<https://gpuweb.github.io/gpuweb/#dom-gpucommandencoder-clearbuffer>).
+        self.send_command(CommandEncoderCommand::ClearBuffer {
+            buffer: buffer.id().0,
+            offset,
+            size,
+        });
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpucommandencoder-finish>
