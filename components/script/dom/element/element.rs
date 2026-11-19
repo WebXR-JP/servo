@@ -5073,17 +5073,14 @@ impl VirtualMethods for Element {
         }
 
         let document = self.owner_document_unrooted(cx.no_gc());
-        let fullscreen = document.fullscreen_element();
-        if fullscreen.as_deref() == Some(self) {
-            self.owner_document().exit_fullscreen(cx);
-        }
 
         // Pointer Lock 中の要素が取り外されたら解除する。祖先削除でも
         // 対象自身の unbind で発火するため、ここだけで足りる。
         // ただし unbind 中は script/layout blocker が立っており、同期的に
         // pointerlockchange を発火すると panic する。DOM が安定してから
         // 遅延タスクで解除する（fullscreen の exit は非同期なので直接呼べる）。
-        if doc.pointer_lock_element().as_deref() == Some(self) {
+        if document.pointer_lock_element().as_deref() == Some(self) {
+            let doc = self.owner_document();
             let trusted_doc = Trusted::new(&*doc);
             doc.add_delayed_task(task!(PointerLockElementRemoved: |cx, trusted_doc: Trusted<Document>| {
                 let doc = trusted_doc.root();
@@ -5095,6 +5092,11 @@ impl VirtualMethods for Element {
                     doc.exit_pointer_lock(cx, true);
                 }
             }));
+        }
+
+        let fullscreen = document.fullscreen_element();
+        if fullscreen.as_deref() == Some(self) {
+            self.owner_document().exit_fullscreen(cx);
         }
 
         self.unregister_current_id_and_name_attribute(cx);

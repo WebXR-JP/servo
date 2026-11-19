@@ -39,20 +39,15 @@ pub(crate) struct RTCRtpTransceiver {
 
 impl RTCRtpTransceiver {
     fn new_inherited(
-        cx: &mut JSContext,
-        global: &GlobalScope,
         direction: RTCRtpTransceiverDirection,
-        track: Option<&MediaStreamTrack>,
+        sender: &RTCRtpSender,
         controller: WebRtcController,
         id: TransceiverId,
-        kind: TransceiverKind,
-        stream_ids: Vec<String>,
     ) -> Self {
-        let sender = RTCRtpSender::new(cx, global, track, controller.clone(), id, kind, stream_ids);
         Self {
             reflector_: Reflector::new(),
             direction: Cell::new(direction),
-            sender: Dom::from_ref(&*sender),
+            sender: Dom::from_ref(sender),
             controller,
             id,
             receiver: MutNullableDom::new(None),
@@ -88,11 +83,10 @@ impl RTCRtpTransceiver {
         kind: TransceiverKind,
         stream_ids: Vec<String>,
     ) -> DomRoot<Self> {
+        let sender = RTCRtpSender::new(cx, global, track, controller.clone(), id, kind, stream_ids);
         reflect_dom_object(
             cx,
-            Box::new(Self::new_inherited(
-                cx, global, direction, track, controller, id, kind, stream_ids,
-            )),
+            Box::new(Self::new_inherited(direction, &sender, controller, id)),
             global,
         )
     }

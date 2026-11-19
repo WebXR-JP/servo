@@ -306,7 +306,7 @@ impl<'dom> LayoutDom<'dom, Node> {
         let Some(selection) = self.owner_doc_for_layout().visible_selection_for_layout() else {
             return false;
         };
-        let Some(range) = selection.range_for_layout().as_ref() else {
+        let Some(range) = selection.range_for_layout() else {
             return false;
         };
         !range.collapsed()
