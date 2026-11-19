@@ -144,13 +144,20 @@ impl StagingBuffer {
 
     /// Make buffer available by unmapping / destroying it and then recreating it if needed.
     fn ensure_available(&mut self, config: &ContextConfiguration) -> Result<(), CreateBufferError> {
-        let recreate = match &self.state {
-            StagingBufferState::Unassigned => true,
+        let current = match &self.state {
+            StagingBufferState::Unassigned => None,
             StagingBufferState::Available(buffer) |
             StagingBufferState::Mapping(buffer) |
-            StagingBufferState::Mapped(MappedBuffer { buffer, .. }) => {
+            StagingBufferState::Mapped(MappedBuffer { buffer, .. }) => Some(*buffer),
+        };
+        let recreate = match current {
+            None => true,
+            Some(buffer) => {
                 if buffer.has_compatible_config(config) {
+                    // Cancel an in-flight map or release an existing mapping so the
+                    // buffer can be reused; it is available afterwards.
                     let _ = self.global.buffer_unmap(self.buffer_id);
+                    self.state = StagingBufferState::Available(buffer);
                     false
                 } else {
                     self.global.buffer_drop(self.buffer_id);
@@ -323,15 +330,39 @@ impl WebGpuExternalImages {
 impl WebRenderExternalImageApi for WebGpuExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
         let id = WebGPUContextId(id);
-        let presentation = {
-            let mut webgpu_contexts = self.image_map.lock().unwrap();
-            webgpu_contexts
-                .get_mut(&id)
-                .and_then(|context_data| context_data.presentation.clone())
+        let (presentation, descriptor_size) = {
+            let webgpu_contexts = self.image_map.lock().unwrap();
+            let Some(context_data) = webgpu_contexts.get(&id) else {
+                return (ExternalImageSource::Invalid, Size2D::zero());
+            };
+            (
+                context_data.presentation.clone(),
+                context_data.descriptor_size,
+            )
         };
         let Some(presentation) = presentation else {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
+        let StagingBufferState::Mapped(mapped_buffer) = &presentation.staging_buffer.state else {
+            unreachable!("Presentation staging buffer should be mapped")
+        };
+        // The descriptor and the presentation are updated through separate
+        // asynchronous channels (the descriptor via `update_image`, the
+        // presentation when a staging buffer map completes), so a resize can
+        // leave a new (larger) descriptor paired with an old (smaller) buffer.
+        // WebRender uploads using the descriptor size and ignores the size
+        // returned here, which would trip its upload size assert and abort the
+        // process. Report the image as invalid instead; WebRender fills it with
+        // a dummy value and we lose at most one frame.
+        if mapped_buffer.image_size.cast().cast_unit() != descriptor_size {
+            warn!(
+                "WebGPU canvas descriptor/presentation size mismatch \
+                (descriptor: {descriptor_size:?}, presentation: {:?}); \
+                dropping frame to avoid texture upload abort",
+                mapped_buffer.image_size,
+            );
+            return (ExternalImageSource::Invalid, Size2D::zero());
+        }
         self.locked_ids.insert(id, presentation);
         let presentation = self.locked_ids.get(&id).unwrap();
         let StagingBufferState::Mapped(mapped_buffer) = &presentation.staging_buffer.state else {
@@ -394,6 +425,17 @@ pub struct ContextData {
     image_key: Option<ImageKey>,
     /// The current size of this context.
     size: DeviceIntSize,
+    /// Size of the image descriptor most recently sent to WebRender for this
+    /// context via `add_image`/`update_image`.
+    ///
+    /// WebRender uploads [`ExternalImageType::Buffer`] contents using the descriptor
+    /// size and ignores the size returned by `lock`, so presenting a buffer whose
+    /// size no longer matches the descriptor trips the texture upload size assert
+    /// and aborts the process (e.g. descriptor updated for the new canvas size
+    /// while the presentation still holds the previous size after a resize).
+    /// [`WebGpuExternalImages::lock`] compares the presentation against this value
+    /// and reports the image as invalid instead, losing at most one frame.
+    descriptor_size: DeviceIntSize,
     /// Staging buffers that are not actively used.
     ///
     /// Staging buffer here are either [`StagingBufferState::Unassigned`] or [`StagingBufferState::Available`].
@@ -416,6 +458,7 @@ impl ContextData {
         Self {
             image_key: None,
             size,
+            descriptor_size: size,
             inactive_staging_buffers: buffer_ids
                 .iter()
                 .map(|buffer_id| StagingBuffer::new(global.clone(), *buffer_id))
@@ -546,6 +589,7 @@ impl crate::WGPU {
             self.paint_api.delete_image(old_image_key);
         }
 
+        context_data.descriptor_size = context_data.size;
         self.paint_api.add_image(
             image_key,
             ImageDescriptor {
@@ -657,6 +701,7 @@ impl crate::WGPU {
         }) = pending_texture
         else {
             context_data.clear_presentation();
+            context_data.descriptor_size = size.cast_unit().cast();
             self.paint_api.update_image(
                 image_key,
                 ImageDescriptor {
@@ -674,6 +719,7 @@ impl crate::WGPU {
         let Some(staging_buffer) = context_data.get_or_make_available_buffer(&configuration) else {
             warn!("Failure obtaining available staging buffer");
             context_data.clear_presentation();
+            context_data.descriptor_size = configuration.size.cast().cast_unit();
             self.paint_api.update_image(
                 image_key,
                 configuration.into(),
@@ -705,6 +751,7 @@ impl crate::WGPU {
                     context_data.clear_presentation();
                 }
                 // update image in WR
+                context_data.descriptor_size = configuration.size.cast().cast_unit();
                 paint_api.update_image(
                     image_key,
                     configuration.into(),
