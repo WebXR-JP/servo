@@ -406,10 +406,20 @@ impl ModuleTree {
                 evaluation_promise.set(eval_result.to_object());
             }
 
+            // NOTE: Use async error reporting so that modules using top-level
+            // await are supported. The sync behaviour assumes the evaluation
+            // promise is already settled and misreads a pending (TLA) promise
+            // as a failure, while genuine TLA rejections would never be
+            // reported. Async reporting delivers rejections through the script
+            // environment preparer (see `invoke_script_environment_preparer`),
+            // matching <https://html.spec.whatwg.org/multipage/#run-a-module-script>
+            // step 8 ("upon rejection of evaluationPromise ... report an exception").
+            // The `Err` branch below is kept as a fallback for engine-level
+            // failures (e.g. OOM while attaching the rejection handler).
             let throw_result = ThrowOnModuleEvaluationFailure(
                 cx,
                 evaluation_promise.handle(),
-                ModuleErrorBehaviour::ThrowModuleErrorsSync,
+                ModuleErrorBehaviour::ReportModuleErrorsAsync,
             );
             if !throw_result {
                 warn!("fail to evaluate module");
